@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "actis-metrology"
+version = "0.1.0"
+description = "Reference-image CD and placement benchmark for actinic EUV photomask inspection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "scipy>=1.11", "pillow>=10", "matplotlib>=3.8"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+gpu = ["cupy-cuda12x[ctk]>=14"]
+fast = ["numba>=0.60"]
+
+[project.scripts]
+actis = "actis.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+actis = ["report.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
