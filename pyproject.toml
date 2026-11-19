@@ -22,7 +22,7 @@ actis = "actis.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-actis = ["report.css"]
+actis = ["report.html", "report.css", "report.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

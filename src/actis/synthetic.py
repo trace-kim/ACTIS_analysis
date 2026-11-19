@@ -102,6 +102,7 @@ def render_repeats(
     pixel_nm=21.0,
     pitch_px=12.0,
     cd_nm=100.0,
+    cd_variation_nm=0.0,
     global_delta_nm=0.0,
     local_delta_nm=0.0,
     n_repeats=8,
@@ -113,6 +114,7 @@ def render_repeats(
     ellipse_ratio=0.75,
     basis_xy=None,
     global_shift_xy_px=(0.0, 0.0),
+    sigma_xy_px=(0.78, 0.96),
 ):
     """Return a uint16 array [run,y,x] and ground truth in the nominal mask frame.
 
@@ -121,6 +123,10 @@ def render_repeats(
     right-half CD steps add in nm before optical formation. Right-half
     membership uses the original center. Local displacement is applied before
     the acquisition translation. Positive angles rotate +x toward +y.
+
+    cd_variation_nm bounds an optional fixed mask variation shared by all
+    acquisitions. Two smooth local size changes and a smaller site-to-site
+    component provide landmarks for comparing measured dimensions.
 
     Geometry and per-acquisition nuisance parameters are consistent across CD
     sweeps for a fixed seed and configuration. Setting nuisance=False selects
@@ -149,7 +155,22 @@ def render_repeats(
     global_shift = np.asarray(global_shift_xy_px, dtype=float)
     if global_shift.shape != (2,) or not np.isfinite(global_shift).all():
         raise ValueError("global_shift_xy_px must be a finite (x, y) pair")
-    parameters = [pixel_nm, pitch_px, cd_nm, global_delta_nm, local_delta_nm, angle_deg]
+    sigma_xy = np.asarray(sigma_xy_px, dtype=float)
+    if (
+        sigma_xy.shape != (2,)
+        or not np.isfinite(sigma_xy).all()
+        or np.any(sigma_xy <= ([0.18, 0.20] if nuisance else 0))
+    ):
+        raise ValueError("Optical blur widths must stay positive across acquisitions")
+    parameters = [
+        pixel_nm,
+        pitch_px,
+        cd_nm,
+        cd_variation_nm,
+        global_delta_nm,
+        local_delta_nm,
+        angle_deg,
+    ]
     if not np.isfinite(parameters).all() or min(pixel_nm, pitch_px) <= 0.0:
         raise ValueError(
             "geometry requires finite parameters and positive pixel and pitch sizes"
@@ -157,7 +178,12 @@ def render_repeats(
     if not np.isfinite(ellipse_ratio) or not 0 < ellipse_ratio <= 1:
         raise ValueError("ellipse_ratio must be in (0, 1]")
     cd_levels = [cd_nm + global_delta_nm, cd_nm + global_delta_nm + local_delta_nm]
-    if min(cd_levels) <= 0 or max(cd_levels) >= pixel_nm * pitch_px:
+    if cd_variation_nm < 0:
+        raise ValueError("CD variation must be nonnegative")
+    if (
+        min(cd_levels) - cd_variation_nm <= 0
+        or max(cd_levels) + cd_variation_nm >= pixel_nm * pitch_px
+    ):
         raise ValueError("CD levels must be positive and smaller than the pitch")
 
     h, w = map(int, dims)
@@ -169,6 +195,15 @@ def render_repeats(
     local = centers[:, 0] >= (w - 1) / 2
     moved = centers + local[:, None] * (shifts_nm / pixel_nm)
     major = np.where(local, cd_levels[1], cd_levels[0])
+    if cd_variation_nm:
+        x, y = centers.T / np.maximum([w - 1, h - 1], 1)[:, None]
+        broader = np.exp(-0.5 * (((x - 0.36) / 0.15) ** 2 + ((y - 0.45) / 0.20) ** 2))
+        narrower = np.exp(-0.5 * (((x - 0.75) / 0.12) ** 2 + ((y - 0.67) / 0.16) ** 2))
+        mask_rng = np.random.default_rng(np.random.SeedSequence([seed, 3]))
+        variation = 0.75 * (broader - narrower) + 0.25 * mask_rng.uniform(
+            -1, 1, len(major)
+        )
+        major = major + cd_variation_nm * variation
     minor = major * (ellipse_ratio if shape == "ellipse" else 1.0)
     area_cd = (
         2 * major / np.sqrt(np.pi) if shape == "square" else np.sqrt(major * minor)
@@ -191,7 +226,7 @@ def render_repeats(
             continue
         optics_rng = np.random.default_rng(np.random.SeedSequence([seed, run, 1]))
         sensor_rng = np.random.default_rng(np.random.SeedSequence([seed, run, 2]))
-        blurs[run] = [0.78, 0.96]
+        blurs[run] = sigma_xy
         illumination = 1.0
         if nuisance:
             if run:
@@ -234,6 +269,7 @@ def render_repeats(
         "shape": shape,
         "lattice": lattice,
         "angle_deg": float(angle_deg),
+        "cd_variation_nm": float(cd_variation_nm),
         "ellipse_ratio": float(ellipse_ratio),
         "pitch_px": float(pitch_px),
         "pixel_nm": float(pixel_nm),

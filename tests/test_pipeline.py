@@ -1,5 +1,7 @@
 import csv
+import gzip
 import json
+from collections import Counter
 from html.parser import HTMLParser
 
 import numpy as np
@@ -83,20 +85,74 @@ def test_reference_entrypoint_measures_and_renders_eight_images(tmp_path):
     )
     with (out / "triplets.csv").open(encoding="utf-8") as f:
         assert sum(r["level"] == "Native page" for r in csv.DictReader(f)) == 56
-    assert len(list((out / "images").glob("native-*.png"))) == 8
-    assert len(list((out / "images").glob("overlay-contour-*.png"))) == 8
     with (out / "run.json").open(encoding="utf-8") as f:
         run = json.load(f)
     assert len(run["inputs"]) == 8 and run["synthetic"] is False
-    assert "phase" in (out / "index.html").read_text(encoding="utf-8")
 
-    class References(HTMLParser):
+    class ReportPage(HTMLParser):
+        in_manifest = False
+        manifest = None
+
         def handle_starttag(self, tag, attrs):
-            for key, ref in attrs:
-                if key in {"href", "src"} and not ref.startswith(("#", "https:")):
-                    assert (out / ref).is_file(), ref
+            attrs = dict(attrs)
+            self.in_manifest = tag == "script" and attrs.get("id") == "study"
+            for key in ("href", "src"):
+                ref = attrs.get(key)
+                if not ref or ref.startswith("#"):
+                    continue
+                if tag == "a" and ref.startswith("https://"):
+                    continue  # Published sources are external links.
+                assert (out / ref).is_file(), ref
 
-    References().feed((out / "index.html").read_text(encoding="utf-8"))
+        def handle_data(self, data):
+            if self.in_manifest:
+                self.manifest = json.loads(data)
+
+        def handle_endtag(self, tag):
+            if tag == "script":
+                self.in_manifest = False
+
+    page = ReportPage()
+    html = (out / "index.html").read_text(encoding="utf-8")
+    page.feed(html)
+    assert "phase" in html and "synthetic-truth.npz" not in html
+    manifest = page.manifest
+    assert (manifest["width"], manifest["height"]) == (80, 88)
+    assert len(manifest["frames"]) == len(images)
+    assert set(manifest["methods"]) == {
+        "contour",
+        "model",
+        "differential",
+        "flux",
+        "raw",
+        "harmonic",
+        "pooled",
+    }
+    with gzip.open(out / "holes.csv.gz", "rt", encoding="utf-8") as f:
+        hole_rows = list(csv.DictReader(f))
+    expected = Counter((int(r["repeat"]), r["method"]) for r in hole_rows)
+    site_keys = {(int(r["region"]), int(r["site"])) for r in hole_rows}
+    assert site_keys and {tuple(s[:2]) for s in manifest["sites"]} == site_keys
+    with (out / "native_tiles.csv").open(encoding="utf-8") as f:
+        expected.update((int(r["repeat"]), r["method"]) for r in csv.DictReader(f))
+
+    for repeat, (frame, original) in enumerate(zip(manifest["frames"], images)):
+        assert frame["file"] == f"{repeat}.png"
+        assert frame["mean"] == pytest.approx(values[repeat])
+        with Image.open(out / frame["source"]) as saved:
+            np.testing.assert_array_equal(np.asarray(saved), original)
+            assert np.asarray(saved).dtype == np.uint16
+        with Image.open(out / frame["image"]) as display:
+            assert display.size == (80, 88) and display.mode == "L"
+        assert (out / frame["thumb"]).is_file()
+        assert frame["layers"].keys() == manifest["methods"].keys()
+        for method, path in frame["layers"].items():
+            script = (out / path).read_text(encoding="utf-8")
+            prefix = f'window.ACTIS_LAYER({repeat},"{method}",'
+            assert script.startswith(prefix) and script.endswith(");\n")
+            layer = json.loads(script[len(prefix) : -3])
+            assert len(layer["rows"]) == layer["total"] == expected[repeat, method]
+
     assert (
         main(["analyze-reference", "--input", str(source), "--output", str(out)]) == 2
     )

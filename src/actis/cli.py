@@ -196,6 +196,7 @@ def _read_speed(path):
 def _pipeline(args, out):
     pipeline_start = perf_counter()
     simulated = args.command == "synthetic"
+    synthetic_settings = vars_for_synthetic(args) if simulated else None
     hardware = _hardware(args.backend)
     if simulated:
         source = out / "synthetic-input"
@@ -207,10 +208,12 @@ def _pipeline(args, out):
             image_shape=(args.height, args.width),
             pitch_px=args.pitch_px,
             cd_nm=args.cd_nm,
+            cd_variation_nm=args.cd_variation_nm,
             pixel_nm=args.pixel_nm,
             angle_deg=args.angle_deg,
             seed=args.seed,
             supersample=5,
+            sigma_xy_px=args.sigma_xy_px,
             n_repeats=8,
         )
         tag = PngImagePlugin.PngInfo()
@@ -308,11 +311,9 @@ def _pipeline(args, out):
             sample_ddof=1,
             repeat_indices="Measurement table repeat indices and triplets are zero-based; displayed acquisition numbers begin at one.",
             source_folder=str(args.input.resolve())
-            if not args.command == "synthetic"
+            if args.command != "synthetic"
             else "synthetic-input",
-            synthetic_settings=vars_for_synthetic(args)
-            if args.command == "synthetic"
-            else None,
+            synthetic_settings=synthetic_settings,
         ),
     )
     write_table(out / "holes.csv.gz", study.holes)
@@ -339,6 +340,7 @@ def _pipeline(args, out):
         comparisons,
         performance,
         simulated,
+        synthetic_settings=synthetic_settings,
     )
     performance["total_seconds"] = perf_counter() - pipeline_start
     save_json(out / "performance.json", performance)
@@ -354,6 +356,8 @@ def vars_for_synthetic(args):
             "width",
             "pitch_px",
             "cd_nm",
+            "cd_variation_nm",
+            "sigma_xy_px",
             "angle_deg",
             "seed",
         )
@@ -399,16 +403,28 @@ def build_parser():
         "synthetic", help="Generate, analyze and score eight simulated reference frames"
     )
     synth.add_argument(
-        "--shape", choices=["square", "circle", "ellipse"], default="ellipse"
+        "--shape", choices=["square", "circle", "ellipse"], default="square"
+    )
+    synth.add_argument("--lattice", choices=["square", "staggered"], default="square")
+    synth.add_argument("--height", type=int, default=192)
+    synth.add_argument("--width", type=int, default=256)
+    synth.add_argument("--pitch-px", type=float, default=6.77)
+    synth.add_argument("--cd-nm", type=float, default=80.0)
+    synth.add_argument(
+        "--cd-variation-nm",
+        type=float,
+        default=7.0,
+        help="Maximum fixed site CD deviation from nominal, in mask nm",
     )
     synth.add_argument(
-        "--lattice", choices=["square", "staggered"], default="staggered"
+        "--sigma-xy-px",
+        nargs=2,
+        type=float,
+        default=(0.70, 0.76),
+        metavar=("X", "Y"),
+        help="Nominal simulated optical blur widths in native pixels",
     )
-    synth.add_argument("--height", type=int, default=512)
-    synth.add_argument("--width", type=int, default=272)
-    synth.add_argument("--pitch-px", type=float, default=18.0)
-    synth.add_argument("--cd-nm", type=float, default=155.0)
-    synth.add_argument("--angle-deg", type=float, default=7.0)
+    synth.add_argument("--angle-deg", type=float, default=0.0)
     synth.add_argument("--seed", type=int, default=47)
     for command in (real, synth):
         command.add_argument(
@@ -434,6 +450,7 @@ def build_parser():
             type=Path,
             help="Optional representative board file for a sequential read timing",
         )
+    synth.set_defaults(tile_um=1.25)
     return parser
 
 

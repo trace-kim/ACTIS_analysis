@@ -12,7 +12,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\actis analyze-reference --input "D:\ACTIS\reference-pngs" --output "D:\ACTIS\reports\run-01"
 ~~~
 
-Point `--input` to a folder containing exactly eight single-channel, 16-bit PNGs of the same dimensions. File names are naturally sorted and recorded with SHA-256 hashes. The first acquisition defines the coordinate frame. Use a new or empty output directory. A completed report opens locally in any browser.
+Point `--input` to a folder containing exactly eight single-channel, 16-bit PNGs of the same dimensions. File names are naturally sorted and recorded with SHA-256 hashes. The first acquisition defines the coordinate frame. Use a new or empty output directory. A completed report opens locally in a modern browser.
 
 ~~~powershell
 Start-Process "D:\ACTIS\reports\run-01\index.html"
@@ -35,11 +35,31 @@ $env:CUDA_VISIBLE_DEVICES = "0"
 .\.venv\Scripts\python -m pytest
 ~~~
 
-The synthetic command writes eight PNGs, ground truth and a full report. Defaults use a staggered array of ellipses. Options include `--shape circle|square|ellipse`, `--lattice square|staggered`, `--cd-nm`, `--pitch-px`, `--angle-deg`, `--width`, `--height` and `--seed`. Shape and pitch configure the **generator**. The analysis recovers them blind. Generated PNGs carry a provenance tag so a subsequent reference-folder run still identifies them as simulated.
+The default demo uses a 256 × 192 pixel crop of a dense, axis-aligned square array. The nominal mask opening is 80 nm wide. At 21 nm/pixel its width is 3.81 pixels, and its assumed pitch is 6.77 pixels. At this density a full 676 × 2,048 field would contain about 30,200 sites before edge exclusion. The compact demo uses 1.25 µm tiles and processes all eight simulated exposures through the same estimators as the real-data command. The dimensions, pitch choice and image-formation assumptions are described in the [metrology notes](docs/metrology.md#demo-imagery).
+
+The full-size example in `results/demo` uses 688 columns, 2,048 rows, the same 6.77 px pitch and 5 µm tiles. This field contains more than 30,000 sites with a resolved square aperture shape. Run the following command to reproduce it in a new output directory.
+
+~~~powershell
+.\.venv\Scripts\actis synthetic --width 688 --height 2048 --pitch-px 6.77 --tile-um 5 --backend cpu --output results\full-field-example
+~~~
+
+Two areas of the mask have wider and narrower openings, with smaller random variation between neighboring sites. These dimensions stay fixed across exposures while the optical blur, detector noise, gain, offset, illumination gradient and registration shift vary. `synthetic-truth.npz` records the actual site dimensions, coordinates and acquisition settings. Generated PNGs carry a simulation tag that survives reanalysis with `analyze-reference`.
+
+Set `--cd-variation-nm 0` for a uniform mask. Other options include `--shape square|circle|ellipse`, `--lattice square|staggered`, `--pitch-px`, `--cd-nm`, `--angle-deg`, `--sigma-xy-px X Y`, `--width`, `--height` and `--seed`. Shape and pitch configure the generator. The analysis infers both from pixel data.
 
 ## Read the report
 
-- **Native page** reproduces one raw arithmetic mean per acquisition. **Common field** uses the overlapping mask area. **Pilot tile** uses complete fixed squares. The eight crops cover the same 14.196 × 43.008 µm field at nominal scale. A full 100 × 100 µm historical bin requires a larger measured area.
+The **Comparison** tab opens with two methods on the same acquisition. Each pane has its own method and filename selectors. To assign acquisitions from the sidebar, choose **A** or **B**. Use **Overlay** to blend the registered images and compare solid A and dashed B annotations.
+
+Scroll over either image to zoom at the pointer, drag to pan, or click the field navigator to move both panes. **Fit** shows the entire field and **1:1** sets one screen pixel per acquisition pixel. **Pixel grid** reveals the native sampling when magnified. A shared grayscale transfer preserves bright and dark tails across the run. Each pane offers the original 16-bit pixel values as a PNG download.
+
+Click a hole to see both measurements, units, fitted dimensions, flags and any held-out placement residual. **Find site** accepts the region and site ID from the hole export. **Largest difference** jumps to the largest absolute discrepancy among qualified pairs with matching quantities and spatial support. **Shared scale** uses common CD color limits. **Method scale** reveals smaller spatial variation within one method and retains the same limits across acquisitions.
+
+Hole methods draw their measured contours or center markers. For tile methods the rings show which reference sites share one tile estimate. Dashed tile boundaries mark its footprint. **Excluded** shows failed measurements, and the inspector gives the reason. **Image only** lets you examine the detector image alone.
+
+The **Precision** tab contains repeatability, coverage and matched spatial comparisons. **Run details** contains acquisition signal profiles, registration, timings and downloadable measurement tables.
+
+- **Native page** reproduces one raw arithmetic mean per acquisition. **Common field** uses the overlapping mask area. **Pilot tile** uses complete fixed squares. A 676 × 2,048 source field covers 14.196 × 43.008 µm at the nominal scale. A full 100 × 100 µm historical bin requires a larger measured area.
 - **3σ** is three times the sample standard deviation across acquisitions. The percentage is `100 × 3s / |mean|`. Each bin first gets one value per acquisition. The study then averages the binwise scores, giving each valid bin equal weight. The 56 possible three-acquisition subsets appear separately. Their overlap limits interpretation.
 - The primary shape-specific CD is circle diameter, square side or ellipse major diameter. Width, height and area-equivalent diameter are also exported. An ambiguous contour uses its area-equivalent diameter. Harmonics report a tile dimension. The flux observable uses DN·px² unless independent bright and dark reference levels are supplied to the estimator.
 - **Registration** includes global acquisition shifts and local residual X/Y in nominal mask nm. Positive X points right and positive Y down. Held-out holes score local placement after a translation-only fit on the other half. Repeated patterns can leave a whole-pitch ambiguity. Absolute pattern placement needs a mask coordinate reference.
@@ -48,14 +68,14 @@ The synthetic command writes eight PNGs, ground truth and a full report. Default
 
 | Output | Contents |
 |---|---|
-| `index.html` and `images/` | Offline report, native images, overlays, detail crops, precision maps and placement vectors |
+| `index.html`, `report.js`, `report.css`, `images/` and `data/` | Portable comparison viewer, native image planes, 16-bit downloads, measurement layers and diagnostic charts. Keep these together when copying the report. |
 | `holes.csv.gz` | Individual coordinates, shape, axes, CD, flags, quality, contour vertices and model diagnostics in native pixels, with held-out placement residuals in nm |
 | `native_tiles.csv` | Raw and harmonic measurements with reference tile indices, phase and fit status |
 | `tile_values.csv`, `tile_scores.csv`, `precision.csv` | Per-acquisition matched aggregates, binwise scores and summary metrics |
 | `triplets.csv`, `stress.csv`, `comparison.csv` | Three-acquisition subsets, known-geometry challenges and sensitivity-adjusted comparisons |
 | `run.json`, `performance.json` | Acquisition ordering, raw intensity profiles, shape evidence, translations, software versions, hardware and timings |
 
-The CSV acquisition indices start at zero. Overlay positions and fitted contours use native (column, row) coordinates. Tiles use the first acquisition's coordinates. The color limits and grayscale stretch affect display only.
+The CSV acquisition indices start at zero. Fitted contours are exported in native (column, row) coordinates. The viewer subtracts each acquisition's measured translation to draw the image and contours in the reference coordinate system. Tiles already use that reference system. Color limits, grayscale stretching and display interpolation only affect viewing.
 
 ## Throughput and production boundary
 
@@ -67,6 +87,6 @@ Run the resident-data benchmark to measure the raw, flux, pooled-moment and harm
 .\.venv\Scripts\actis benchmark --input "D:\ACTIS\reference-pngs" --output "D:\ACTIS\reports\timing-01.json" --workers 4 --seconds 5 --io-sample "D:\ACTIS\stripes\2_1_1.tiff"
 ~~~
 
-The TIFF contract is recorded for a later implementation. Arrays have shape up to (1500, 2048, 1376) in (page, row, column) order at 8 bits per pixel. A file name encodes stripe, vertical segment and board. The four simultaneous boards have 32-column overlaps and a combined width of 5,408 pixels. Neighboring stripes overlap by 32 columns. Stripe 1 scans down from the top. Even stripes scan up with reversed segment/page order and vertically flipped pages. The far end can overrun the nominal mask boundary by a fractional page, giving neighboring stripes different Y origins. The reference benchmark reads PNGs. TIFF stitching, full-mask streaming and workbench/UI development belong to the next phase.
+The TIFF contract is recorded for a later implementation. Arrays have shape up to (1500, 2048, 1376) in (page, row, column) order at 8 bits per pixel. A file name encodes stripe, vertical segment and board. The four simultaneous boards have 32-column overlaps and a combined width of 5,408 pixels. Neighboring stripes overlap by 32 columns. Stripe 1 scans down from the top. Even stripes scan up with reversed segment/page order and vertically flipped pages. The far end can overrun the nominal mask boundary by a fractional page, giving neighboring stripes different Y origins. The reference benchmark reads PNGs. TIFF stitching and full-mask streaming belong to the next phase.
 
 The equipment evidence, method assumptions and physical calibration requirements are documented in [the research notes](docs/metrology.md).

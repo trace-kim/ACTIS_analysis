@@ -5,6 +5,34 @@ from actis.statistics import precision, response_fit, tile_indices, triplet_scor
 from actis.synthetic import render_repeats
 
 
+def test_demo_has_dense_aligned_openings_and_unclipped_exposures():
+    from actis.cli import build_parser
+
+    args = build_parser().parse_args(["synthetic", "--output", "demo"])
+    frames, truth = render_repeats(
+        image_shape=(args.height, args.width),
+        shape=args.shape,
+        lattice=args.lattice,
+        pixel_nm=args.pixel_nm,
+        pitch_px=args.pitch_px,
+        angle_deg=args.angle_deg,
+        cd_nm=args.cd_nm,
+        cd_variation_nm=args.cd_variation_nm,
+        sigma_xy_px=args.sigma_xy_px,
+        seed=args.seed,
+        supersample=5,
+        n_repeats=2,
+    )
+    np.testing.assert_allclose(truth["basis_xy"], np.eye(2) * args.pitch_px)
+    assert args.shape == "square" and args.cd_nm == 80
+    assert 676 * 2048 / args.pitch_px**2 > 30000
+    assert 0.45 < args.cd_nm / (args.pitch_px * args.pixel_nm) < 0.75
+    assert 0 < frames.min() < frames.max() < np.iinfo(frames.dtype).max
+    assert np.ptp(truth["cd_nm"]) > args.cd_variation_nm > 0
+    assert np.max(np.abs(truth["cd_nm"] - args.cd_nm)) <= args.cd_variation_nm
+    assert not np.array_equal(frames[0], frames[1])
+
+
 def test_sample_precision_is_computed_across_acquisitions_per_bin():
     values = np.array([[9, 1, np.nan, -1], [10, 2, 4, 0], [11, 3, 4, 1]])
     result = precision(values)

@@ -1,0 +1,75 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark"><title>ACTIS · Measurement comparison</title>
+  <link rel="stylesheet" href="report.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark" aria-hidden="true"></span>ACTIS</div>
+  <span class="brand-context">Metrology workspace</span>
+  <nav aria-label="Report sections">
+    <a href="#comparison" data-view="comparison" aria-current="page">Comparison</a>
+    <a href="#precision" data-view="precision">Precision</a>
+    <a href="#run" data-view="run">Run details</a>
+  </nav>
+  <span class="origin">$provenance</span>
+</header>
+<main>
+<noscript><p>This comparison viewer requires JavaScript. The measurement tables and run details are available below.</p></noscript>
+<section id="comparison" class="workspace">
+  <aside class="rail" aria-label="Acquisitions and field navigation">
+    <div class="rail-heading"><h2>Acquisitions</h2><span class="count">$frame_count</span></div>
+    <div class="assign">Assign to pane <div class="pair-switch" aria-label="Acquisition target"><button data-target="0" aria-pressed="true">A</button><button data-target="1" aria-pressed="false">B</button></div></div>
+    <div id="acquisitions"></div>
+    <section class="navigator">
+      <div class="rail-heading"><h2>Field navigator</h2><button id="nav-fit" class="text-btn" title="Fit the full acquisition">Fit field</button></div>
+      <canvas id="overview" tabindex="0" aria-label="Field overview. Click or drag to move the comparison viewport. Arrow keys pan."></canvas>
+      <div class="nav-foot"><span>$frame_size px</span><span>Reference</span></div>
+    </section>
+  </aside>
+  <div class="work-area">
+    <div class="view-heading">
+      <div><h1>Measurement comparison</h1><p>$site_count common-field sites <span>·</span> $frame_count acquisitions <span>·</span> $pixel_nm nm/px</p></div>
+      <div class="segmented mode-switch" aria-label="Comparison mode">
+        <button id="split" aria-pressed="true"><i class="split-icon" aria-hidden="true"></i>Side by side</button>
+        <button id="overlay" aria-pressed="false"><i class="overlay-icon" aria-hidden="true"></i>Overlay</button>
+      </div>
+    </div>
+    <div class="workbench" id="workbench">
+      <div class="tools">
+        <div class="zoom-tools"><button id="zoom-out" aria-label="Zoom out" title="Zoom out (−)">−</button><output id="zoom-level" aria-label="Zoom level"></output><button id="zoom-in" aria-label="Zoom in" title="Zoom in (+)">+</button><span class="rule"></span><button id="fit">Fit</button><button id="native" title="One display pixel per native pixel">1:1</button></div>
+        <div class="layer-tools">
+          <label><input id="marks" type="checkbox" checked> Annotations</label>
+          <label><input id="excluded" type="checkbox"> Excluded</label>
+          <label title="Show the native pixel grid when magnified"><input id="pixels" type="checkbox"> Pixel grid</label>
+          <label class="color-control">Color <select id="color-mode"><option value="value">Shared scale</option><option value="method">Method scale</option><option value="pane">By pane</option></select></label>
+        </div>
+      </div>
+      <div id="pane-grid" class="pane-grid"></div>
+      <div id="blend-control" hidden><label for="blend">Image blend</label><span class="tone-a">A</span><input id="blend" type="range" min="0" max="100" value="50"><span class="tone-b">B</span><output id="blend-value">50% B</output></div>
+      <div class="status-line"><span class="linked"><i class="link-icon" aria-hidden="true">↔</i> <span id="alignment-state">Linked coordinates</span></span><span class="gestures">Scroll to zoom <b>·</b> Drag to pan <b>·</b> Click to inspect</span><output id="position"></output></div>
+    </div>
+    <section class="inspector" aria-labelledby="inspect-heading">
+      <div class="inspector-head"><h2 id="inspect-heading">Site inspector</h2><span id="site-label"></span><span id="site-xy"></span><button id="largest" class="inspect-action" hidden>Largest difference</button><button id="find" class="inspect-action" aria-expanded="false">Find site</button></div>
+      <form id="site-search" hidden><label for="region-id">Region</label><select id="region-id"></select><label for="site-id">Site ID</label><input id="site-id" type="number" step="1" min="0" required><button class="inspect-action">Go to site</button><span id="search-note" role="status"></span></form>
+      <p id="rank-note" class="inspector-empty" role="status" hidden></p>
+      <div id="inspection" aria-live="polite"></div>
+    </section>
+    <p class="registration-note" id="registration-note" hidden></p>
+  </div>
+</section>
+<section class="report-view" id="precision"><div class="view-heading"><div><h1>Measurement precision</h1><p>Repeatability, coverage and response across detector positions</p></div><a class="export" href="precision.csv" download>↓ Precision CSV</a></div>$precision</section>
+<section class="report-view" id="run"><div class="view-heading"><div><h1>Run details</h1><p>Acquisition diagnostics, registration and measurement exports</p></div><a class="export" href="run.json" download>↓ Run JSON</a></div>$diagnostics</section>
+</main>
+<template id="pane-template">
+  <section class="pane">
+    <div class="pane-head"><span class="pane-badge"></span><div class="pane-picks"><select class="method" aria-label="Measurement method"></select><select class="acq" aria-label="Acquisition"></select></div><span class="support"></span></div>
+    <div class="stage"><canvas class="field" tabindex="0"></canvas><span class="stage-msg" role="status"></span><span class="ruler"></span></div>
+    <div class="pane-foot"><div class="metric-key"></div><div class="coverage"></div><a class="native-download" download title="Download this acquisition at its original 16-bit pixel depth">↓ 16-bit PNG</a></div>
+  </section>
+</template>
+<script type="application/json" id="study">$manifest</script>
+<script src="report.js"></script>
+</body></html>
