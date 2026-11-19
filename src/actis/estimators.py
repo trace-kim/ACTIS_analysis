@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from time import perf_counter
 
 import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from .fit import ApertureLibrary, array_backend, solve_stamps
+from .fit import ApertureLibrary, array_backend, solve_stamps, to_host
 
 METHOD_NAMES = ("contour", "model", "differential", "flux")
 N_RAYS = 40
@@ -80,16 +81,18 @@ def _shape_from_contour(points, center, axis_ratio):
     return "square" if fourth > 0.037 else "circle"
 
 
-def _isocontours(norm, level, sites, dirs, rays, distance):
+def _isocontours(norm, level, sites, dirs, rays, distance, xp=np):
     # First downward crossing on each ray prevents inclusion of a neighbor.
     falls = (norm[:, :, :-1] >= level) & (norm[:, :, 1:] < level)
     crossing = falls.any(axis=2) & (norm[:, :, 0] >= level)
-    coverage = crossing.mean(axis=1)
     ir = falls.argmax(axis=2)
-    a = np.take_along_axis(norm, ir[:, :, None], axis=2)[:, :, 0]
-    b = np.take_along_axis(norm, ir[:, :, None] + 1, axis=2)[:, :, 0]
-    frac = np.divide(a - level, a - b, out=np.zeros_like(a), where=abs(a - b) > 1e-8)
-    dist = distance[ir] + np.clip(frac, 0, 1) * (distance[1] - distance[0])
+    a = xp.take_along_axis(norm, ir[:, :, None], axis=2)[:, :, 0]
+    b = xp.take_along_axis(norm, ir[:, :, None] + 1, axis=2)[:, :, 0]
+    stable = abs(a - b) > 1e-8
+    frac = xp.where(stable, (a - level) / xp.where(stable, a - b, 1), 0)
+    dist = to_host(xp, (ir + xp.clip(frac, 0, 1)) * (distance[1] - distance[0]))
+    crossing = to_host(xp, crossing)
+    coverage = crossing.mean(axis=1)
     for k in np.flatnonzero((coverage >= 0.94) & (coverage < 1.0)):
         ok = crossing[k]
         dist[k, ~ok] = np.interp(rays[~ok], rays[ok], dist[k, ok], period=2 * np.pi)
@@ -98,50 +101,70 @@ def _isocontours(norm, level, sites, dirs, rays, distance):
     return coverage, points, centroids, areas, axes, major_angles
 
 
-def _contours(image, centers, pitch, shape, angle, threshold_diagnostics=False):
+def _contours(image, centers, pitch, shape, angle, threshold_diagnostics=False, xp=np):
+    if xp is np:
+        map_coordinates = ndimage.map_coordinates
+    else:
+        from cupyx.scipy.ndimage import map_coordinates
     rays = np.arange(N_RAYS) * 2 * np.pi / N_RAYS
     dirs = np.column_stack((np.cos(rays), np.sin(rays)))
     radius = 0.64 * pitch
     distance = np.linspace(0, radius, max(15, int(np.ceil(radius * 4)) + 1))
-    offsets = dirs[:, None, :] * distance[None, :, None]
+    offsets = xp.asarray(dirs[:, None, :] * distance[None, :, None])
     results = []
     rows_per_batch = max(1, min(256, 150000 // (len(distance) * N_RAYS)))
     for start in range(0, len(centers), rows_per_batch):
         sites = centers[start : start + rows_per_batch]
-        positions = sites[:, None, None, :] + offsets
-        values = ndimage.map_coordinates(
+        positions = xp.asarray(sites)[:, None, None, :] + offsets
+        values = map_coordinates(
             image,
-            [positions[..., 1], positions[..., 0]],
+            xp.stack((positions[..., 1], positions[..., 0])),
             order=1,
-            mode="constant",
-            cval=np.nan,
+            mode="nearest",
             prefilter=False,
         )
-        finite = np.isfinite(values).all(axis=(1, 2))
-        values[~finite] = 0
-        dark, dark_q32 = np.quantile(
-            values[:, :, distance >= 0.65 * radius], [0.16, 0.32], axis=(1, 2)
+        finite = xp.isfinite(values).all(axis=(1, 2))
+        # Rays include all four cardinal directions. Exclude sites whose
+        # physical support extends beyond the frame, before using the samples.
+        last_pixel = np.array(image.shape[::-1]) - 1
+        finite &= xp.asarray(
+            ((sites >= radius) & (sites <= last_pixel - radius)).all(axis=1)
         )
-        bright = np.quantile(
-            values[:, :, distance <= max(0.7, 0.15 * pitch)], 0.96, axis=(1, 2)
+        values = xp.where(finite[:, None, None], values, 0)
+        dark, dark_q32 = xp.quantile(
+            values[:, :, distance.searchsorted(0.65 * radius) :].reshape(
+                len(sites), -1
+            ),
+            xp.asarray([0.16, 0.32]),
+            axis=1,
+        )
+        bright = xp.quantile(
+            values[
+                :, :, : distance.searchsorted(max(0.7, 0.15 * pitch), side="right")
+            ].reshape(len(sites), -1),
+            0.96,
+            axis=1,
         )
         amplitude = bright - dark
-        noise_floor = np.maximum(
-            1.90 * (dark_q32 - dark), 1e-6 * np.maximum(abs(dark), 1.0)
+        noise_floor = xp.maximum(
+            1.90 * (dark_q32 - dark), 1e-6 * xp.maximum(abs(dark), 1.0)
         )
         snr = amplitude / noise_floor
-        contrast_ok = snr >= 3.5
-        norm = (values - dark[:, None, None]) / np.maximum(
+        norm = (values - dark[:, None, None]) / xp.maximum(
             amplitude[:, None, None], 1e-12
         )
+        finite, dark, amplitude, snr = (
+            to_host(xp, a) for a in (finite, dark, amplitude, snr)
+        )
+        contrast_ok = snr >= 3.5
         coverage, points, centroids, areas, axes, major_angles = _isocontours(
-            norm, 0.5, sites, dirs, rays, distance
+            norm, 0.5, sites, dirs, rays, distance, xp
         )
         sensitivities = {}
         if threshold_diagnostics:
             for level in (0.4, 0.6):
                 cov, _, _, area, lengths, _ = _isocontours(
-                    norm, level, sites, dirs, rays, distance
+                    norm, level, sites, dirs, rays, distance, xp
                 )
                 closed = (cov >= 0.94) & (area > 0) & (lengths[:, 1] > 0)
                 sensitivities[level] = np.where(
@@ -212,7 +235,7 @@ def _contours(image, centers, pitch, shape, angle, threshold_diagnostics=False):
     return results
 
 
-def _flux(image, centers, pitch, shape, contours, bright, dark):
+def _flux(image, centers, pitch, shape, contours, bright, dark, xp=np):
     """Aperture photometry on native pixels, with a local surround background."""
     results = [empty_measurement(i, center, shape) for i, center in enumerate(centers)]
     rad = pitch / 2
@@ -229,24 +252,27 @@ def _flux(image, centers, pitch, shape, contours, bright, dark):
     batch_size = max(1, min(1024, 180000 // len(xx)))
     for k in range(0, len(indices), batch_size):
         ids = indices[k : k + batch_size]
-        x = xx + rounded[ids, 0, None]
-        y = yy + rounded[ids, 1, None]
-        dx, dy = x - centers[ids, 0, None], y - centers[ids, 1, None]
+        x = xp.asarray(xx) + xp.asarray(rounded[ids, 0, None])
+        y = xp.asarray(yy) + xp.asarray(rounded[ids, 1, None])
+        dx, dy = (
+            x - xp.asarray(centers[ids, 0, None]),
+            y - xp.asarray(centers[ids, 1, None]),
+        )
         dist2 = dx * dx + dy * dy
         values = image[y, x]
         ring = (dist2 >= (0.48 * pitch) ** 2) & (dist2 <= (0.64 * pitch) ** 2)
         # A low percentile used directly as background would generate positive
         # flux from zero-mean read noise. Use the ring median or a dark reference.
-        ordered = np.sort(np.where(ring, values, np.inf), axis=1)
-        last = np.maximum(ring.sum(axis=1) - 1, 0)
-        qi = np.rint(last[:, None] * [0.25, 0.5, 0.75]).astype(int)
-        q25, median, q75 = np.take_along_axis(ordered, qi, axis=1).T
-        bg = median if dark is None else np.full(len(ids), dark)
+        ordered = xp.sort(xp.where(ring, values, np.inf), axis=1)
+        last = xp.maximum(ring.sum(axis=1) - 1, 0)
+        qi = xp.rint(last[:, None] * xp.asarray([0.25, 0.5, 0.75])).astype(int)
+        q25, median, q75 = xp.take_along_axis(ordered, qi, axis=1).T
+        bg = median if dark is None else xp.full(len(ids), dark)
         # Sample only boundary pixels at 4x4 subpixel positions.
         weight = (dist2 < rad * rad).astype(np.float32)
         edge = (dist2 >= max(0, rad - 0.72) ** 2) & (dist2 < (rad + 0.72) ** 2)
         ex, ey = dx[edge], dy[edge]
-        partial = np.zeros(len(ex), dtype=np.float32)
+        partial = xp.zeros(len(ex), dtype=np.float32)
         for sx in (-0.375, -0.125, 0.125, 0.375):
             for sy in (-0.375, -0.125, 0.125, 0.375):
                 partial += (ex + sx) ** 2 + (ey + sy) ** 2 <= rad * rad
@@ -257,13 +283,16 @@ def _flux(image, centers, pitch, shape, contours, bright, dark):
         variance_factor = (weight**2).sum(axis=1)
         if dark is None:
             variance_factor += 1.57 * weight.sum(axis=1) ** 2 / (last + 1)
-        noise = np.maximum(sigma * np.sqrt(variance_factor), 1e-9)
+        noise = xp.maximum(sigma * xp.sqrt(variance_factor), 1e-9)
         snr = flux / noise
-        positive = np.isfinite(flux) & (flux > 0)
-        safe_flux = np.where(positive, flux, 1)
+        positive = xp.isfinite(flux) & (flux > 0)
+        safe_flux = xp.where(positive, flux, 1)
         offsets = (
-            np.column_stack(((weighted * dx).sum(axis=1), (weighted * dy).sum(axis=1)))
+            xp.column_stack(((weighted * dx).sum(axis=1), (weighted * dy).sum(axis=1)))
             / safe_flux[:, None]
+        )
+        positive, flux, offsets, snr, bg = (
+            to_host(xp, a) for a in (positive, flux, offsets, snr, bg)
         )
         for j, i in enumerate(ids):
             row = results[i]
@@ -377,7 +406,17 @@ def _representative(ids, limit=10):
 
 
 def _model_methods(
-    image, centers, pitch, shape, angle, contours, names, psf, tile_size, backend
+    image,
+    centers,
+    pitch,
+    shape,
+    angle,
+    contours,
+    names,
+    psf,
+    tile_size,
+    backend,
+    fit_seconds=None,
 ):
     result = {
         name: [empty_measurement(i, center, shape) for i, center in enumerate(centers)]
@@ -530,6 +569,9 @@ def _model_methods(
             for j in range(0, len(ids), batch_size):
                 group = ids[j : j + batch_size]
                 for name in names:
+                    if fit_seconds is not None:
+                        xp.cuda.get_current_stream().synchronize()
+                        fit_start = perf_counter()
                     # The differential estimate linearizes at the contour seed.
                     # It uses one displacement/size update, independently of the
                     # full fit. A fixed PSF makes this path especially cheap.
@@ -581,6 +623,8 @@ def _model_methods(
                             contour_xy=_outline(center, w, h, theta, shape),
                         )
                         row.update(diagnostic)
+                    if fit_seconds is not None:
+                        fit_seconds[name] += perf_counter() - fit_start
         del library
     return result
 

@@ -438,7 +438,7 @@ def iter_harmonic_tiles(
     """
     if not np.isfinite(tile_px) or tile_px < 4:
         raise ValueError("tile_px must be a finite tile width of at least four pixels")
-    data = np.asarray(image)
+    data = image if hasattr(image, "__cuda_array_interface__") else np.asarray(image)
     shift = np.asarray(shift_xy, dtype=float)
     origin = np.asarray(origin_xy, dtype=float)
     x0, y0, x1, y1 = np.asarray(region.bounds) - 0.5
@@ -615,6 +615,8 @@ def harmonic_tiles(
     shift_xy=(0.0, 0.0),
     tile_px=128,
     origin_xy=(0.0, 0.0),
+    *,
+    sample_orders=_tile_orders,
 ):
     """Collect the complete reference-aligned measurements from iter_harmonic_tiles."""
     return list(
@@ -624,5 +626,6 @@ def harmonic_tiles(
             shift_xy,
             tile_px,
             origin_xy,
+            sample_orders=sample_orders,
         )
     )

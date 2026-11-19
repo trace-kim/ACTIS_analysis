@@ -12,11 +12,12 @@ dependencies = ["numpy>=1.26", "scipy>=1.11", "pillow>=10", "matplotlib>=3.8"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
-gpu = ["cupy-cuda12x[ctk]>=14"]
+gpu = ["cupy-cuda12x[ctk]>=14", "tifffile", "imagecodecs"]
 fast = ["numba>=0.60"]
 
 [project.scripts]
 actis = "actis.cli:main"
+actis-benchmark-tiff = "actis.tiff_benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

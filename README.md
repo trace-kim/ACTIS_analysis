@@ -97,6 +97,21 @@ The detector looks for bright openings on a darker background in the first acqui
 
 The CSV acquisition indices start at zero. Fitted contours are exported in native (column, row) coordinates. The viewer subtracts each acquisition's measured translation to draw the image and contours in the reference coordinate system. Tiles already use that reference system. Color limits, grayscale stretching and display interpolation only affect viewing.
 
+## Time all seven methods on one multi-page TIFF
+
+From the checkout, install the CUDA extra and supply a holes-only reference page at the scan's pixel scale and orientation. The scan and reference may have different dimensions and bit depths. Both support 8- and 16-bit grayscale.
+
+~~~sh
+python -m pip install -e ".[gpu]"
+python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --json timing.json
+~~~
+
+If the reference is inside the scan, use `--reference-page 17` in place of `--reference holes.tiff` to use the eighteenth page. The benchmark still processes every page. A separate reference can also be a grayscale PNG or a numbered page in another TIFF.
+
+The selector takes one exemplar from each detected reference lattice and tests every complete scan tile against those exemplars, independent of page position. A batched GPU FFT estimates translation. All four quadrants of the overlapping pixels must then match at the same shift. The score is the lowest quadrant correlation after local gain and offset normalization. A blank or striped quadrant can therefore disqualify a tile whose overall correlation is high. This tests for hole arrays represented in the reference. Inspect labeled examples from the instrument when choosing `--min-corr` (default 0.80). The default tile side is 128 pixels. Choose an even `--tile-size` spanning at least five hole pitches. The output counts pixels skipped in incomplete edge tiles.
+
+The script prefetches the next TIFF page while processing bounded tile batches on one CUDA device. It reports scan wall time, pages per second, warm-up, decode, selection, and times and valid counts for all seven methods. Raw, harmonic and pooled counts refer to tiles. Contour, flux, model and differential counts refer to sites. GPU work is synchronized at timing boundaries. TIFF decoding, reference discovery, record assembly and the harmonic nonlinear fit use the CPU. Both aperture fits share contour seeds and blur profiling. Their individual times include that shared work, and the JSON also gives exclusive times. If the effective blur is independently calibrated, `--psf-sigma-px X Y` skips profiling. Use `--shape` only when the reference hole shape is known.
+
 ## Throughput and production boundary
 
 The report times input, discovery, alignment, each estimator and rendering separately. Optional `--io-sample "D:\ACTIS\stripes\2_1_1.tiff"` measures sequential file reading on the workstation. The operating system can cache a repeated read. The 1,500-page projections use 4,227,072,000 decoded pixels per board stack. Reference PNG bit depth, pattern density, TIFF compression and parallelism affect transfer to production. The exhaustive method comparison is a qualification run. Evaluate the selected method's throughput separately.
@@ -107,6 +122,6 @@ Run the resident-data benchmark to measure the raw, flux, pooled-moment and harm
 .\.venv\Scripts\actis benchmark --input "D:\ACTIS\reference-pngs" --output "D:\ACTIS\reports\timing-01.json" --workers 4 --seconds 5 --io-sample "D:\ACTIS\stripes\2_1_1.tiff"
 ~~~
 
-The TIFF contract is recorded for a later implementation. Arrays have shape up to (1500, 2048, 1376) in (page, row, column) order at 8 bits per pixel. A file name encodes stripe, vertical segment and board. The four simultaneous boards have 32-column overlaps and a combined width of 5,408 pixels. Neighboring stripes overlap by 32 columns. Stripe 1 scans down from the top. Even stripes scan up with reversed segment/page order and vertically flipped pages. The far end can overrun the nominal mask boundary by a fractional page, giving neighboring stripes different Y origins. The reference benchmark reads PNGs. TIFF stitching and full-mask streaming belong to the next phase.
+The production board stacks have shape up to (1500, 2048, 1376) in (page, row, column) order at 8 bits per pixel. A file name encodes stripe, vertical segment and board. The four simultaneous boards have 32-column overlaps and a combined width of 5,408 pixels. Neighboring stripes overlap by 32 columns. Stripe 1 scans down from the top. Even stripes scan up with reversed segment/page order and vertically flipped pages. The far end can overrun the nominal mask boundary by a fractional page, giving neighboring stripes different Y origins. The single-file TIFF benchmark measures native pages. Board and stripe stitching belong to the next phase.
 
 The equipment evidence, method assumptions and physical calibration requirements are documented in [the research notes](docs/metrology.md).

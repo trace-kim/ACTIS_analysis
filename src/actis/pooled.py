@@ -4,13 +4,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .fit import to_host
+
 try:
     from numba import njit
 except ImportError:
     njit = None
 
 
-def _moments_numpy(image, xy, low, scale, half):
+def _moments_numpy(image, xy, low, scale, half, xp=np):
     """Vectorized fallback with bounded stamp batches."""
     offsets = np.arange(-half, half + 1)
     dy, dx = np.meshgrid(offsets, offsets, indexing="ij")
@@ -18,13 +20,14 @@ def _moments_numpy(image, xy, low, scale, half):
     basis = np.stack(
         (np.ones_like(dx), dx, dy, dx * dx, dy * dy, dx * dy, border), axis=-1
     )
-    basis = basis.reshape(-1, 7).astype(np.float64)
-    out = np.empty((len(xy), 7))
+    basis = xp.asarray(basis.reshape(-1, 7), dtype=np.float64)
+    dx, dy = xp.asarray(dx.ravel()), xp.asarray(dy.ravel())
+    out = xp.empty((len(xy), 7))
     batch = max(1, 120000 // dx.size)
     for i in range(0, len(xy), batch):
         sites = xy[i : i + batch]
         stamp = image[sites[:, 1, None] + dy.ravel(), sites[:, 0, None] + dx.ravel()]
-        weights = np.clip(
+        weights = xp.clip(
             (stamp - low[i : i + batch, None]) * scale[i : i + batch, None], 0, 1
         )
         out[i : i + batch] = weights @ basis
@@ -58,15 +61,17 @@ _moments = (
 )
 
 
-def _measure(image, centers, half):
+def _measure(image, centers, half, xp=np):
     """Independent local contrast and soft pixel occupancy for each seed."""
-    xy = np.rint(centers).astype(np.int64)
+    xy = xp.asarray(np.rint(centers).astype(np.int64))
     mid = max(1, half // 2)
     offsets = np.arange(-1, 2)
     cy, cx = np.meshgrid(offsets, offsets, indexing="ij")
-    core = image[xy[:, 1, None] + cy.ravel(), xy[:, 0, None] + cx.ravel()]
+    core = image[
+        xy[:, 1, None] + xp.asarray(cy.ravel()), xy[:, 0, None] + xp.asarray(cx.ravel())
+    ]
     # Second brightest in the central 3x3 suppresses isolated hot pixels.
-    bright = np.partition(core, 7, axis=1)[:, 7].astype(float)
+    bright = xp.partition(core, 7, axis=1)[:, 7].astype(float)
     u = np.array(
         [
             -half,
@@ -107,30 +112,34 @@ def _measure(image, centers, half):
             -mid,
         ]
     )
-    ring = image[xy[:, 1, None] + v, xy[:, 0, None] + u]
-    q = np.partition(ring, (3, 7, 8, 12), axis=1).astype(float)
+    ring = image[xy[:, 1, None] + xp.asarray(v), xy[:, 0, None] + xp.asarray(u)]
+    q = xp.partition(ring, (3, 7, 8, 12), axis=1).astype(float)
     dark = 0.5 * (q[:, 7] + q[:, 8])
     contrast = bright - dark
-    noise = np.maximum((q[:, 12] - q[:, 3]) / 1.349, 1e-6 * np.maximum(abs(dark), 1))
+    noise = xp.maximum((q[:, 12] - q[:, 3]) / 1.349, 1e-6 * xp.maximum(abs(dark), 1))
     good = contrast > 3.5 * noise
-    saturated = np.zeros(len(xy), bool)
+    saturated = xp.zeros(len(xy), bool)
     if image.dtype.kind in "ui":
         saturated = (core == np.iinfo(image.dtype).max).sum(axis=1) >= 2
     # A finite ramp integrates fractional occupancy around a local half-height
     # threshold. Its endpoints are fixed before testing against the CD sweep.
     low = dark + 0.28 * contrast
-    scale = 1.0 / np.maximum(0.44 * contrast, 1e-12)
-    m = _moments(image, xy, low, scale, half)
+    scale = 1.0 / xp.maximum(0.44 * contrast, 1e-12)
+    m = (
+        _moments(image, xy, low, scale, half)
+        if xp is np
+        else _moments_numpy(image, xy, low, scale, half, xp)
+    )
     area = m[:, 0]
-    denominator = np.maximum(area, 1e-12)
+    denominator = xp.maximum(area, 1e-12)
     delta = m[:, 1:3] / denominator[:, None]
     cx, cy = delta.T
     good &= ~saturated & (area >= 2.0) & (m[:, 6] <= 0.035 * area)
-    good &= np.hypot(cx, cy) <= 0.58 * half
-    cov = m[:, 3:6] / denominator[:, None] - np.column_stack(
+    good &= xp.hypot(cx, cy) <= 0.58 * half
+    cov = m[:, 3:6] / denominator[:, None] - xp.column_stack(
         (cx * cx, cy * cy, cx * cy)
     )
-    return good, area, xy + delta, cov, saturated
+    return tuple(to_host(xp, a) for a in (good, area, xy + delta, cov, saturated))
 
 
 @dataclass
@@ -183,7 +192,7 @@ class _Exposure:
     shape: tuple
 
 
-def _exposure(data, grid, shift):
+def _exposure(data, grid, shift, xp=np):
     centers, half, bounds = grid.centers, grid.half, grid.bounds
     rounded = np.rint(centers + shift).astype(int)
     usable = ((rounded >= half) & (rounded < np.array(data.shape[::-1]) - half)).all(
@@ -194,7 +203,7 @@ def _exposure(data, grid, shift):
         axis=1
     )
     sites = centers[usable]
-    good, area, measured, cov, saturated = _measure(data, sites + shift, half)
+    good, area, measured, cov, saturated = _measure(data, sites + shift, half, xp)
     valid = np.zeros(len(centers), bool)
     valid[usable] = good
     sat = np.zeros(len(centers), bool)
@@ -303,7 +312,7 @@ def _rows(region, grid, exposure, common, tile_px, origin):
     return out
 
 
-def pooled_group_tiles(images, region, shifts, tile_px, origin_xy, groups):
+def pooled_group_tiles(images, region, shifts, tile_px, origin_xy, groups, *, xp=np):
     """Measure once per acquisition; intersect stable site IDs inside each group."""
     origin = np.asarray(origin_xy, dtype=float)
     grid = _grid(region, tile_px, origin)
@@ -312,7 +321,7 @@ def pooled_group_tiles(images, region, shifts, tile_px, origin_xy, groups):
     if grid is None:
         return {tuple(group): [[] for _ in group] for group in groups}
     samples = [
-        _exposure(np.asarray(image), grid, np.asarray(shift))
+        _exposure(xp.asarray(image), grid, np.asarray(shift), xp)
         for image, shift in zip(images, shifts)
     ]
     out = {}
@@ -335,10 +344,14 @@ def pooled_common_tiles(images, region, shifts, tile_px=128, origin_xy=(0.0, 0.0
     ]
 
 
-def pooled_tiles(image, region, shift_xy=(0.0, 0.0), tile_px=128, origin_xy=(0.0, 0.0)):
+def pooled_tiles(
+    image, region, shift_xy=(0.0, 0.0), tile_px=128, origin_xy=(0.0, 0.0), *, xp=np
+):
     """Mean area and within-hole moments of complete locally normalized apertures.
 
     Holes belong to tiles by reference center. Displacements are relative to
     ideal lattice sites after removing the global acquisition translation.
     """
-    return pooled_common_tiles([image], region, [shift_xy], tile_px, origin_xy)[0]
+    return pooled_group_tiles(
+        [image], region, [shift_xy], tile_px, origin_xy, [(0,)], xp=xp
+    )[(0,)][0]

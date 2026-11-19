@@ -95,6 +95,25 @@ class ApertureLibrary:
     def evaluate(self, x, y, width, height, derivatives=True):
         """Return native sampled template and optionally dx,dy,dwidth,dheight."""
         xp = self.xp
+        if xp is not np:
+            from .cuda_aperture import aperture_sampler
+
+            return aperture_sampler(derivatives)(
+                x,
+                y,
+                width[:, None],
+                height[:, None],
+                self.data,
+                self.data.shape[-1],
+                len(self.w),
+                len(self.h),
+                self.radius,
+                self.scale,
+                self.w[0],
+                self.h[0],
+                self.w[1] - self.w[0],
+                self.h[1] - self.h[0] if len(self.h) > 1 else 1,
+            )
         cx = xp.clip((x + self.radius) * self.scale, 0, self.data.shape[-1] - 1)
         cy = xp.clip((y + self.radius) * self.scale, 0, self.data.shape[-2] - 1)
         ix = xp.minimum(cx.astype("int32"), self.data.shape[-1] - 2)
