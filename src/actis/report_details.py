@@ -742,6 +742,26 @@ def details_views(
             "No excluded hole or tile observations.",
         ),
     )
+    discovery = getattr(study, "discovery", {})
+    rejected = discovery.get("rejected", [])
+    if rejected:
+        patterns += _table(
+            [
+                "Rejected field (left, top, right, bottom · px)",
+                "Candidate centers",
+                "Reason",
+                "Lattice inlier fraction",
+            ],
+            (
+                [
+                    ", ".join(map(str, row["bounds"])),
+                    row["candidate_centers"],
+                    row["reason"].replace("_", " "),
+                    row.get("lattice_inlier_fraction"),
+                ]
+                for row in rejected
+            ),
+        )
     x0, y0, x1, y1 = study.bounds
     parts.append(
         _card(

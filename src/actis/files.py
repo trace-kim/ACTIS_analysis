@@ -13,8 +13,10 @@ import numpy as np
 from PIL import Image
 
 
-def read_reference(folder):
+def read_reference(folder, *, source_archive=None):
     folder = Path(folder)
+    if source_archive is not None:
+        source_archive = Path(source_archive)
     if not folder.is_dir():
         raise ValueError(f"Reference folder does not exist: {folder}")
     paths = sorted(
@@ -27,6 +29,8 @@ def read_reference(folder):
         raise ValueError(
             f"Expected exactly eight reference PNGs in {folder}, found {len(paths)}."
         )
+    if source_archive is not None:
+        source_archive.mkdir(parents=True, exist_ok=True)
     images, info = [], []
     for path in paths:
         data = path.read_bytes()
@@ -49,6 +53,11 @@ def read_reference(folder):
             gamma, srgb = im.info.get("gamma"), im.info.get("srgb")
         if pixels.shape != (h, w) or (images and pixels.shape != images[0].shape):
             raise ValueError(f"{path.name}: image dimensions differ across repeats")
+        if source_archive is not None:
+            # Save the bytes used for the analysis, including PNG display metadata.
+            source_name = f"source-{len(images)}.png"
+            with (source_archive / source_name).open("xb") as copy:
+                copy.write(data)
         images.append(pixels)
         info.append(
             {
@@ -62,6 +71,8 @@ def read_reference(folder):
                 "png_srgb_intent": srgb,
             }
         )
+        if source_archive is not None:
+            info[-1]["report_source"] = f"{source_archive.name}/{source_name}"
     return images, info
 
 

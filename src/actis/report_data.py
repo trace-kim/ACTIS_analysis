@@ -3,8 +3,9 @@
 import base64
 import json
 import math
+import zlib
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 from PIL import Image, PngImagePlugin
@@ -218,15 +219,24 @@ def write_viewer_data(out, images, info, study):
         zip(images, info, study.registration, study.frames)
     ):
         preview = f"images/native-{repeat}.png"
-        source = f"images/source-{repeat}.png"
+        source = meta.get("report_source", f"images/source-{repeat}.png")
+        samples = f"data/dn-{repeat}.js"
         thumb = f"images/thumb-{repeat}.png"
         display = Image.fromarray(lut[image])
         display.save(out / preview)
         levels = _image_levels(out, display, repeat)
-        pnginfo = PngImagePlugin.PngInfo()
-        if meta.get("synthetic"):
-            pnginfo.add_text("actis-data-origin", "synthetic")
-        Image.fromarray(image).save(out / source, pnginfo=pnginfo)
+        if "report_source" not in meta:
+            pnginfo = PngImagePlugin.PngInfo()
+            if meta.get("synthetic"):
+                pnginfo.add_text("actis-data-origin", "synthetic")
+            Image.fromarray(image).save(out / source, pnginfo=pnginfo)
+        # Canvas exposes 8-bit display colors. Keep exact source DN independently
+        # available to the probe, including in reports opened directly via file://.
+        compressed = zlib.compress(image.astype("<u2", copy=False).tobytes(), level=1)
+        encoded = base64.b64encode(compressed).decode("ascii")
+        (out / samples).write_text(
+            f'window.ACTIS_SAMPLES({repeat},"{encoded}");\n', encoding="ascii"
+        )
         shift = list(map(float, reg["shift_xy"]))
         cx, cy = center + shift
         left = int(np.clip(round(cx - crop_w / 2), 0, display.width - crop_w))
@@ -236,6 +246,7 @@ def write_viewer_data(out, images, info, study):
         ).save(out / thumb)
         layers = {}
         qualified = {}
+        coverage = {}
         for method in methods:
             measurements = grouped.pop((repeat, method), [])
             if method in METHODS:
@@ -259,6 +270,18 @@ def write_viewer_data(out, images, info, study):
             layer["valid"] = len(values[method]) - before
             layer["total"] = len(layer["rows"])
             qualified[method] = layer["valid"]
+            rejected = Counter(
+                row[value_index + 1]
+                if row[value_index + 1] not in ("", "ok")
+                else "missing_value"
+                for row in layer["rows"]
+                if row[value_index] is None
+            )
+            coverage[method] = {
+                "total": layer["total"],
+                "valid": layer["valid"],
+                "exclusions": dict(rejected.most_common()),
+            }
             layers[method] = f"data/{repeat}-{method}.js"
             with (out / layers[method]).open("w", encoding="utf-8") as f:
                 f.write(f"window.ACTIS_LAYER({repeat},{json.dumps(method)},")
@@ -272,6 +295,7 @@ def write_viewer_data(out, images, info, study):
                 "image": preview,
                 "levels": levels,
                 "source": source,
+                "samples": samples,
                 "thumb": thumb,
                 "shift": shift,
                 "mean": float(metrics["mean_dn"]),
@@ -282,6 +306,7 @@ def write_viewer_data(out, images, info, study):
                 "periodicAmbiguity": bool(reg.get("periodic_ambiguity", False)),
                 "layers": layers,
                 "qualified": qualified,
+                "coverage": coverage,
             }
         )
     cd_values = np.concatenate(

@@ -11,6 +11,32 @@ from .report_data import write_viewer_data
 from .report_details import details_views
 
 
+def measurement_notice(study, frames):
+    if not study.regions:
+        discovery = getattr(study, "discovery", {})
+        count = discovery.get("candidate_centers")
+        candidates = (
+            f"Discovery found {count:,} candidate bright centers in acquisition 01. "
+            if count is not None
+            else ""
+        )
+        return (
+            candidates
+            + "No periodic region qualified. The hole fits and region-based tiles were skipped. "
+            "Whole-acquisition brightness is available for every input."
+        )
+    if not any(
+        frame["qualified"][method]
+        for frame in frames
+        for method in ("contour", "model", "differential", "flux")
+    ):
+        return (
+            "No per-hole measurement qualified across these acquisitions. "
+            "Select a method to see its coverage and exclusion reasons."
+        )
+    return ""
+
+
 def make_report(
     out,
     images,
@@ -24,9 +50,15 @@ def make_report(
     performance,
     synthetic,
     synthetic_settings=None,
+    viewer_data=None,
 ):
     start = perf_counter()
-    manifest = write_viewer_data(out, images, info, study)
+    manifest = (
+        viewer_data
+        if viewer_data is not None
+        else write_viewer_data(out, images, info, study)
+    )
+    notice = measurement_notice(study, manifest["frames"])
     precision, diagnostics = details_views(
         study,
         info,
@@ -73,6 +105,13 @@ def make_report(
         pixel_nm=f"{study.pixel_nm:g}",
         precision=precision,
         diagnostics=diagnostics,
+        qualification_notice=(
+            '<div class="detail-card" role="status"><p>'
+            + escape(notice)
+            + ' <a href="#run">Run details</a></p></div>'
+            if notice
+            else ""
+        ),
     )
     (out / "index.html").write_text(page, encoding="utf-8")
     return perf_counter() - start

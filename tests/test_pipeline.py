@@ -50,6 +50,7 @@ def test_reference_contract(tmp_path):
 
 
 def test_reference_entrypoint_measures_and_renders_eight_images(tmp_path):
+    """Exercise file input on a generated fixture, including the exact source PNGs."""
     source = tmp_path / "input"
     source.mkdir()
     images, _ = render_repeats(
@@ -139,6 +140,10 @@ def test_reference_entrypoint_measures_and_renders_eight_images(tmp_path):
     for repeat, (frame, original) in enumerate(zip(manifest["frames"], images)):
         assert frame["file"] == f"{repeat}.png"
         assert frame["mean"] == pytest.approx(values[repeat])
+        assert (out / frame["source"]).read_bytes() == (
+            source / frame["file"]
+        ).read_bytes()
+        assert run["measurement_coverage"][repeat]["methods"] == frame["coverage"]
         with Image.open(out / frame["source"]) as saved:
             np.testing.assert_array_equal(np.asarray(saved), original)
             assert np.asarray(saved).dtype == np.uint16
@@ -152,7 +157,53 @@ def test_reference_entrypoint_measures_and_renders_eight_images(tmp_path):
             assert script.startswith(prefix) and script.endswith(");\n")
             layer = json.loads(script[len(prefix) : -3])
             assert len(layer["rows"]) == layer["total"] == expected[repeat, method]
+            stats = frame["coverage"][method]
+            assert (
+                stats["valid"] + sum(stats["exclusions"].values())
+                == stats["total"]
+                == layer["total"]
+            )
 
     assert (
         main(["analyze-reference", "--input", str(source), "--output", str(out)]) == 2
     )
+
+
+def test_report_explains_failed_discovery_and_retains_page_brightness(tmp_path, capsys):
+    source = tmp_path / "blank"
+    source.mkdir()
+    for repeat in range(8):
+        Image.fromarray(np.full((64, 64), 1700 + repeat, np.uint16)).save(
+            source / f"{repeat}.png"
+        )
+    out = tmp_path / "report"
+    assert main(["diagnose-reference", "--input", str(source)]) == 0
+    assert (
+        capsys.readouterr().out.strip()
+        == "bright_candidates=0 regions=0 sites=0 rejected=too_few_centers"
+    )
+    assert (
+        main(
+            [
+                "analyze-reference",
+                "--input",
+                str(source),
+                "--output",
+                str(out),
+                "--backend",
+                "cpu",
+            ]
+        )
+        == 0
+    )
+    note = "No periodic region qualified"
+    assert note in capsys.readouterr().out
+    assert note in (out / "index.html").read_text(encoding="utf-8")
+    run = json.loads((out / "run.json").read_bytes())
+    assert run["discovery"]["candidate_centers"] == 0
+    assert run["discovery"]["rejected"][0]["reason"] == "too_few_centers"
+    for repeat, coverage in enumerate(run["measurement_coverage"]):
+        assert run["frames"][repeat]["mean_dn"] == 1700 + repeat
+        assert all(
+            x["total"] == 0 and x["valid"] == 0 for x in coverage["methods"].values()
+        )

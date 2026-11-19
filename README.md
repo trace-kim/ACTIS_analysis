@@ -51,13 +51,23 @@ Set `--cd-variation-nm 0` for a uniform mask. Other options include `--shape squ
 
 The **Comparison** tab opens with two methods on the same acquisition. Each pane has its own method and filename selectors. To assign acquisitions from the sidebar, choose **A** or **B**. Use **Overlay** to blend the registered images and compare solid A and dashed B annotations.
 
-Scroll over either image to zoom at the pointer, drag to pan, or click the field navigator to move both panes. **Fit** shows the entire field and **1:1** sets one screen pixel per acquisition pixel. **Pixel grid** reveals the native sampling when magnified. A shared grayscale transfer preserves bright and dark tails across the run. Each pane offers the original 16-bit pixel values as a PNG download.
+The viewer opens on **Source PNG** at **1:1**, with one detector sample per physical screen pixel. Magnification uses nearest-neighbor sampling. The pointer readout shows each pane's native pixel coordinates and exact 16-bit DN. The download preserves the input PNG bytes and metadata. Switch to **Shared contrast** when the detector uses a narrow part of its 16-bit range. This applies one display stretch across all acquisitions. Scroll over either image to zoom, drag to pan, or use **Fit** and the field navigator to move around the acquisition.
 
 Click a hole to see both measurements, units, fitted dimensions, flags and any held-out placement residual. **Find site** accepts the region and site ID from the hole export. **Largest difference** jumps to the largest absolute discrepancy among qualified pairs with matching quantities and spatial support. **Shared scale** uses common CD color limits. **Method scale** reveals smaller spatial variation within one method and retains the same limits across acquisitions.
 
 Hole methods draw their measured contours or center markers. For tile methods the rings show which reference sites share one tile estimate. Dashed tile boundaries mark its footprint. **Excluded** shows failed measurements, and the inspector gives the reason. **Image only** lets you examine the detector image alone.
 
 The **Precision** tab contains repeatability, coverage and matched spatial comparisons. **Run details** contains acquisition signal profiles, registration, timings and downloadable measurement tables.
+
+### Diagnose an empty comparison
+
+The detector looks for bright openings on a darker background in the first acquisition. On the workstation, run the following read-only command against the same input folder to check discovery before fitting the stack. It prints one line of counts and rejection reasons. It runs offline and writes no report.
+
+~~~powershell
+.\.venv\Scripts\actis diagnose-reference --input "D:\ACTIS\reference-pngs"
+~~~
+
+`bright_candidates` counts detected centers. `regions` counts regions with a qualified lattice. With zero regions, the pipeline skips hole fits and region-based tiles. Whole-acquisition mean DN remains available. For runs with an accepted lattice, the method selector distinguishes an empty support from measurements that were attempted and excluded. Each pane shows its exclusion reasons. `run.json` records discovery evidence and the valid, eligible and excluded counts for each acquisition and method.
 
 - **Native page** reproduces one raw arithmetic mean per acquisition. **Common field** uses the overlapping mask area. **Pilot tile** uses complete fixed squares. A 676 × 2,048 source field covers 14.196 × 43.008 µm at the nominal scale. A full 100 × 100 µm historical bin requires a larger measured area.
 - **3σ** is three times the sample standard deviation across acquisitions. The percentage is `100 × 3s / |mean|`. Each bin first gets one value per acquisition. The study then averages the binwise scores, giving each valid bin equal weight. The 56 possible three-acquisition subsets appear separately. Their overlap limits interpretation.

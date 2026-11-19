@@ -1,7 +1,7 @@
 """Analyze repeats in native image coordinates; correspondence uses the first field."""
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 
 import numpy as np
@@ -35,6 +35,7 @@ class Study:
     frames: list
     timing: dict
     notes: list
+    discovery: dict = field(default_factory=dict)
 
 
 def rect_mean(image, bounds):
@@ -106,7 +107,8 @@ def analyze(
         raise ValueError("Pixel pitch and tile size must be finite and positive")
     timing = defaultdict(float)
     start = perf_counter()
-    regions = discover(images[0])
+    discovery = {}
+    regions = discover(images[0], diagnostics=discovery)
     if not regions:
         if allow_unpatterned:
             bounds = common_bounds(images[0].shape, [(0.0, 0.0)])
@@ -138,6 +140,7 @@ def analyze(
                 [
                     "No periodic hole array was found in the reference acquisition. Only native page brightness is qualified."
                 ],
+                discovery,
             )
         raise ValueError(
             "No periodic hole array was detected in the reference acquisition"
@@ -383,4 +386,5 @@ def analyze(
         frames,
         dict(timing),
         notes,
+        discovery,
     )

@@ -420,6 +420,7 @@ h1 {
 }
 .layer-tools {
   gap: 14px;
+  flex-wrap: wrap;
   color: var(--muted);
   font-size: 11px;
 }
@@ -442,7 +443,7 @@ select {
   color: var(--ink);
   max-width: 100%;
 }
-.color-control select {
+.layer-tools select {
   font-size: 11px;
   border: 1px solid var(--line);
   padding: 3px;
@@ -574,6 +575,10 @@ select {
   align-items: center;
   gap: 5px;
   flex-wrap: wrap;
+}
+.pixel-probe {
+  flex-basis: 100%;
+  color: var(--ink);
 }
 .gradient {
   display: inline-block;

@@ -16,8 +16,10 @@ from PIL import Image, PngImagePlugin
 
 from . import __version__
 from .analysis import analyze
+from .discovery import discover
 from .files import read_reference, save_json, write_table
-from .report import make_report
+from .report import make_report, measurement_notice
+from .report_data import write_viewer_data
 from .scores import summarize
 from .stress import run_stress
 from .synthetic import render_repeats
@@ -193,6 +195,26 @@ def _read_speed(path):
     )
 
 
+def _discovery_readout(regions, discovery):
+    values = [
+        f"bright_candidates={discovery['candidate_centers']}",
+        f"regions={len(regions)}",
+        f"sites={sum(len(r.centers) for r in regions)}",
+    ]
+    rejected = discovery["rejected"]
+    if rejected:
+        reasons = sorted({r["reason"] for r in rejected})
+        values.append("rejected=" + ",".join(reasons))
+        fractions = [
+            r["lattice_inlier_fraction"]
+            for r in rejected
+            if "lattice_inlier_fraction" in r
+        ]
+        if fractions:
+            values.append(f"best_rejected_inlier_fraction={max(fractions):.3f}")
+    return " ".join(values)
+
+
 def _pipeline(args, out):
     pipeline_start = perf_counter()
     simulated = args.command == "synthetic"
@@ -224,7 +246,7 @@ def _pipeline(args, out):
     else:
         source = args.input
     start = perf_counter()
-    images, info = read_reference(source)
+    images, info = read_reference(source, source_archive=out / "images")
     input_seconds = perf_counter() - start
     simulated = simulated or any(row.get("synthetic") for row in info)
     start = perf_counter()
@@ -237,6 +259,7 @@ def _pipeline(args, out):
         allow_unpatterned=True,
     )
     analysis_seconds = perf_counter() - start
+    print(_discovery_readout(study.regions, study.discovery), flush=True)
     if len({r["sha256"] for r in info}) < len(info):
         study.notes.append(
             "Some inputs are byte-identical. Duplicated acquisitions reduce the apparent dispersion."
@@ -277,6 +300,12 @@ def _pipeline(args, out):
     comparisons = _comparison(study, summary, stress)
     print("Writing offline figures, report and measurement tables", flush=True)
     start = perf_counter()
+    viewer_data = write_viewer_data(out, images, info, study)
+    viewer_seconds = perf_counter() - start
+    notice = measurement_notice(study, viewer_data["frames"])
+    if notice:
+        print(notice, flush=True)
+    start = perf_counter()
     regions = [
         dict(
             id=r.region_id,
@@ -301,6 +330,11 @@ def _pipeline(args, out):
             inputs=info,
             frames=study.frames,
             regions=regions,
+            discovery=study.discovery,
+            measurement_coverage=[
+                {"file": frame["file"], "methods": frame["coverage"]}
+                for frame in viewer_data["frames"]
+            ],
             common_bounds_xyxy_px=study.bounds,
             registration=study.registration,
             notes=study.notes,
@@ -328,7 +362,7 @@ def _pipeline(args, out):
     ]:
         write_table(out / (filename + ".csv"), rows)
     performance["export_seconds"] = perf_counter() - start
-    performance["report_seconds"] = make_report(
+    performance["report_seconds"] = viewer_seconds + make_report(
         out,
         images,
         info,
@@ -341,6 +375,7 @@ def _pipeline(args, out):
         performance,
         simulated,
         synthetic_settings=synthetic_settings,
+        viewer_data=viewer_data,
     )
     performance["total_seconds"] = perf_counter() - pipeline_start
     save_json(out / "performance.json", performance)
@@ -367,6 +402,13 @@ def vars_for_synthetic(args):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    probe = commands.add_parser(
+        "diagnose-reference",
+        help="Check first-acquisition pattern discovery locally and print a one-line result",
+    )
+    probe.add_argument(
+        "--input", type=Path, required=True, help="The eight-PNG reference folder"
+    )
     bench = commands.add_parser(
         "benchmark", help="Time resident tile kernels on the target workstation"
     )
@@ -456,6 +498,16 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.command == "diagnose-reference":
+        try:
+            images, _ = read_reference(args.input)
+            diagnostics = {}
+            regions = discover(images[0], diagnostics=diagnostics)
+            print(_discovery_readout(regions, diagnostics))
+            return 0
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"ACTIS diagnosis: {exc}", file=sys.stderr)
+            return 1
     dst = args.output.resolve()
     if args.command == "benchmark":
         from .throughput import benchmark

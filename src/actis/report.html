@@ -37,13 +37,14 @@
         <button id="overlay" aria-pressed="false"><i class="overlay-icon" aria-hidden="true"></i>Overlay</button>
       </div>
     </div>
+    $qualification_notice
     <div class="workbench" id="workbench">
       <div class="tools">
-        <div class="zoom-tools"><button id="zoom-out" aria-label="Zoom out" title="Zoom out (−)">−</button><output id="zoom-level" aria-label="Zoom level"></output><button id="zoom-in" aria-label="Zoom in" title="Zoom in (+)">+</button><span class="rule"></span><button id="fit">Fit</button><button id="native" title="One display pixel per native pixel">1:1</button></div>
+        <div class="zoom-tools"><button id="zoom-out" aria-label="Zoom out" title="Zoom out (−)">−</button><output id="zoom-level" aria-label="Zoom level"></output><button id="zoom-in" aria-label="Zoom in" title="Zoom in (+)">+</button><span class="rule"></span><button id="fit">Fit</button><button id="native" title="One screen pixel per native detector pixel">1:1</button></div>
         <div class="layer-tools">
           <label><input id="marks" type="checkbox" checked> Annotations</label>
           <label><input id="excluded" type="checkbox"> Excluded</label>
-          <label title="Show the native pixel grid when magnified"><input id="pixels" type="checkbox"> Pixel grid</label>
+          <label class="intensity-control">Image <select id="intensity-mode" title="Source displays the original PNG at its encoded levels. Shared contrast stretches the same detector samples for visibility."><option value="source">Source PNG</option><option value="contrast">Shared contrast</option></select></label>
           <label class="color-control">Color <select id="color-mode"><option value="value">Shared scale</option><option value="method">Method scale</option><option value="pane">By pane</option></select></label>
         </div>
       </div>
@@ -67,7 +68,7 @@
   <section class="pane">
     <div class="pane-head"><span class="pane-badge"></span><div class="pane-picks"><select class="method" aria-label="Measurement method"></select><select class="acq" aria-label="Acquisition"></select></div><span class="support"></span></div>
     <div class="stage"><canvas class="field" tabindex="0"></canvas><span class="stage-msg" role="status"></span><span class="ruler"></span></div>
-    <div class="pane-foot"><div class="metric-key"></div><div class="coverage"></div><a class="native-download" download title="Download this acquisition at its original 16-bit pixel depth">↓ 16-bit PNG</a></div>
+    <div class="pane-foot"><div class="metric-key"></div><div class="coverage"></div><a class="native-download" download title="Download this acquisition at its original 16-bit pixel depth">↓ 16-bit PNG</a><span class="pixel-probe" title="Nearest original detector sample at the indicated native column and row"></span></div>
   </section>
 </template>
 <script type="application/json" id="study">$manifest</script>

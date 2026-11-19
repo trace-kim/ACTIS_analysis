@@ -50,6 +50,42 @@ def test_rotated_stagger_basis_and_native_correspondence():
     assert np.allclose(r.centers[pairs[:, 0]] + shift, shuffled[pairs[:, 1]])
 
 
+def test_dense_native_pixel_lattice_keeps_phase_across_full_detector_height():
+    # A rounded threshold centroid depends on the subpixel sampling phase.
+    # On this field the median apparent neighbor spacing formerly lost nearly
+    # three rows of phase and all measurements were dropped at discovery.
+    h, w = 2048, 676
+    pitch = 5.9
+    y, x = np.ogrid[:h, :w]
+    dx = (x + 0.30 + pitch / 2) % pitch - pitch / 2
+    dy = (y + 0.13 + pitch / 2) % pitch - pitch / 2
+    exposure = (
+        3000 + 11000 * np.exp(-0.5 * ((dx / 1.24) ** 2 + (dy / 1.34) ** 2))
+    ).astype("uint16")
+    diagnostics = {}
+    regions = discover(exposure, diagnostics=diagnostics)
+    assert diagnostics["candidate_centers"] > 39000
+    assert diagnostics["accepted_regions"] == len(regions) == 1
+    assert diagnostics["rejected"] == []
+    region = regions[0]
+    assert region.confidence > 0.99
+    np.testing.assert_allclose(region.basis, pitch * np.eye(2), atol=0.001)
+
+
+def test_discovery_rejections_distinguish_missing_sites_from_a_line_of_sites():
+    image = np.zeros((100, 200))
+    diagnostics = {}
+    assert not discover(image, diagnostics=diagnostics)
+    assert diagnostics["candidate_centers"] == 0
+    assert diagnostics["rejected"][0]["reason"] == "too_few_centers"
+
+    for x in range(8, 195, 12):
+        image[48:52, x : x + 4] = 1
+    assert not discover(image, diagnostics=diagnostics)
+    assert diagnostics["candidate_centers"] == 16
+    assert diagnostics["rejected"][0]["reason"] == "no_independent_lattice"
+
+
 def test_subpixel_registration_and_aliases():
     img = array_image(shape=(192, 208))
     delta = (1.45, -2.25)

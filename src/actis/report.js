@@ -111,7 +111,9 @@
     }
     return imageCache.get(url);
   }
-  const loadImage = (repeat) => assetImage(frames[repeat].image);
+  const sourceView = () => $("#intensity-mode").value === "source";
+  const loadImage = (repeat) => assetImage(sourceView() ? frames[repeat].source : frames[repeat].image);
+  const deviceScale = () => window.devicePixelRatio || 1;
 
   const layers = new Map(),
     pending = new Map();
@@ -121,6 +123,61 @@
       bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return new Type(bytes.buffer);
+  }
+  // A browser canvas quantizes and color-manages PNGs. Inspect the original
+  // detector samples independently and retain only the displayed acquisitions.
+  const samplePlanes = new Map();
+  let pointerOffset = null;
+  window.ACTIS_SAMPLES = async (repeat, encoded) => {
+    const plane = samplePlanes.get(repeat);
+    if (!plane) return;
+    try {
+      const bytes = unpack(encoded, Uint8Array);
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+      const buffer = await new Response(stream).arrayBuffer();
+      if (buffer.byteLength !== 2 * data.width * data.height) throw new Error("Invalid detector plane");
+      plane.values = new DataView(buffer);
+    } catch {
+      plane.failed = true;
+    }
+    updateProbe();
+  };
+  function loadSamples(repeat) {
+    for (const old of samplePlanes.keys()) {
+      if (!panes.some((p) => p.repeat === old)) samplePlanes.delete(old);
+    }
+    if (samplePlanes.has(repeat) || !frames[repeat].samples) return;
+    const plane = { values: null, failed: false };
+    samplePlanes.set(repeat, plane);
+    const script = document.createElement("script");
+    script.src = frames[repeat].samples;
+    script.onload = () => script.remove();
+    script.onerror = () => {
+      script.remove();
+      plane.failed = true;
+      updateProbe();
+    };
+    document.head.append(script);
+  }
+  function updateProbe() {
+    const location = pointerOffset
+      ? { x: camera.x + pointerOffset.x / camera.scale, y: camera.y + pointerOffset.y / camera.scale }
+      : selection;
+    if (!location) return;
+    for (const p of panes) {
+      const [dx, dy] = frames[p.repeat].shift;
+      const x = Math.floor(location.x + dx + 0.5),
+        y = Math.floor(location.y + dy + 0.5);
+      const plane = samplePlanes.get(p.repeat);
+      let reading = "Outside acquisition";
+      if (x >= 0 && y >= 0 && x < data.width && y < data.height) {
+        if (plane?.values) reading = fmt(plane.values.getUint16(2 * (y * data.width + x), true), 0) + " DN";
+        else reading = plane && !plane.failed ? "Loading DN…" : "DN unavailable";
+        reading += " · (" + x + ", " + y + ")";
+      }
+      $(".pixel-probe", p.element).textContent =
+        (pointerOffset ? "Pointer pixel · " : "Selected pixel · ") + reading;
+    }
   }
   const layerKey = (repeat, method) => repeat + "-" + method;
   const tileKey = (region, i, j) => region + ":" + i + ":" + j;
@@ -171,6 +228,9 @@
   const initialMethods = ["contour", "model", "differential", "flux", "harmonic", "pooled", "raw"].filter(
     (method) => (frames[0].qualified ? frames[0].qualified[method] > 0 : sites.length > 0),
   );
+  function usesPageMean(repeat, method) {
+    return method === "raw" && frames[repeat].coverage?.raw.total === 0;
+  }
   function createPane(idx) {
     const element = $("#pane-template").content.firstElementChild.cloneNode(true);
     $("#pane-grid").append(element);
@@ -179,8 +239,8 @@
       idx,
       field: $(".field", element),
       stage: $(".stage", element),
-      repeat: 0,
-      method: initialMethods[idx] || "image",
+      repeat: !initialMethods.length && idx === 1 && frames.length > 1 ? 1 : 0,
+      method: initialMethods[idx] || (initialMethods.length ? "image" : "raw"),
       layer: null,
       version: 0,
     };
@@ -247,11 +307,28 @@
     });
   }
   function refreshNotice(p) {
-    const image = imageCache.get(frames[p.repeat].image);
+    const image = p.image;
     let msg = p.error || (image?.failed ? "Image file could not be opened." : "");
-    if (!msg && p.method !== "image" && !p.layer) msg = "Loading measurements…";
-    if (!msg && p.layer && !p.layer.valid)
-      msg = p.layer.total ? "No qualified measurements" : "No measurements on this support";
+    if (!msg && p.method !== "image" && !usesPageMean(p.repeat, p.method) && !p.layer)
+      msg = "Loading measurements…";
+    if (!msg && p.layer && !p.layer.valid) {
+      const support = methods[p.method].support;
+      if (p.layer.total) {
+        const reasons = Object.entries(frames[p.repeat].coverage?.[p.method].exclusions || {}).map(
+          ([reason, count]) => fmt(count, 0) + " " + reason.replaceAll("_", " "),
+        );
+        msg =
+          "0 of " +
+          fmt(p.layer.total, 0) +
+          (support === "hole" ? " holes" : " tiles") +
+          " qualified. " +
+          reasons.join(" · ");
+      } else if (!data.regions.length) {
+        msg = "Skipped · no reference lattice";
+      } else {
+        msg = support === "hole" ? "No candidate sites in the common field" : "No complete eligible tiles";
+      }
+    }
     const node = $(".stage-msg", p.element);
     node.textContent = msg;
     node.dataset.message = msg;
@@ -260,22 +337,30 @@
     const version = ++p.version;
     for (const opt of p.methodSelect.options) {
       if (opt.value !== "image") {
-        const suffix = frames[p.repeat].qualified?.[opt.value] === 0 ? " · no valid results" : "";
-        opt.textContent = methods[opt.value].name + suffix;
+        const stats = frames[p.repeat].coverage?.[opt.value];
+        const support = methods[opt.value].support === "hole" ? "sites" : "tiles";
+        const suffix =
+          stats?.total === 0 ? " · no eligible " + support : stats?.valid === 0 ? " · all excluded" : "";
+        opt.textContent = usesPageMean(p.repeat, opt.value)
+          ? "Raw brightness · whole acquisition"
+          : methods[opt.value].name + suffix;
       }
     }
     p.methodSelect.value = p.method;
     p.frameSelect.value = p.repeat;
     p.image = loadImage(p.repeat);
+    loadSamples(p.repeat);
     p.error = "";
     p.layer = null;
     $("#rank-note").hidden = true;
     const method = methods[p.method];
-    $(".support", p.element).textContent = method
-      ? method.support === "hole"
-        ? "Per hole"
-        : "Per tile"
-      : "Native image";
+    $(".support", p.element).textContent = usesPageMean(p.repeat, p.method)
+      ? "Whole frame"
+      : method
+        ? method.support === "hole"
+          ? "Per hole"
+          : "Per tile"
+        : "Native image";
     acquisitionTags();
     $(".native-download", p.element).href = frames[p.repeat].source;
     refreshNotice(p);
@@ -283,7 +368,7 @@
     inspect();
     schedule();
     updateRegistration();
-    if (method) {
+    if (method && !usesPageMean(p.repeat, p.method)) {
       try {
         const layer = await loadLayer(p.repeat, p.method);
         if (p.version === version) p.layer = layer;
@@ -326,8 +411,7 @@
 
   let colorMode = "value",
     showMarks = true,
-    showExcluded = false,
-    pixelated = false;
+    showExcluded = false;
   function byValue() {
     return !combined && colorMode !== "pane";
   }
@@ -340,8 +424,12 @@
         count = $(".coverage", p.element);
       const m = methods[p.method];
       node.replaceChildren();
-      if (!m) {
-        node.textContent = "Grayscale · shared DN stretch";
+      node.title = "";
+      count.title = "";
+      if (!m || usesPageMean(p.repeat, p.method)) {
+        node.textContent = m
+          ? "Mean " + fmt(frames[p.repeat].mean, 2) + " DN · whole frame"
+          : "Grayscale image";
         count.textContent = fmt(frames[p.repeat].min, 0) + "–" + fmt(frames[p.repeat].max, 0) + " DN";
       } else {
         if (byValue()) {
@@ -368,7 +456,7 @@
           : "";
         count.title = "Qualified measurements / eligible measurements";
       }
-      if (m?.support === "tile")
+      if (m?.support === "tile" && !usesPageMean(p.repeat, p.method))
         node.title += " Rings mark reference sites and carry the enclosing tile estimate.";
       if (combined && p.idx === 1 && p.error) count.textContent = p.error;
     }
@@ -395,16 +483,16 @@
   function drawBase(ctx, p, view, opacity) {
     let img = p.image;
     if (!img || !img.complete || !img.naturalWidth || !opacity) return;
-    const needed = view.scale * (window.devicePixelRatio || 1);
-    const level = frames[p.repeat].levels?.filter((l) => l.scale >= needed).pop();
+    const needed = view.scale * deviceScale();
+    const level = !sourceView() && frames[p.repeat].levels?.filter((l) => l.scale >= needed).pop();
     if (level) {
       const reduced = assetImage(level.image);
       if (reduced.complete && reduced.naturalWidth) img = reduced;
     }
     const [dx, dy] = frames[p.repeat].shift;
     ctx.globalAlpha = opacity;
-    ctx.imageSmoothingEnabled = !pixelated || view.scale < 1;
-    ctx.imageSmoothingQuality = view.scale < 1 ? "high" : "low";
+    ctx.imageSmoothingEnabled = !sourceView() && needed < 1;
+    ctx.imageSmoothingQuality = "high";
     ctx.drawImage(
       img,
       view.x - (dx + 0.5) * view.scale,
@@ -617,7 +705,8 @@
       drawPane(panes[0]);
       if (!combined) drawPane(panes[1]);
       drawOverview();
-      $("#zoom-level").textContent = fmt(camera.scale * 100, 0) + "%";
+      updateProbe();
+      $("#zoom-level").textContent = fmt(camera.scale * deviceScale() * 100, 0) + "%";
     });
   }
   function initializeCamera() {
@@ -639,9 +728,8 @@
     if (i !== null) {
       camera.x = sites[i][2];
       camera.y = sites[i][3];
-      // Open on a readable patch. Fit and the navigator provide full-field context.
-      camera.scale = clamp(Math.max(fitScale(), Math.min(w, h) / (15 * pitch)), 0.01, 64);
-    } else camera.scale = fitScale();
+    }
+    camera.scale = 1 / deviceScale();
     selectPoint(camera.x, camera.y, i);
   }
   function fitScale() {
@@ -726,6 +814,8 @@
     });
     canvas.addEventListener("pointermove", (event) => {
       const offset = point(event, canvas);
+      pointerOffset = offset;
+      updateProbe();
       const x = camera.x + offset.x / camera.scale,
         y = camera.y + offset.y / camera.scale;
       $("#position").textContent = "X " + fmt(x, 1) + "  Y " + fmt(y, 1) + " px";
@@ -758,6 +848,8 @@
     });
     canvas.addEventListener("pointerleave", () => {
       $("#position").textContent = "";
+      pointerOffset = null;
+      updateProbe();
     });
   }
   function navigate(event) {
@@ -771,9 +863,9 @@
   }
   function reading(p) {
     const spec = methods[p.method];
-    if (!spec)
+    if (!spec || usesPageMean(p.repeat, p.method))
       return {
-        name: "Image only",
+        name: spec ? "Raw brightness" : "Image only",
         value: frames[p.repeat].mean,
         unit: "DN",
         note: "Whole-acquisition mean",
@@ -989,15 +1081,22 @@
   $("#split").onclick = () => mode(false);
   $("#overlay").onclick = () => mode(true);
   $("#fit").onclick = $("#nav-fit").onclick = fit;
-  $("#native").onclick = () => zoom(1);
+  $("#native").onclick = () => zoom(1 / deviceScale());
   $("#zoom-in").onclick = () => zoom(camera.scale * Math.SQRT2);
   $("#zoom-out").onclick = () => zoom(camera.scale / Math.SQRT2);
-  for (const id of ["marks", "excluded", "color-mode", "pixels"])
+  $("#intensity-mode").onchange = () => {
+    for (const p of panes) {
+      p.image = loadImage(p.repeat);
+      refreshNotice(p);
+    }
+    updateLegends();
+    schedule();
+  };
+  for (const id of ["marks", "excluded", "color-mode"])
     $("#" + id).onchange = () => {
       showMarks = $("#marks").checked;
       showExcluded = $("#excluded").checked;
       colorMode = $("#color-mode").value;
-      pixelated = $("#pixels").checked;
       updateLegends();
       schedule();
     };

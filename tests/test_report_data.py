@@ -1,10 +1,13 @@
 import base64
 import json
+import struct
+import zlib
 from types import SimpleNamespace
 
 import numpy as np
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
+from actis.files import read_reference
 from actis.report_data import _image_levels, write_viewer_data
 
 
@@ -59,13 +62,29 @@ def test_report_preserves_site_identity_native_contours_and_tile_support(tmp_pat
         holes=[hole, blank],
         tiles=[tile],
     )
-    manifest = write_viewer_data(tmp_path, [image], [{"file": "input.png"}], study)
+    inputs = tmp_path / "acquisitions"
+    inputs.mkdir()
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add(b"gAMA", struct.pack(">I", 45455))
+    metadata.add_text("instrument", "test camera")
+    for i in range(8):
+        Image.fromarray(image).save(inputs / f"{i}.png", pnginfo=metadata)
+    originals, info = read_reference(inputs, source_archive=tmp_path / "images")
+    manifest = write_viewer_data(tmp_path, originals[:1], info[:1], study)
     frame = manifest["frames"][0]
     assert frame["levels"] == [] and manifest["overview"] == frame["image"]
     assert manifest["sites"] == [[1, 0, 10, 10], [2, 0, 25, 20]]
     assert manifest["width"] == 40 and manifest["height"] == 32
     with Image.open(tmp_path / frame["source"]) as saved:
         np.testing.assert_array_equal(saved, image)
+    assert (tmp_path / frame["source"]).read_bytes() == (inputs / "0.png").read_bytes()
+    script = (tmp_path / frame["samples"]).read_text(encoding="ascii")
+    assert script.startswith('window.ACTIS_SAMPLES(0,"') and script.endswith('");\n')
+    packed = json.loads(script[len("window.ACTIS_SAMPLES(0,") : -3])
+    decoded = zlib.decompress(base64.b64decode(packed))
+    np.testing.assert_array_equal(
+        np.frombuffer(decoded, "<u2").reshape(image.shape), image
+    )
     with Image.open(tmp_path / frame["image"]) as saved:
         assert saved.size == (40, 32) and saved.getextrema() == (6, 249)
 

@@ -162,6 +162,15 @@ def _basis(xy, pitch):
     a = a * np.sign(a[0] or 1)
     b = b * np.sign(np.linalg.det([a, b]))
     basis = np.array([a, b])
+    # Pixel-phase errors bias the median of short neighbor displacements. Across
+    # hundreds of periods even a few hundredths of a pixel breaks integer site
+    # assignment. Average the measured adjacent-site steps first. Interior
+    # centroid errors then cancel between incoming and outgoing steps.
+    for j, vector in enumerate(basis):
+        distance, neighbor = tree.query(xy + vector, distance_upper_bound=0.19 * pitch)
+        paired = np.isfinite(distance)
+        if np.count_nonzero(paired) >= 8:
+            basis[j] = np.mean(xy[neighbor[paired]] - xy[paired], axis=0)
     anchor = np.median(xy, axis=0)
     for _ in range(5):
         coords = (xy - anchor) @ np.linalg.inv(basis)
@@ -334,24 +343,36 @@ def _profile_partition(image, region, ellipse_angle, square_angle):
     return None
 
 
-def discover(image, pitch_px=None, shape="auto", regions=None):
+def discover(image, pitch_px=None, shape="auto", regions=None, *, diagnostics=None):
     """Discover bright islands, locally homogeneous domains, and lattice bases.
 
     Explicit reference-coordinate rectangles use exclusive right/bottom bounds.
     Optional region keys are bounds, shape, pitch_px, and angle_deg.
+    A supplied diagnostics dictionary receives candidate counts and the
+    qualification failures of regions that could not be indexed.
     """
     image = np.asarray(image)
     if image.ndim != 2 or min(image.shape) < 12 or not np.isfinite(image).all():
         raise ValueError("Discovery needs a finite 2D image of at least 12x12 pixels")
     h, w = image.shape
     configs = regions or [{"bounds": (0, 0, w, h)}]
+    rejected = []
+    candidate_count = 0
     out = []
     for cfg in configs:
         x0, y0, x1, y1 = map(int, cfg["bounds"])
         if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
             raise ValueError("Region bounds outside the native reference image")
         xy, feat = _islands(image[y0:y1, x0:x1])
+        candidate_count += len(xy)
         if len(xy) < 9:
+            rejected.append(
+                {
+                    "reason": "too_few_centers",
+                    "bounds": (x0, y0, x1, y1),
+                    "candidate_centers": len(xy),
+                }
+            )
             continue
         xy += [x0, y0]
         auto_pitch = float(np.median(cKDTree(xy).query(xy, k=2)[0][:, 1]))
@@ -375,8 +396,23 @@ def discover(image, pitch_px=None, shape="auto", regions=None):
             try:
                 basis, anchor, coherence = _basis(points, pitch)
             except (ValueError, np.linalg.LinAlgError):
+                rejected.append(
+                    {
+                        "reason": "no_independent_lattice",
+                        "bounds": bounds,
+                        "candidate_centers": len(points),
+                    }
+                )
                 continue
             if coherence < 0.45:
+                rejected.append(
+                    {
+                        "reason": "low_lattice_coherence",
+                        "bounds": bounds,
+                        "candidate_centers": len(points),
+                        "lattice_inlier_fraction": coherence,
+                    }
+                )
                 continue
             length = np.linalg.norm(basis, axis=1)
             dot = np.dot(*basis)
@@ -414,7 +450,7 @@ def discover(image, pitch_px=None, shape="auto", regions=None):
             choice = cfg.get("shape", shape)
             if choice not in ("auto", "circle", "ellipse", "square", "ambiguous"):
                 raise ValueError(f"Unknown shape: {choice}")
-            diagnostics = {
+            region_diagnostics = {
                 "anchor_xy": anchor.tolist(),
                 "lattice_inlier_fraction": coherence,
                 "median_component_area_px": float(np.median(f[:, 0])),
@@ -433,7 +469,7 @@ def discover(image, pitch_px=None, shape="auto", regions=None):
                 lattice,
                 bounds,
                 coherence,
-                diagnostics,
+                region_diagnostics,
             )
             if regions is None and choice == "auto":
                 split = _profile_partition(image, region, ellipse_angle, square_angle)
@@ -463,6 +499,13 @@ def discover(image, pitch_px=None, shape="auto", regions=None):
                 float(np.deg2rad(cfg["angle_deg"])) if "angle_deg" in cfg else angle
             )
             out.append(region)
+    if diagnostics is not None:
+        diagnostics.update(
+            candidate_centers=candidate_count,
+            accepted_regions=len(out),
+            polarity="bright",
+            rejected=rejected,
+        )
     return out
 
 
