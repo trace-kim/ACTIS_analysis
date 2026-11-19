@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lattice harmonic inspector</title>
+<style>
+:root{color-scheme:light;--ink:#172e31;--mute:#506768;--line:#cddbd7;--teal:#086b60;--paper:#f5f7f3;--mint:#b7ecd3;--amber:#f2bc72}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 "Segoe UI",Arial,sans-serif}
+header{background:#142d30;color:white;padding:22px clamp(18px,3.5vw,62px);display:flex;align-items:center;justify-content:space-between;gap:20px}
+h1,h2,h3,p{margin:0}h1{font-size:clamp(23px,2.8vw,38px);line-height:1.15;letter-spacing:-.04em;font-weight:600}
+header p{color:#b7cdca;font-size:14px;margin-top:6px}header strong{display:block;font-size:24px;color:var(--mint);font-weight:600;white-space:nowrap}
+header .count{text-align:right;font-size:12px;color:#c7dad6}
+main{max-width:1900px;margin:auto;padding:20px clamp(14px,3.5vw,62px) 48px}
+button,select,input{font:inherit;color:inherit}button,select{background:white;border:1px solid #b9cac4;border-radius:5px;padding:6px 10px}
+button{cursor:pointer}button:hover:not(:disabled),select:hover{border-color:var(--teal)}button:disabled{opacity:.45;cursor:default}
+button:focus-visible,select:focus-visible,input:focus-visible,canvas:focus-visible{outline:3px solid #27a87d;outline-offset:2px}
+.selectors,.tools,.nav,.labels,.between{display:flex;align-items:center;flex-wrap:wrap;gap:9px}.selectors{gap:16px;padding-bottom:16px}
+label{display:inline-flex;align-items:center;gap:7px}.selectors label,.tools,.labels,.nav{font-size:13px}
+.layout{display:grid;grid-template-columns:minmax(0,1.13fr) minmax(0,1fr);gap:22px;align-items:start}
+.viewer,.calculation{min-width:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+.viewer{position:sticky;top:12px}.block{padding:16px 19px}.between{justify-content:space-between}h2{font-size:20px;line-height:1.3;letter-spacing:-.03em}
+h3{font-size:15px;letter-spacing:-.01em;margin:17px 0 5px}.tools{padding:10px 14px;border-top:1px solid var(--line)}
+.tools select{max-width:100%}.viewport{position:relative;background:#102024}.viewport canvas{display:block;width:100%;height:clamp(280px,52vh,650px);touch-action:none;cursor:crosshair}
+.readout{padding:8px 14px;background:#203537;color:#d7eee3;font:12px/1.5 Consolas,monospace;min-height:34px}
+.labels{padding:10px 14px;border-bottom:1px solid var(--line)}input{accent-color:var(--teal)}.hint,.small{color:var(--mute);font-size:13px}
+.hint{padding:8px 14px 12px}.nav{padding:12px 16px;background:#e9f2eb;border-bottom:1px solid var(--line);justify-content:space-between}
+.nav select{flex:1;min-width:0;font-weight:600;background:#fff}.body{padding:20px}.body>p{margin-top:8px;color:#435958}.body h2{font-size:24px}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:14px 0}
+.fact{padding:9px 11px;background:#f7faf7;min-width:0;overflow-wrap:anywhere}.fact span{display:block;font-size:12px;color:var(--mute)}.fact b{font:600 15px/1.5 Consolas,monospace}
+.formula{background:#f2f6f4;padding:10px 12px;border-left:3px solid #37917e;font:13px/1.65 Consolas,monospace;margin:12px 0;overflow-wrap:anywhere;white-space:pre-line}
+.note{margin-top:12px;padding:10px 12px;border-left:3px solid #bb772d;background:#fff4e4}
+.result{color:var(--teal);font:600 32px/1.15 "Segoe UI",sans-serif;letter-spacing:-.04em;margin-top:12px}
+details{margin-top:13px;border-top:1px solid var(--line);padding-top:9px}summary{cursor:pointer;font-weight:600;font-size:14px}
+.scroll{max-height:350px;overflow:auto;margin:8px 0}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;font-size:12px}
+td,th{text-align:right;white-space:nowrap;padding:5px 7px;border-bottom:1px solid #e1e9e5}td:first-child,th:first-child{text-align:left}
+th{position:sticky;top:0;background:#edf3ef;font-weight:600}tr.selected td{background:#d5f0e4}
+.plot{display:block;width:100%;background:#f4f8f5;border:1px solid var(--line);border-radius:5px;margin:8px 0}
+#spectrum{display:block;background:#17282b;width:min(100%,390px);aspect-ratio:1;margin:10px auto;cursor:crosshair}
+.legend{font-size:13px;color:#3c5352}.swatch{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 4px 0 9px}
+.stop{color:#885214}.pass{color:var(--teal)}.footer{margin-top:13px;font-size:13px;color:var(--mute)}
+@media(max-width:970px){.layout{grid-template-columns:1fr}.viewer{position:static}.viewport canvas{height:46vh;min-height:250px}}
+@media(max-width:550px){header{padding:16px;align-items:start}.selectors{gap:8px}.body,.block{padding:14px}.layout{gap:12px}main{padding:12px}.nav{padding:9px}.selectors select{max-width:175px}}
+</style></head><body>
+<header><div><h1>Lattice harmonic inspector</h1><p id="source"></p></div><div class="count"><strong id="yield"></strong>tiles with a CD</div></header>
+<main><div class="selectors">
+<label>Region <select id="region"></select></label><label>Tile <select id="tile"></select></label>
+<span id="selection" class="small" aria-live="polite"></span></div>
+<div class="layout"><section class="viewer" aria-label="Native image viewer">
+<div class="block between"><h2>Image field</h2><span class="small" id="scale"></span></div>
+<div class="tools"><label>Layer <select id="layer"></select></label><button id="field">Fit field</button><button id="focus">Fit tile</button><button id="detail">Hole detail</button><button id="out" aria-label="Zoom out">−</button><button id="in" aria-label="Zoom in">+</button></div>
+<div class="viewport"><canvas id="fieldview" tabindex="0" aria-label="Interactive native image. Use arrows to pan and plus or minus to zoom."></canvas></div>
+<div id="probe" class="readout">Move over the image to inspect detector samples.</div>
+<div class="labels"><label><input type="checkbox" id="boxes" checked>Tile status</label><label><input type="checkbox" id="sites">Detected centers</label><label><input type="checkbox" id="outlines">Fitted openings</label><label><input type="checkbox" id="stretch" checked>Stretch contrast</label></div>
+<p class="hint" id="layerhint"></p><p class="hint">Wheel to zoom at the pointer. Drag to pan. Click a tile to inspect its calculation.</p>
+</section><section class="calculation" aria-label="Calculation walkthrough">
+<div class="nav"><button id="prev" aria-label="Previous step">←</button><select id="stage" aria-label="Calculation step"></select><button id="next" aria-label="Next step">→</button></div>
+<article class="body" id="walk"></article></section></div>
+<p class="footer" id="foot"></p></main>

@@ -6,6 +6,7 @@ No measured image is interpolated for feature metrology.
 """
 
 from dataclasses import dataclass, field, replace
+from functools import partial
 from itertools import combinations
 
 import numpy as np
@@ -70,7 +71,7 @@ def _background_maps(a):
     return expand(coarse[:, :, 0]), expand(coarse[:, :, 1])
 
 
-def _islands(image):
+def _islands(image, *, observe=None):
     a = np.asarray(image, dtype="f4")
     smooth = ndimage.gaussian_filter(a, 0.65)
     low, high = _background_maps(smooth)
@@ -86,6 +87,19 @@ def _islands(image):
     peak = np.zeros(n + 1, dtype="f4")
     np.maximum.at(peak, idx, excursion[y, x])
     core = excursion[y, x] >= 0.50 * peak[idx]
+    if observe is not None:
+        core_mask = np.zeros_like(mask)
+        core_mask[y[core], x[core]] = True
+        observe(
+            smooth,
+            low,
+            high,
+            np.maximum(0.47 * contrast, 2.1 * noise),
+            mask,
+            core_mask,
+            float(noise),
+            n,
+        )
     y, x, idx = y[core], x[core], idx[core]
     count = np.bincount(idx, minlength=n + 1)
     weight = np.maximum(excursion[y, x], 0)
@@ -117,7 +131,7 @@ def _islands(image):
     )
 
 
-def _basis(xy, pitch):
+def _basis(xy, pitch, *, trace=None):
     tree = cKDTree(xy)
     sample = xy[:: max(1, len(xy) // 1500)]
     _, idx = tree.query(sample, k=min(18, len(xy)))
@@ -162,6 +176,8 @@ def _basis(xy, pitch):
     a = a * np.sign(a[0] or 1)
     b = b * np.sign(np.linalg.det([a, b]))
     basis = np.array([a, b])
+    if trace is not None:
+        trace.update(neighbor_modes=modes, initial_basis=basis.copy(), refinements=[])
     # Pixel-phase errors bias the median of short neighbor displacements. Across
     # hundreds of periods even a few hundredths of a pixel breaks integer site
     # assignment. Average the measured adjacent-site steps first. Interior
@@ -185,6 +201,10 @@ def _basis(xy, pitch):
             break
         fit = np.linalg.lstsq(design, xy[good], rcond=None)[0]
         anchor, basis = fit[0], fit[1:]
+        if trace is not None:
+            trace["refinements"].append(
+                {"anchor": anchor, "basis": basis, "inliers": int(good.sum())}
+            )
     coords = (xy - anchor) @ np.linalg.inv(basis)
     residual = np.linalg.norm((coords - np.rint(coords)) @ basis, axis=1)
     fraction = float(np.mean(residual < 0.19 * pitch))
@@ -343,13 +363,17 @@ def _profile_partition(image, region, ellipse_angle, square_angle):
     return None
 
 
-def discover(image, pitch_px=None, shape="auto", regions=None, *, diagnostics=None):
+def discover(
+    image, pitch_px=None, shape="auto", regions=None, *, diagnostics=None, observe=None
+):
     """Discover bright islands, locally homogeneous domains, and lattice bases.
 
     Explicit reference-coordinate rectangles use exclusive right/bottom bounds.
     Optional region keys are bounds, shape, pitch_px, and angle_deg.
     A supplied diagnostics dictionary receives candidate counts and the
     qualification failures of regions that could not be indexed.
+    An optional observer receives each region's bounds and discovery images,
+    and enables additional basis-refinement diagnostics.
     """
     image = np.asarray(image)
     if image.ndim != 2 or min(image.shape) < 12 or not np.isfinite(image).all():
@@ -363,7 +387,9 @@ def discover(image, pitch_px=None, shape="auto", regions=None, *, diagnostics=No
         x0, y0, x1, y1 = map(int, cfg["bounds"])
         if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
             raise ValueError("Region bounds outside the native reference image")
-        xy, feat = _islands(image[y0:y1, x0:x1])
+        bounds = (x0, y0, x1, y1)
+        observer = partial(observe, bounds) if observe is not None else None
+        xy, feat = _islands(image[y0:y1, x0:x1], observe=observer)
         candidate_count += len(xy)
         if len(xy) < 9:
             rejected.append(
@@ -393,8 +419,9 @@ def discover(image, pitch_px=None, shape="auto", regions=None, *, diagnostics=No
             pitch = float(
                 given_pitch or np.median(cKDTree(points).query(points, k=2)[0][:, 1])
             )
+            basis_trace = {} if observe is not None else None
             try:
-                basis, anchor, coherence = _basis(points, pitch)
+                basis, anchor, coherence = _basis(points, pitch, trace=basis_trace)
             except (ValueError, np.linalg.LinAlgError):
                 rejected.append(
                     {
@@ -458,6 +485,13 @@ def discover(image, pitch_px=None, shape="auto", regions=None, *, diagnostics=No
                 "fourfold_moment": float(abs(fourth)),
                 "shape_resolved": bool(resolved),
             }
+            if basis_trace is not None:
+                region_diagnostics.update(
+                    basis_trace=basis_trace,
+                    moment_shape=hypothesis,
+                    elongation=abs(elongation),
+                    moment_resolved=bool(resolved),
+                )
             region = Region(
                 len(out),
                 points,

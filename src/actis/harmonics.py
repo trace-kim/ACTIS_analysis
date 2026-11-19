@@ -23,7 +23,7 @@ def _form_factor(freq, width, height, angle, shape):
     return np.divide(2 * j1(z), z, out=np.ones_like(z), where=z > 1e-9)
 
 
-def _fit_orders(amplitude, freq, noise, pitch, region):
+def _fit_orders(amplitude, freq, noise, pitch, region, *, trace=None):
     shape = region.shape
     ellipse = shape == "ellipse"
     scale = max(float(np.abs(amplitude).max()), 1e-15)
@@ -48,7 +48,10 @@ def _fit_orders(amplitude, freq, noise, pitch, region):
         wid, ht, sx, sy, gain = unpack(z)
         form = _form_factor(freq, wid, ht, region.angle, shape)
         mtf = np.exp(-2 * np.pi**2 * ((sx * freq[:, 0]) ** 2 + (sy * freq[:, 1]) ** 2))
-        return (gain * form * mtf * pixel - target) / error
+        residuals = (gain * form * mtf * pixel - target) / error
+        if trace is not None:
+            evaluations.append([wid, ht, sx, sy, gain, 0.5 * (residuals @ residuals)])
+        return residuals
 
     def jacobian(z):
         # Gaussian parameters and aperture dimensions have separate analytic
@@ -95,6 +98,8 @@ def _fit_orders(amplitude, freq, noise, pitch, region):
     high = ([1.20, 1.20] if ellipse else [1.20]) + [0.35, 0.35, 4.0]
     best = None
     for width in (0.23, 0.46, 0.74):
+        if trace is not None:
+            evaluations = []
         init = ([width, width * 0.78] if ellipse else [width]) + [0.065, 0.065, 0.25]
         fit = least_squares(
             residual,
@@ -106,8 +111,15 @@ def _fit_orders(amplitude, freq, noise, pitch, region):
             gtol=1e-7,
             xtol=1e-7,
         )
+        if trace is not None:
+            runs = trace.setdefault("starts", [])
+            runs.append(
+                {"evaluations": evaluations, "cost": fit.cost, "message": fit.message}
+            )
         if best is None or fit.cost < best.cost:
             best = fit
+            if trace is not None:
+                trace["winner"] = len(runs) - 1
     J = best.jac
     norm = np.linalg.norm(J, axis=0)
     cond = float(np.linalg.cond(J / np.maximum(norm, 1e-14)))
@@ -131,14 +143,38 @@ def _fit_orders(amplitude, freq, noise, pitch, region):
         status = "size_blur_unresolved"
     elif rms > 0.095:
         status = "transfer_model_mismatch"
+    if trace is not None:
+        _, _, _, _, gain = unpack(best.x)
+        form = _form_factor(freq, wid, ht, region.angle, shape)
+        mtf = np.exp(-2 * np.pi**2 * ((sx * freq[:, 0]) ** 2 + (sy * freq[:, 1]) ** 2))
+        trace.update(
+            width=wid,
+            height=ht,
+            gain=gain,
+            scale=scale,
+            target=target,
+            error=error,
+            form=form,
+            mtf=mtf,
+            pixel=pixel,
+            predicted=gain * form * mtf * pixel,
+            residual=best.fun,
+            sensitivity=sensitivity,
+            jacobian=J,
+            projected_size=projected,
+            success=best.success,
+            cd_at_bound=bool(np.any(best.active_mask[:n_cd])),
+        )
     return wid, ht, sx, sy, cond, rms, status
 
 
-def _tile_orders(patch, freq, anchor_local):
+def _tile_orders(patch, freq, anchor_local, *, trace=None):
     h, w = patch.shape
     wy, wx = np.hanning(h), np.hanning(w)
     window = wy[:, None] * wx[None, :]
-    patch = (patch - np.sum(patch * window) / window.sum()) * window / window.sum()
+    window_sum = window.sum()
+    mean = np.sum(patch * window) / window_sum
+    patch = (patch - mean) * window / window_sum
     q = np.vstack((freq, freq + [3.6 / w, 2.4 / h], freq + [-2.3 / w, 3.7 / h]))
     # Native pixel centers. Separable direct DFT avoids leakage from choosing
     # the nearest FFT bin when rotated periods do not fit an integer tile.
@@ -156,6 +192,20 @@ def _tile_orders(patch, freq, anchor_local):
     A, side1, side2 = np.split(values, 3)
     # Robust floor from off-lattice samples, less sensitive to neighboring orders.
     noise = max(1e-12, float(np.median(np.minimum(abs(side1), abs(side2)))))
+    if trace is not None:
+        trace.update(
+            mean=mean,
+            window_sum=window_sum,
+            windowed=patch,
+            anchor_local=anchor_local,
+            raw_re=A.real.copy(),
+            raw_im=A.imag.copy(),
+            side1=abs(side1),
+            side2=abs(side2),
+            sampler="Cubic interpolation of a 3× padded FFT"
+            if max(h, w) > 192
+            else "Direct DFT",
+        )
     A *= np.exp(2j * np.pi * (freq @ anchor_local))
     return A, noise
 
@@ -367,15 +417,24 @@ def _frequencies(basis):
     return freq[np.all(np.abs(freq) < 0.445, axis=1)]
 
 
-def harmonic_tiles(
-    image, region, shift_xy=(0.0, 0.0), tile_px=128, origin_xy=(0.0, 0.0)
+def iter_harmonic_tiles(
+    image,
+    region,
+    shift_xy=(0.0, 0.0),
+    tile_px=128,
+    origin_xy=(0.0, 0.0),
+    *,
+    sample_orders=_tile_orders,
+    capture=False,
 ):
-    """Return one record per *complete* reference-aligned tile for this region.
+    """Yield one record per *complete* reference-aligned tile for this region.
 
     tile_i and tile_j are integer x/y indices relative to origin_xy.
     Area-averaged x/y CD are axes of the shape in pixels; ellipse CD is the
     major axis. dx_px/dy_px are independent phase residuals around the nominal
     reference lattice after removing the supplied global acquisition shift.
+    With capture=True each row also carries the intermediates actually reached.
+    A custom sampler used with capture must accept a trace dictionary.
     """
     if not np.isfinite(tile_px) or tile_px < 4:
         raise ValueError("tile_px must be a finite tile width of at least four pixels")
@@ -393,7 +452,6 @@ def harmonic_tiles(
     # the componentwise Nyquist limit the sampled coefficients alias.
     freq = _frequencies(region.basis)
     anchor = np.asarray(region.diagnostics["anchor_xy"])
-    out = []
     for j in range(start[1], stop[1]):
         for i in range(start[0], stop[0]):
             lower = origin + np.array((i, j)) * tile_px
@@ -424,25 +482,52 @@ def harmonic_tiles(
                 "phase_status": "unavailable",
                 "status": "insufficient_orders",
             }
-            out.append(row)
+            trace = {} if capture else None
+            if capture:
+                row["trace"] = trace
+                trace.update(
+                    lo=lo,
+                    hi=hi,
+                    freq=freq,
+                    minimum_sites=max(16, 0.74 * tile_px**2 / cell_area),
+                )
             if np.any(lo < 0) or hi[0] > data.shape[1] or hi[1] > data.shape[0]:
                 row["status"] = "incomplete_native_footprint"
+                yield row
                 continue
             if (
                 count < max(16, 0.74 * tile_px**2 / cell_area)
                 or min(hi - lo) < 5 * region.pitch
             ):
                 row["status"] = "insufficient_pattern_coverage"
+                yield row
                 continue
             if len(freq) < 5:
+                yield row
                 continue
-            amplitude, noise = _tile_orders(
-                data[lo[1] : hi[1], lo[0] : hi[0]], freq, anchor + shift - lo
+            amplitude, noise = sample_orders(
+                data[lo[1] : hi[1], lo[0] : hi[0]],
+                freq,
+                anchor + shift - lo,
+                **({"trace": trace} if capture else {}),
             )
             radii = np.linalg.norm(freq, axis=1)
             fundamental = (radii <= 1.26 / region.pitch) & (abs(amplitude) > 5 * noise)
+            if capture:
+                trace.update(
+                    noise=noise,
+                    anchored_re=amplitude.real,
+                    anchored_im=amplitude.imag,
+                    fundamental=fundamental,
+                    rank=(
+                        int(np.linalg.matrix_rank(freq[fundamental]))
+                        if fundamental.any()
+                        else 0
+                    ),
+                )
             if fundamental.sum() < 2 or np.linalg.matrix_rank(freq[fundamental]) < 2:
                 row["status"] = "two_dimensional_phase_unresolved"
+                yield row
                 continue
             f = freq[fundamental]
             w = np.abs(amplitude[fundamental])
@@ -454,15 +539,23 @@ def harmonic_tiles(
             # Localization by phase requires residuals smaller than half a
             # period and a common displacement across visible fundamental orders.
             phase_err = np.angle(amplitude[fundamental] * np.exp(2j * np.pi * (f @ d)))
+            if capture:
+                trace.update(
+                    displacement=d,
+                    phase_err=phase_err,
+                    phase_rms=np.sqrt(np.average(phase_err**2, weights=w**2)),
+                )
             if (
                 np.linalg.norm(d) > 0.35 * region.pitch
                 or np.average(phase_err**2, weights=w**2) > 0.18**2
             ):
                 row["status"] = "inconsistent_lattice_phase"
+                yield row
                 continue
             row.update(dx_px=float(d[0]), dy_px=float(d[1]), phase_status="ok")
             if region.shape not in ("ellipse", "circle", "square"):
                 row["status"] = "ambiguous_shape"
+                yield row
                 continue
             real = (amplitude * np.exp(2j * np.pi * (freq @ d))).real
             good = abs(amplitude) > max(4 * noise, 0.008 * abs(amplitude).max())
@@ -470,20 +563,29 @@ def harmonic_tiles(
             # field with only the first diffracted order cannot identify blur.
             n_orders = int(good.sum())
             row["n_orders"] = n_orders
+            if capture:
+                trace.update(signed=real, good=good)
             if (
                 n_orders < (7 if region.shape == "ellipse" else 5)
                 or radii[good].max() < 1.8 / region.pitch
             ):
+                yield row
                 continue
             include = radii < min(0.46, 1.22 * radii[good].max())
+            if capture:
+                trace["include"] = include
             if include.sum() < 6:
+                yield row
                 continue
+            if capture:
+                trace["fit"] = {}
             wid, ht, sx, sy, cond, rms, status = _fit_orders(
                 real[include],
                 freq[include],
                 np.full(include.sum(), noise),
                 region.pitch,
                 region,
+                **({"trace": trace["fit"]} if capture else {}),
             )
             row.update(
                 condition=cond,
@@ -504,4 +606,23 @@ def harmonic_tiles(
                     cd_y_px=float(ht),
                     area_diameter_px=float(area_diameter),
                 )
-    return out
+            yield row
+
+
+def harmonic_tiles(
+    image,
+    region,
+    shift_xy=(0.0, 0.0),
+    tile_px=128,
+    origin_xy=(0.0, 0.0),
+):
+    """Collect the complete reference-aligned measurements from iter_harmonic_tiles."""
+    return list(
+        iter_harmonic_tiles(
+            image,
+            region,
+            shift_xy,
+            tile_px,
+            origin_xy,
+        )
+    )

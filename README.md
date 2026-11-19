@@ -28,6 +28,16 @@ $env:CUDA_VISIBLE_DEVICES = "0"
 .\.venv\Scripts\actis analyze-reference --input "D:\ACTIS\reference-pngs" --output "D:\ACTIS\reports\run-gpu" --backend cuda
 ~~~
 
+## Inspect lattice harmonics in one image
+
+For a single-image lattice harmonic walkthrough, run the following command from the checkout. Open the resulting HTML locally, select a tile and use the step selector to follow its native detector samples through the Fourier measurement, fit and CD qualification.
+
+~~~powershell
+.\.venv\Scripts\python scripts\inspect_harmonics.py "D:\ACTIS\field.tif" -o "D:\ACTIS\field-harmonics.html"
+~~~
+
+The inspector accepts single-channel 8- and 16-bit bright-opening PNGs and TIFFs. It defaults to 128 px tiles and automatic shape discovery. Set `--tile-px` for another tile side, `--page` for a zero-based TIFF page, or `--pixel-nm` for calibrated units. The report embeds its image pyramid and measurements in one file. Hover over a pixel for its native DN, click a Fourier order to see its pixel contributions, or use **Hole detail** to compare the fitted tile-average opening with the image.
+
 ## Try a complete study without mask data
 
 ~~~powershell
