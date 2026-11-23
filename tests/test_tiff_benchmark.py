@@ -231,16 +231,16 @@ def test_page_sample_decodes_only_chosen_pages_and_keeps_native_indices(
     )
 
 
-def test_cli_defaults_bound_comparison_and_cover_every_page_for_all_tiles(
-    cuda, holes, tmp_path
-):
+def test_cli_screens_every_page_unless_a_page_limit_is_explicit(cuda, holes, tmp_path):
     tifffile = pytest.importorskip("tifffile")
     path = tmp_path / "many.tif"
     tifffile.imwrite(path, np.repeat(holes[None], 40, axis=0), photometric="minisblack")
     for name, flags, pages, measured in (
-        ("quick", [], 32, 32),
+        ("default", [], 40, 32),
+        ("sample_pages", ["--sample-pages", "8"], 8, 8),
         ("all_pages", ["--all-pages"], 40, 32),
         ("full", ["--all-tiles"], 40, 40),
+        ("explicit_full", ["--all-pages", "--all-tiles"], 40, 40),
     ):
         output = tmp_path / f"{name}.json"
         assert (

@@ -1,6 +1,6 @@
 """Benchmark a multipage scan from a checkout.
 
-Compare methods on up to 32 pages and 32 accepted tiles.
+Screen every page and compare methods on up to 32 accepted tiles.
     python scripts/benchmark_tiff.py scan.tif --reference holes.tif
 
 Time one method on every accepted tile.

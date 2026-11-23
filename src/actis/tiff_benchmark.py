@@ -1,4 +1,4 @@
-"""Compare ACTIS methods on sampled pages or time one method on a complete TIFF."""
+"""Screen every TIFF page and time ACTIS methods on accepted tiles."""
 
 import argparse
 import json
@@ -24,7 +24,6 @@ from .tiff_tiles import prepare_reference, select_tiles
 METHODS = ("raw", *METHOD_NAMES, "harmonic", "pooled")
 FITS = ("model", "differential")
 DEFAULT_SAMPLE = 32
-DEFAULT_SAMPLE_PAGES = 32
 
 
 class Progress:
@@ -634,13 +633,13 @@ def main(argv=None):
     pages.add_argument(
         "--sample-pages",
         type=int,
-        help=f"Decode up to N pages distributed across the TIFF (default for comparisons: {DEFAULT_SAMPLE_PAGES}). Counts and projections cover these pages.",
+        help="Limit screening to N pages distributed across the TIFF. Counts and projections cover these pages.",
         metavar="N",
     )
     pages.add_argument(
         "--all-pages",
         action="store_true",
-        help="Screen the whole stack while sampling accepted tiles. Implied by --all-tiles unless a page limit is given.",
+        help="Screen every page (default). Add --all-tiles to measure every accepted tile.",
     )
     parser.add_argument(
         "--shape",
@@ -657,13 +656,6 @@ def main(argv=None):
     )
     parser.add_argument("--json", type=Path, help="Also write a new timing JSON file")
     args = parser.parse_args(argv)
-    if (
-        args.sample_pages is None
-        and args.max_pages is None
-        and not args.all_pages
-        and args.sample_tiles is not None
-    ):
-        args.sample_pages = DEFAULT_SAMPLE_PAGES
     partial = PartialReport(args.json) if args.json else None
     try:
         if args.json and (args.json.exists() or partial.path.exists()):

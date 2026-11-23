@@ -154,7 +154,13 @@ python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --json timing.
 
 If the reference is inside the scan, use `--reference-page 17` in place of `--reference holes.tiff` to use the eighteenth page. A separate reference can also be a grayscale PNG or a numbered page in another TIFF.
 
-By default the command screens up to **32 pages** distributed across the file, then times all seven methods on the same **32 accepted tiles**. On a long stack it draws one page from each of 32 intervals and samples accepted tiles uniformly within the screened set. Both draws use fixed seeds. If fewer pages or tiles are available, it uses them all. The output gives the page coverage and the accepted and measured tile counts. Use `--sample-pages N` or `--sample-tiles N` to change either limit. Use `--all-pages` for an exact whole-file acceptance count and a tile sample drawn from the entire stack. This is useful when hole arrays are rare. `--max-pages 10` reads the first ten pages.
+The command screens **every page** by default. It then compares all seven methods on up to 32 accepted tiles sampled uniformly across the whole file with a fixed seed. This command measures actual end-to-end runtime for all seven methods on every accepted tile.
+
+~~~sh
+python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --all-pages --all-tiles --json full-timing.json
+~~~
+
+In the JSON report, `total_seconds` includes reference preparation, reading, screening and measurement. For the full run, `pages` equals `total_pages` and `measured_tiles` equals `accepted_tiles`. Only the explicit options `--sample-pages N` and `--max-pages N` limit the pages screened.
 
 Once you have chosen a method, use `--method` with `--all-tiles` to measure every accepted tile on every page. This example runs pooled aperture moments in batches on the GPU and reports the full scan time.
 
