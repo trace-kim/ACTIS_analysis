@@ -1,4 +1,4 @@
-"""Time the seven ACTIS methods on hole-array tiles in one multi-page TIFF."""
+"""Compare ACTIS methods on sampled pages or time one method on a complete TIFF."""
 
 import argparse
 import json
@@ -18,12 +18,13 @@ from PIL import Image
 from .estimators import METHOD_NAMES, _contours, _flux, _model_methods
 from .fit import array_backend
 from .harmonics import harmonic_tiles
-from .pooled import pooled_tiles
+from .pooled import pooled_matched_cds
 from .tiff_tiles import prepare_reference, select_tiles
 
 METHODS = ("raw", *METHOD_NAMES, "harmonic", "pooled")
 FITS = ("model", "differential")
 DEFAULT_SAMPLE = 32
+DEFAULT_SAMPLE_PAGES = 32
 
 
 class Progress:
@@ -88,9 +89,10 @@ class TileSample:
 
 
 class Run:
-    def __init__(self, cp, progress):
+    def __init__(self, cp, progress, methods):
         self.stream = cp.cuda.get_current_stream()
         self.progress = progress
+        self.selected = methods
         self.seconds = Counter()
         self.valid = Counter()
         self.attempted = Counter()
@@ -111,7 +113,7 @@ class Run:
 
     def methods(self):
         rows = {}
-        for name in METHODS:
+        for name in self.selected:
             shared = (
                 self.seconds["contour"] + self.seconds["fit_setup"]
                 if name in FITS
@@ -153,8 +155,12 @@ def _raw_means(tiles, matches, cp):
     return tiles[ids].mean(axis=(1, 2), dtype=cp.float64).get()
 
 
-def _decoded_pages(stack, max_pages=None):
-    pages = islice(stack.pages, max_pages)
+def _decoded_pages(stack, max_pages=None, page_indices=None):
+    pages = (
+        (stack.pages[i] for i in page_indices)
+        if page_indices is not None
+        else islice(stack.pages, max_pages)
+    )
 
     def read_next():
         start = perf_counter()
@@ -162,7 +168,7 @@ def _decoded_pages(stack, max_pages=None):
         if page is None:
             return None
         data = _read_page(page)
-        return data, perf_counter() - start
+        return page.index, data, perf_counter() - start
 
     # Only the reader thread advances the TIFF handle. At most one subsequent
     # decoded page waits in memory while CUDA processes the current one.
@@ -196,46 +202,74 @@ def _reference(path, index, tifffile):
             ) from None
 
 
+def _batch_values(tiles, matches, templates, run, cp):
+    """One value per match for methods that can measure many tiles at once."""
+    values = {}
+    if "raw" in run.selected:
+        with run.time("raw"):
+            values["raw"] = _raw_means(tiles, matches, cp)
+    if "pooled" in run.selected:
+        with run.time("pooled"):
+            cds = np.full(len(matches), np.nan)
+            for ref_id in np.unique(matches[:, 1].astype(int)):
+                group = matches[:, 1] == ref_id
+                indices = cp.asarray(matches[group, 0], dtype=cp.int32)
+                cds[group] = pooled_matched_cds(
+                    tiles[indices], templates[ref_id].region, matches[group, 2:], cp
+                )
+            values["pooled"] = cds
+    return values
+
+
 def _measure(tile, region, template, psf, run, cp):
     side = tile.shape[0]
     args = (region.centers, region.pitch, region.shape)
-    with run.time("contour"):
-        image = tile.astype(cp.float32, copy=False)
-        contours = _contours(
-            image, *args, region.angle, threshold_diagnostics=True, xp=cp
+    fit_names = tuple(name for name in FITS if name in run.selected)
+    if "contour" in run.selected or fit_names:
+        with run.time("contour"):
+            image = tile.astype(cp.float32, copy=False)
+            contours = _contours(
+                image, *args, region.angle, threshold_diagnostics=True, xp=cp
+            )
+        if "contour" in run.selected:
+            run.record(
+                "contour", [r["cd_px"] for r in contours if r["valid"]], len(contours)
+            )
+    if "flux" in run.selected:
+        with run.time("flux"):
+            flux = _flux(tile, *args, contours=None, bright=None, dark=None, xp=cp)
+        run.record("flux", [r["flux_dn_px2"] for r in flux if r["valid"]], len(flux))
+    if fit_names:
+        # Both fits share the contour seeds and blur profile.
+        fit_seconds = Counter()
+        with run.time("fit_setup"):
+            fits = _model_methods(
+                image,
+                *args,
+                region.angle,
+                contours,
+                fit_names,
+                psf,
+                side,
+                "cuda",
+                fit_seconds=fit_seconds,
+            )
+        run.seconds["fit_setup"] -= sum(fit_seconds.values())
+        run.seconds.update(fit_seconds)
+        for name, rows in fits.items():
+            run.record(name, [r["cd_px"] for r in rows if r["valid"]], len(rows))
+    if "harmonic" in run.selected:
+        with run.time("harmonic"):
+            rows = harmonic_tiles(
+                tile,
+                region,
+                tile_px=side,
+                origin_xy=(-0.5, -0.5),
+                sample_orders=template.sample_orders,
+            )
+        run.record(
+            "harmonic", [r["cd_px"] for r in rows if r["status"] == "ok"], len(rows)
         )
-    run.record("contour", [r["cd_px"] for r in contours if r["valid"]], len(contours))
-    with run.time("flux"):
-        flux = _flux(tile, *args, contours=None, bright=None, dark=None, xp=cp)
-    run.record("flux", [r["flux_dn_px2"] for r in flux if r["valid"]], len(flux))
-    # Count contour seeds and blur profiling once in wall time. Each fit also
-    # gets its own inclusive time so a one-method cost can be read from the table.
-    fit_seconds = Counter()
-    with run.time("fit_setup"):
-        fits = _model_methods(
-            image,
-            *args,
-            region.angle,
-            contours,
-            FITS,
-            psf,
-            side,
-            "cuda",
-            fit_seconds=fit_seconds,
-        )
-    run.seconds["fit_setup"] -= sum(fit_seconds.values())
-    run.seconds.update(fit_seconds)
-    for name, rows in fits.items():
-        run.record(name, [r["cd_px"] for r in rows if r["valid"]], len(rows))
-    options = {"tile_px": side, "origin_xy": (-0.5, -0.5)}
-    with run.time("harmonic"):
-        harmonic = harmonic_tiles(
-            tile, region, **options, sample_orders=template.sample_orders
-        )
-    with run.time("pooled"):
-        pooled = pooled_tiles(tile, region, **options, xp=cp)
-    for name, rows in (("harmonic", harmonic), ("pooled", pooled)):
-        run.record(name, [r["cd_px"] for r in rows if r["status"] == "ok"], len(rows))
 
 
 def benchmark(
@@ -252,6 +286,8 @@ def benchmark(
     sample_tiles=DEFAULT_SAMPLE,
     max_pages=None,
     checkpoint=None,
+    method=None,
+    sample_pages=None,
 ):
     try:
         import tifffile
@@ -259,6 +295,9 @@ def benchmark(
         raise RuntimeError(
             'Install the TIFF/CUDA dependencies with pip install -e ".[gpu]"'
         ) from None
+    if method is not None and method not in METHODS:
+        raise ValueError(f"Unknown benchmark method: {method}")
+    selected = (method,) if method else METHODS
     if tile_size < 16 or tile_size % 2 or not 0 < min_corr <= 1:
         raise ValueError(
             "Use an even tile size of at least 16 and a minimum correlation in (0,1]"
@@ -271,6 +310,8 @@ def benchmark(
         )
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive")
+    if sample_pages is not None and (sample_pages < 1 or max_pages is not None):
+        raise ValueError("Use a positive sample_pages or max_pages, one at a time")
     if psf is not None:
         if len(psf) != 2 or not all(np.isfinite(s) and s > 0 for s in psf):
             raise ValueError(
@@ -290,7 +331,19 @@ def benchmark(
         live.stage = "opening TIFF and reading reference"
         live.tell()
         stack = resources.enter_context(tifffile.TiffFile(path))
-        run = Run(cp, live)
+        page_indices = None
+        total_pages = None
+        if sample_pages is not None:
+            total_pages = len(stack.pages)
+            # One random page per contiguous stratum avoids repeatedly hitting
+            # the same phase of periodic scan content. Only decode those pages.
+            edges = np.linspace(
+                0, total_pages, min(sample_pages, total_pages) + 1, dtype=int
+            )
+            page_indices = (
+                np.random.default_rng(0).integers(edges[:-1], edges[1:]).tolist()
+            )
+        run = Run(cp, live, selected)
         batch_size = max(1, min(64, 2**20 // tile_size**2))
         with run.time("reference_and_warmup"):
             ref = _reference(ref_path, reference_page, tifffile)
@@ -323,8 +376,8 @@ def benchmark(
                     )
                     tile = cp.rint((pixels - pixels.min()) * scale).astype(first.dtype)
                     batch = cp.repeat(tile[None], warm_count, axis=0)
-                warm = Run(cp, live)
-                _raw_means(batch, matches, cp)
+                warm = Run(cp, live, selected)
+                _batch_values(batch, matches, [template], warm, cp)
                 _measure(tile, template.geometry(np.zeros(2)), template, psf, warm, cp)
         sample = TileSample(sample_tiles) if sample_tiles is not None else None
         mode = (
@@ -332,10 +385,13 @@ def benchmark(
             if sample is None
             else f"uniform sample of up to {sample_tiles} accepted tiles"
         )
-        live.location = f"Starting scan, measuring {mode}"
-        live.stage = "reading TIFF page 1"
+        live.location = f"Starting scan, measuring {mode} with {', '.join(selected)}"
+        live.stage = (
+            f"reading {len(page_indices)} of {total_pages} TIFF pages"
+            if page_indices is not None
+            else "reading TIFF pages"
+        )
         live.tell()
-        axis = cp.arange(tile_size)
         pages = tested = accepted = edge_pixels = measured = 0
         scan_start = perf_counter()
         last_save = -np.inf
@@ -350,6 +406,8 @@ def benchmark(
                         "input": str(path),
                         "gpu": gpu,
                         "sample_tiles": sample_tiles,
+                        "sample_page_indices_zero_based": page_indices,
+                        "total_pages": total_pages,
                         "pages_completed": pages,
                         "tested_tiles": tested,
                         "accepted_tiles": accepted,
@@ -365,10 +423,15 @@ def benchmark(
             nonlocal measured
             if not len(matches):
                 return
-            with run.time("raw"):
-                means = _raw_means(tiles, matches, cp)
-            for (idx, ref_id, dx, dy), mean, (page_index, tile_index) in zip(
-                matches, means, locations
+            values = _batch_values(tiles, matches, templates, run, cp)
+            if len(values) == len(selected):
+                for name, column in values.items():
+                    run.record(name, column[np.isfinite(column)], len(column))
+                measured += len(matches)
+                save_progress()
+                return
+            for i, ((idx, ref_id, dx, dy), (page_index, tile_index)) in enumerate(
+                zip(matches, locations)
             ):
                 count = (
                     str(measured + 1)
@@ -379,30 +442,36 @@ def benchmark(
                 template = templates[int(ref_id)]
                 region = template.geometry(np.array([dx, dy]))
                 _measure(tiles[int(idx)], region, template, psf, run, cp)
-                run.record("raw", [mean], 1)
+                for name, column in values.items():
+                    run.record(name, [column[i]] if np.isfinite(column[i]) else [], 1)
                 measured += 1
                 save_progress(force=measured == 1)
 
-        for data, decode_seconds in _decoded_pages(stack, max_pages):
+        for page_index, data, decode_seconds in _decoded_pages(
+            stack, max_pages, page_indices
+        ):
             run.seconds["decode"] += decode_seconds
             h, w = data.shape
             ny, nx = h // tile_size, w // tile_size
             if not nx * ny:
                 raise ValueError(
-                    f"Tile size {tile_size} exceeds the dimensions of page {pages}: {w} x {h}"
+                    f"Tile size {tile_size} exceeds the dimensions of page {page_index}: {w} x {h}"
                 )
             edge_pixels += h * w - nx * ny * tile_size**2
-            with run.time("selection"):
-                frame = cp.asarray(data)
+            # This is a strided CPU view. Pack and upload only one batch of
+            # complete tiles, even if an individual TIFF page is very large.
+            tile_grid = (
+                data[: ny * tile_size, : nx * tile_size]
+                .reshape(ny, tile_size, nx, tile_size)
+                .transpose(0, 2, 1, 3)
+            )
             for start in range(0, ny * nx, batch_size):
                 live.location = (
-                    f"Selecting on page {pages + 1}, tile {start + 1}/{ny * nx}"
+                    f"Selecting on page {page_index + 1}, tile {start + 1}/{ny * nx}"
                 )
                 with run.time("selection"):
-                    indices = cp.arange(start, min(start + batch_size, ny * nx))
-                    y = (indices // nx)[:, None] * tile_size + axis
-                    x = (indices % nx)[:, None] * tile_size + axis
-                    tiles = frame[y[:, :, None], x[:, None, :]]
+                    indices = np.arange(start, min(start + batch_size, ny * nx))
+                    tiles = cp.asarray(tile_grid[indices // nx, indices % nx])
                     matches = select_tiles(tiles, templates, min_corr, cp)
                 tested += len(tiles)
                 accepted += len(matches)
@@ -410,10 +479,10 @@ def benchmark(
                     measure_batch(
                         tiles,
                         matches,
-                        ((pages, start + int(idx)) for idx in matches[:, 0]),
+                        ((page_index, start + int(idx)) for idx in matches[:, 0]),
                     )
                 else:
-                    sample.consider(data, pages, start, matches, tile_size)
+                    sample.consider(data, page_index, start, matches, tile_size)
             pages += 1
             live.location = f"Read {pages} pages, accepted {accepted}/{tested} tiles, measured {measured}"
             live.stage = "waiting for next TIFF page"
@@ -436,8 +505,17 @@ def benchmark(
                     measure_batch(tiles, matches, (e[:2] for e in entries))
         scan_seconds = perf_counter() - scan_start
     methods = run.methods()
+    # Inclusive model and differential times both contain the same contour
+    # and blur setup. Count each timed stage once when extrapolating.
+    method_seconds = run.seconds["fit_setup"] + sum(run.seconds[m] for m in METHODS)
+    scale = accepted / measured if 0 < measured < accepted else None
+    exhaustive_estimate = method_seconds * scale if scale is not None else None
+    for row in methods.values():
+        row["estimated_all_tiles_seconds"] = (
+            row["seconds"] * scale if scale is not None else None
+        )
     ranked = sorted(
-        (m for m in METHODS if methods[m]["valid"]), key=lambda m: methods[m]["seconds"]
+        (m for m in methods if methods[m]["valid"]), key=lambda m: methods[m]["seconds"]
     )
     return {
         "status": "complete",
@@ -451,11 +529,16 @@ def benchmark(
         "reference_shapes": [t.region.shape for t in templates],
         "psf_sigma_px": psf,
         "pages": pages,
+        "total_pages": pages
+        if max_pages is None and page_indices is None
+        else total_pages,
         "tested_tiles": tested,
         "accepted_tiles": accepted,
         "measured_tiles": measured,
+        "estimated_all_tiles_method_seconds": exhaustive_estimate,
         "sample_tiles": sample_tiles,
         "max_pages": max_pages,
+        "sample_page_indices_zero_based": page_indices,
         "sample_locations_page_tile_zero_based": [e[:2] for e in sample.entries]
         if sample is not None
         else None,
@@ -523,24 +606,41 @@ def main(argv=None):
         help="Minimum correlation in every quadrant",
     )
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
+    parser.add_argument(
+        "--method",
+        choices=METHODS,
+        help="Time only this method (default: compare all seven). Combine with --all-tiles for production timing.",
+    )
     sampling = parser.add_mutually_exclusive_group()
     sampling.add_argument(
         "--sample-tiles",
         type=int,
         default=DEFAULT_SAMPLE,
-        help=f"Measure all methods on a uniform sample from the accepted tiles (default: {DEFAULT_SAMPLE})",
+        help=f"Measure a uniform sample from the accepted tiles (default: {DEFAULT_SAMPLE})",
     )
     sampling.add_argument(
         "--all-tiles",
         dest="sample_tiles",
         action="store_const",
         const=None,
-        help="Measure every accepted tile, including its per-tile blur fit",
+        help="Measure every accepted tile with the requested methods",
     )
-    parser.add_argument(
+    pages = parser.add_mutually_exclusive_group()
+    pages.add_argument(
         "--max-pages",
         type=int,
         help="Read at most this many target pages for a short trial",
+    )
+    pages.add_argument(
+        "--sample-pages",
+        type=int,
+        help=f"Decode up to N pages distributed across the TIFF (default for comparisons: {DEFAULT_SAMPLE_PAGES}). Counts and projections cover these pages.",
+        metavar="N",
+    )
+    pages.add_argument(
+        "--all-pages",
+        action="store_true",
+        help="Screen the whole stack while sampling accepted tiles. Implied by --all-tiles unless a page limit is given.",
     )
     parser.add_argument(
         "--shape",
@@ -557,6 +657,13 @@ def main(argv=None):
     )
     parser.add_argument("--json", type=Path, help="Also write a new timing JSON file")
     args = parser.parse_args(argv)
+    if (
+        args.sample_pages is None
+        and args.max_pages is None
+        and not args.all_pages
+        and args.sample_tiles is not None
+    ):
+        args.sample_pages = DEFAULT_SAMPLE_PAGES
     partial = PartialReport(args.json) if args.json else None
     try:
         if args.json and (args.json.exists() or partial.path.exists()):
@@ -568,8 +675,10 @@ def main(argv=None):
             tile_size=args.tile_size,
             min_corr=args.min_corr,
             device=args.device,
+            method=args.method,
             sample_tiles=args.sample_tiles,
             max_pages=args.max_pages,
+            sample_pages=args.sample_pages,
             checkpoint=partial.write if partial else None,
             shape=args.shape,
             psf=args.psf_sigma_px,
@@ -582,8 +691,11 @@ def main(argv=None):
                 partial.path.unlink()
     except (OSError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"TIFF benchmark: {exc}\n")
+    coverage = f"{result['pages']} pages"
+    if result["total_pages"] is not None:
+        coverage = f"{result['pages']}/{result['total_pages']} pages"
     print(
-        f"{result['gpu']} | {result['pages']} pages | {result['accepted_tiles']}/{result['tested_tiles']} "
+        f"{result['gpu']} | {coverage} screened | {result['accepted_tiles']}/{result['tested_tiles']} "
         f"tiles selected | {result['measured_tiles']} measured | {result['excluded_edge_pixels']} edge pixels skipped"
     )
     stages = result["stage_seconds"]
@@ -591,13 +703,35 @@ def main(argv=None):
         f"Reference + warm-up {stages['reference_and_warmup']:.3f} s | "
         f"decode {stages.get('decode', 0):.3f} s | selection {stages.get('selection', 0):.3f} s"
     )
-    print("Method          Seconds     Valid / attempted   Mean")
+    estimate = result["estimated_all_tiles_method_seconds"]
+    projection_label = (
+        "   Est. all accepted tiles on screened pages (s)"
+        if estimate is not None
+        else ""
+    )
+    print(f"Method          Seconds     Valid / attempted   Mean{projection_label}")
     for method, row in result["methods"].items():
         value = "n/a" if row["mean"] is None else f"{row['mean']:.5g} {row['unit']}"
-        print(
-            f"{method:13} {row['seconds']:9.4f} {row['valid']:9} / {row['attempted']:<9}   {value}"
+        projection = (
+            f"   {row['estimated_all_tiles_seconds']:,.1f}"
+            if estimate is not None
+            else ""
         )
-    print("Both fit times include shared contour and blur setup.")
+        print(
+            f"{method:13} {row['seconds']:9.4f} {row['valid']:9} / {row['attempted']:<9}   {value}{projection}"
+        )
+    if any(name in result["methods"] for name in FITS):
+        print(
+            "Aperture fit times include contour work and "
+            f"{stages.get('fit_setup', 0):.3f} s of shared setup."
+        )
+    if estimate is not None:
+        print(
+            f"At the measured rate of {estimate / result['accepted_tiles']:.3f} s/tile, "
+            f"{args.method or 'all seven methods'} on all {result['accepted_tiles']:,} accepted tiles "
+            f"would take about {estimate:,.1f} s ({estimate / 3600:.2f} h), "
+            "plus reference preparation, input and screening on those pages."
+        )
     print(
         f"Scan {result['scan_seconds']:.3f} s ({result['pages_per_second']:.2f} pages/s) | "
         f"total {result['total_seconds']:.3f} s"
@@ -607,7 +741,9 @@ def main(argv=None):
         if result["fastest_valid_cd"]:
             print(f"Fastest with valid hole dimensions: {result['fastest_valid_cd']}")
     else:
-        print("No valid measurements on the target stack.")
+        print("No valid measurements on the screened pages.")
+        if result["total_pages"] and result["pages"] < result["total_pages"]:
+            print("Use --all-pages to screen the entire stack.")
     return 0
 
 

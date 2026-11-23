@@ -152,11 +152,21 @@ python -m pip install -e ".[gpu]"
 python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --json timing.json
 ~~~
 
-If the reference is inside the scan, use `--reference-page 17` in place of `--reference holes.tiff` to use the eighteenth page. The benchmark still processes every page. A separate reference can also be a grayscale PNG or a numbered page in another TIFF.
+If the reference is inside the scan, use `--reference-page 17` in place of `--reference holes.tiff` to use the eighteenth page. A separate reference can also be a grayscale PNG or a numbered page in another TIFF.
 
-By default the benchmark screens the entire stack, then times all seven methods on the same **32 accepted tiles**, drawn uniformly across the stack with a fixed random seed. If fewer qualify, it measures them all. The output gives both the accepted and measured counts. Method timings and means describe the measured sample. Use `--sample-tiles N` to change its size, or `--max-pages 10` for a short trial. For exhaustive metrology use `--all-tiles`. That mode fits each accepted tile and can take days on dense stacks.
+By default the command screens up to **32 pages** distributed across the file, then times all seven methods on the same **32 accepted tiles**. On a long stack it draws one page from each of 32 intervals and samples accepted tiles uniformly within the screened set. Both draws use fixed seeds. If fewer pages or tiles are available, it uses them all. The output gives the page coverage and the accepted and measured tile counts. Use `--sample-pages N` or `--sample-tiles N` to change either limit. Use `--all-pages` for an exact whole-file acceptance count and a tile sample drawn from the entire stack. This is useful when hole arrays are rare. `--max-pages 10` reads the first ten pages.
+
+Once you have chosen a method, use `--method` with `--all-tiles` to measure every accepted tile on every page. This example runs pooled aperture moments in batches on the GPU and reports the full scan time.
+
+~~~sh
+python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --method pooled --all-tiles --json pooled.json
+~~~
+
+The other choices are `raw`, `contour`, `flux`, `harmonic`, `model` and `differential`. The two aperture fits require contour seeds and can take hours or days on dense stacks. With `--all-tiles` alone, the benchmark runs all seven methods exhaustively.
 
 The console identifies the CUDA device and reports the current stage every 15 seconds, including during reference preparation and individual fits. With `--json timing.json`, the benchmark writes ongoing results to `timing.partial.json` at completed pages or tiles and replaces them with the final `timing.json` on success. An interrupted run retains its most recent partial report. Use a new output name for a new run.
+
+For a tile sample, the console and JSON give an estimated time to run each method on every accepted tile on the screened pages. The combined `estimated_all_tiles_method_seconds` counts shared fit setup once. Reference preparation, TIFF reads and tile selection have separate timings. With either page limit, counts and projections cover only the pages screened.
 
 The selector takes one exemplar from each detected reference lattice and tests every complete scan tile against those exemplars, independent of page position. A batched GPU FFT estimates translation. All four quadrants of the overlapping pixels must then match at the same shift. The score is the lowest quadrant correlation after local gain and offset normalization. A blank or striped quadrant can therefore disqualify a tile whose overall correlation is high. This tests for hole arrays represented in the reference. Inspect labeled examples from the instrument when choosing `--min-corr` (default 0.80). The default tile side is 128 pixels. Choose an even `--tile-size` spanning at least five hole pitches. The output counts pixels skipped in incomplete edge tiles.
 

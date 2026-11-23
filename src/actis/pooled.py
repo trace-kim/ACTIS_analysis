@@ -192,27 +192,32 @@ class _Exposure:
     shape: tuple
 
 
-def _exposure(data, grid, shift, xp=np):
-    centers, half, bounds = grid.centers, grid.half, grid.bounds
+def _complete_stamps(centers, half, bounds, shift, shape):
     rounded = np.rint(centers + shift).astype(int)
-    usable = ((rounded >= half) & (rounded < np.array(data.shape[::-1]) - half)).all(
-        axis=1
-    )
+    usable = ((rounded >= half) & (rounded < np.array(shape[::-1]) - half)).all(axis=1)
     # Do not collect a stamp from an adjacent design domain.
-    usable &= ((centers - half >= bounds[:2]) & (centers + half < bounds[2:])).all(
-        axis=1
-    )
-    sites = centers[usable]
-    good, area, measured, cov, saturated = _measure(data, sites + shift, half, xp)
-    valid = np.zeros(len(centers), bool)
+    return usable & (
+        (centers - half >= bounds[:2]) & (centers + half < bounds[2:])
+    ).all(axis=1)
+
+
+def _measure_exposure(data, grid, shift, usable, xp):
+    sites = grid.centers[usable] + shift
+    good, area, measured, cov, saturated = _measure(data, sites, grid.half, xp)
+    valid = np.zeros(len(grid.centers), bool)
     valid[usable] = good
-    sat = np.zeros(len(centers), bool)
+    sat = np.zeros(len(valid), bool)
     sat[usable] = saturated
-    moments = np.zeros((len(centers), 6))
+    moments = np.zeros((len(valid), 6))
     moments[usable] = np.column_stack(
         (area, measured - (grid.ideal[usable] + shift), cov)
     )
     return _Exposure(valid, moments, sat, shift, data.shape)
+
+
+def _exposure(data, grid, shift, xp=np):
+    usable = _complete_stamps(grid.centers, grid.half, grid.bounds, shift, data.shape)
+    return _measure_exposure(data, grid, shift, usable, xp)
 
 
 def _rows(region, grid, exposure, common, tile_px, origin):
@@ -355,3 +360,45 @@ def pooled_tiles(
     return pooled_group_tiles(
         [image], region, [shift_xy], tile_px, origin_xy, [(0,)], xp=xp
     )[(0,)][0]
+
+
+def pooled_matched_cds(tiles, region, shifts, xp):
+    """Return one CD per matched native tile, with NaN for rejected measurements."""
+    count, side, _ = tiles.shape
+    bounds = np.asarray([0, 0, side, side]) - 0.5
+    origin = bounds[:2]
+    half = max(2, int(np.floor((region.pitch - 1.0) / 2)))
+    centers = region.centers + shifts[:, None, :]
+    inside = ((centers >= origin) & (centers < bounds[2:])).all(axis=2)
+    bins, seeds = np.nonzero(inside)
+    sites = centers[bins, seeds]
+    anchor = np.asarray(region.diagnostics["anchor_xy"]) + shifts[bins]
+    ideal = (
+        np.rint((sites - anchor) @ np.linalg.inv(region.basis)) @ region.basis + anchor
+    )
+
+    # Stack the tiles vertically for one set of aperture kernel launches. Test
+    # each stamp against its own tile before moving it into the joined image.
+    shift = np.zeros(2)
+    usable = _complete_stamps(sites, half, bounds, shift, (side, side))
+    # Round in local coordinates exactly as _measure does for a single tile.
+    # Adding a large row offset first could round a near half-pixel differently.
+    sites = np.rint(sites)
+    sites[:, 1] += side * bins
+    ideal[:, 1] += side * bins
+    bounds[3] = count * side - 0.5
+    grid = _Grid(
+        np.zeros(2, dtype=int),
+        1,
+        count,
+        abs(np.linalg.det(region.basis)),
+        bounds,
+        half,
+        sites,
+        bins,
+        ideal,
+        np.bincount(bins, minlength=count),
+    )
+    exposure = _measure_exposure(tiles.reshape(-1, side), grid, shift, usable, xp)
+    rows = _rows(region, grid, exposure, exposure.valid, side, origin)
+    return np.asarray([r["cd_px"] for r in rows])

@@ -1,6 +1,7 @@
 """Reference-guided selection of complete bright-hole array tiles on CUDA."""
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 import numpy as np
 
@@ -99,9 +100,85 @@ def prepare_reference(image, side, shape, cp):
     return templates
 
 
-def _match(tiles, spectra, template, cp):
-    from cupyx.scipy.ndimage import map_coordinates
+@lru_cache(maxsize=1)
+def _quadrant_kernels(cp):
+    # Calculate coordinates in registers. Match CuPy's order-1 sampling of a
+    # float32 reference, including how it rounds the stencil near integer edges.
+    align = cp.ElementwiseKernel(
+        "float32 tile, raw float32 ref, raw float64 dx, raw float64 dy, int32 side",
+        "float32 target, float32 aligned, bool overlap",
+        r"""
+        const int tile_id = i / side / side;
+        const double x = i % side - dx[tile_id], y = (i / side) % side - dy[tile_id];
+        overlap = x >= 0 && x <= side - 1 && y >= 0 && y <= side - 1;
+        target = overlap ? tile : 0;
+        aligned = 0;
+        if (overlap) {
+            const int x0 = (int)floorf((float)x), y0 = (int)floorf((float)y);
+            const int x1 = min(x0 + 1, side - 1), y1 = min(y0 + 1, side - 1);
+            const double fx = x - x0, fy = y - y0;
+            aligned = ref[(size_t)y0 * side + x0] * (float)((1 - fy) * (1 - fx));
+            aligned = fmaf(ref[(size_t)y0 * side + x1], (float)((1 - fy) * fx), aligned);
+            aligned = fmaf(ref[(size_t)y1 * side + x0], (float)(fy * (1 - fx)), aligned);
+            aligned = fmaf(ref[(size_t)y1 * side + x1], (float)(fy * fx), aligned);
+        }
+        """,
+        "actis_align_overlap",
+    )
+    moments = cp.ElementwiseKernel(
+        "raw float32 target, raw float32 aligned, raw bool overlap, "
+        "raw float64 mean_a, raw float64 mean_b, int32 side, int32 columns",
+        "float64 aa, float64 bb, float64 ab",
+        r"""
+        const int half_side = side / 2, tile = i / columns / 4;
+        const int quadrant = (i / columns) % 4, column = i % columns;
+        const int top = (quadrant / 2) * half_side;
+        const int x = (quadrant % 2) * half_side + column % half_side;
+        const int y0 = top + (column / half_side) * 32;
+        const double ma = mean_a[tile * 4 + quadrant], mb = mean_b[tile * 4 + quadrant];
+        aa = bb = ab = 0;
+        for (int y = y0; y < min(y0 + 32, top + half_side); ++y) {
+            const size_t p = ((size_t)tile * side + y) * side + x;
+            if (overlap[p]) {
+                const double a = target[p] - ma, b = aligned[p] - mb;
+                aa += a * a;
+                bb += b * b;
+                ab += a * b;
+            }
+        }
+        """,
+        "actis_centered_quadrant_moments",
+    )
+    return align, moments
 
+
+def _quadrant_scores(tiles, pixels, shift_x, shift_y, cp):
+    n, side, _ = tiles.shape
+    align, moments = _quadrant_kernels(cp)
+    # Keep the same per-quadrant means and double-precision centered products
+    # for weak 16-bit contrast. Fuse each product with its reduction to avoid
+    # full-size centered arrays and square/product temporaries.
+    half = side // 2
+    shape = (n, 2, half, 2, half)
+    target, aligned, overlap = (
+        a.reshape(shape) for a in align(tiles, pixels, shift_x, shift_y, side)
+    )
+    axes = (2, 4)
+    count = overlap.sum(axis=axes, keepdims=True)
+    mean_a = target.sum(axis=axes, keepdims=True) / count
+    mean_b = aligned.sum(axis=axes, keepdims=True) / count
+    # Each thread covers one column of a 32-row strip. Adjacent threads
+    # read adjacent pixels, including when only one large tile fits a batch.
+    columns = half * ((half + 31) // 32)
+    partial = cp.empty((3, n, 4, columns), dtype=cp.float64)
+    moments(target, aligned, overlap, mean_a, mean_b, side, columns, *partial)
+    aa, bb, ab = partial.sum(axis=-1)
+    energy = cp.sqrt(aa * bb)
+    corr = cp.where(energy > 0, ab / cp.maximum(energy, 1e-20), 0)
+    return cp.where(corr >= 1 - 1e-12, 1, corr).min(axis=1)
+
+
+def _match(tiles, spectra, template, cp):
     n, side, _ = tiles.shape
     cross = cp.fft.irfft2(spectra * template.spectrum, s=(side, side), axes=(-2, -1))
     # Whole-pitch shifts are equivalent for periodic metrology. Search nearby
@@ -132,36 +209,8 @@ def _match(tiles, spectra, template, cp):
     shift_y = dy + interpolate(
         cross[ids, (dy - 1) % side, dx], cross[ids, (dy + 1) % side, dx]
     )
-    axis = cp.arange(side)
-    rx, ry = axis - shift_x[:, None], axis - shift_y[:, None]
-    overlap = ((rx >= 0) & (rx <= side - 1))[:, None, :] & (
-        (ry >= 0) & (ry <= side - 1)
-    )[:, :, None]
-    coords = cp.stack(cp.broadcast_arrays(ry[:, :, None], rx[:, None, :]))
-    # Only the overlap contributes. Clamp the interpolation stencil at its
-    # last pixel, including when a fractional coordinate rounds to the edge.
-    aligned = map_coordinates(
-        template.pixels, coords, order=1, mode="nearest", prefilter=False
-    )
-
-    def quadrant_sum(a):
-        return a.reshape(n, 2, side // 2, 2, side // 2).sum(axis=(2, 4))
-
-    # Center each quadrant before accumulating squares, including for 16-bit
-    # pages with weak contrast on a large DC offset.
-    count = quadrant_sum(overlap)
-
-    def centered(a):
-        mean = quadrant_sum(a * overlap) / count
-        return (
-            a.reshape(n, 2, side // 2, 2, side // 2) - mean[:, :, None, :, None]
-        ).reshape(tiles.shape) * overlap
-
-    a, b = centered(tiles), centered(aligned)
-    energy = cp.sqrt(quadrant_sum(a * a) * quadrant_sum(b * b))
-    corr = cp.where(energy > 0, quadrant_sum(a * b) / cp.maximum(energy, 1e-20), 0)
-    corr = cp.where(corr >= 1 - 1e-12, 1, corr)
-    return corr.min(axis=(1, 2)), shift_x, shift_y
+    scores = _quadrant_scores(tiles, template.pixels, shift_x, shift_y, cp)
+    return scores, shift_x, shift_y
 
 
 def select_tiles(tiles, templates, min_corr, cp):
@@ -170,14 +219,16 @@ def select_tiles(tiles, templates, min_corr, cp):
     window = templates[0].window
     centered = data - (data * window).sum(axis=(1, 2), keepdims=True)
     spectra = cp.fft.rfft2(centered * window)
-    best = cp.full(len(data), -cp.inf, dtype=cp.float32)
-    match = cp.zeros((len(data), 3))
-    for i, template in enumerate(templates):
+    best, match_x, match_y = _match(data, spectra, templates[0], cp)
+    reference_ids = cp.zeros(len(data), dtype=cp.int32)
+    for i, template in enumerate(templates[1:], 1):
         score, dx, dy = _match(data, spectra, template, cp)
         better = score > best
-        match[:, 0] = cp.where(better, i, match[:, 0])
-        match[:, 1] = cp.where(better, dx, match[:, 1])
-        match[:, 2] = cp.where(better, dy, match[:, 2])
+        reference_ids = cp.where(better, i, reference_ids)
+        match_x = cp.where(better, dx, match_x)
+        match_y = cp.where(better, dy, match_y)
         best = cp.maximum(score, best)
     keep = cp.flatnonzero(best >= min_corr)
-    return cp.column_stack((keep, match[keep])).get()
+    return cp.column_stack(
+        (keep, reference_ids[keep], match_x[keep], match_y[keep])
+    ).get()

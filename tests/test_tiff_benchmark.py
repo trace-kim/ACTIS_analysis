@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 from scipy.ndimage import shift
@@ -5,9 +7,9 @@ from scipy.ndimage import shift
 from actis.estimators import estimate_holes
 from actis.fit import array_backend
 from actis.harmonics import harmonic_tiles
-from actis.pooled import pooled_tiles
+from actis.pooled import pooled_matched_cds, pooled_tiles
 from actis.synthetic import render_repeats
-from actis.tiff_benchmark import METHODS, PartialReport, TileSample, benchmark
+from actis.tiff_benchmark import METHODS, PartialReport, TileSample, benchmark, main
 from actis.tiff_tiles import prepare_reference, select_tiles
 
 
@@ -55,6 +57,26 @@ def test_gpu_selection_distinguishes_mixed_tiles(cuda, holes):
     np.testing.assert_array_equal(matches[:, 0], [0, 1])
     recovered = matches[1, 2:] - [-1.33, 2.25]
     np.testing.assert_allclose(recovered - 8 * np.rint(recovered / 8), 0, atol=0.15)
+
+
+def test_batched_pooled_matches_independent_shifted_tiles(cuda, holes):
+    # A halo supplies sites that enter or leave the tile at different shifts.
+    template = prepare_reference(np.tile(holes, (2, 2)), 96, "square", cuda)[0]
+    pixels = template.pixels.get().astype("u2")
+    shifts = np.array([[0.0, 0.0], [-2.25, 1.5], [2.75, -1.5], [0.0, 0.0]])
+    tiles = np.stack(
+        [shift(pixels, (dy, dx), order=1, mode="grid-wrap") for dx, dy in shifts]
+    )
+    tiles[-1].fill(65535)
+    expected = [
+        pooled_tiles(
+            tile, template.geometry(delta), tile_px=96, origin_xy=(-0.5, -0.5)
+        )[0]["cd_px"]
+        for tile, delta in zip(tiles, shifts)
+    ]
+    assert np.isfinite(expected[:-1]).all() and np.isnan(expected[-1])
+    actual = pooled_matched_cds(cuda.asarray(tiles), template.region, shifts, cuda)
+    np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=0, equal_nan=True)
 
 
 def test_streamed_gpu_methods_agree_with_native_estimators(cuda, holes, tmp_path):
@@ -117,6 +139,7 @@ def test_streamed_gpu_methods_agree_with_native_estimators(cuda, holes, tmp_path
     assert empty["fastest_with_valid_results"] is None
     assert empty["tested_tiles"] == 1 and empty["accepted_tiles"] == 0
     assert all(r["attempted"] == r["seconds"] == 0 for r in empty["methods"].values())
+    assert empty["estimated_all_tiles_method_seconds"] is None
 
 
 def test_tile_sample_is_repeatable_across_batch_boundaries():
@@ -139,6 +162,110 @@ def test_tile_sample_is_repeatable_across_batch_boundaries():
     assert selected == sample(5)
 
 
+def test_single_pooled_method_skips_other_work_even_in_warmup(
+    cuda, holes, tmp_path, monkeypatch
+):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "scan.tif"
+    tifffile.imwrite(
+        path, np.stack([holes, holes * 0, holes]), photometric="minisblack"
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Ran an unrequested estimator")
+
+    for name in (
+        "_model_methods",
+        "_contours",
+        "harmonic_tiles",
+        "_flux",
+        "_raw_means",
+    ):
+        monkeypatch.setattr(f"actis.tiff_benchmark.{name}", unexpected)
+    kwargs = {"method": "pooled", "tile_size": 96, "shape": "square"}
+    full = benchmark(path, sample_tiles=None, **kwargs)
+    sample = benchmark(path, sample_tiles=1, **kwargs)
+    assert set(full["methods"]) == {"pooled"}
+    assert full["pages"] == 3 and full["tested_tiles"] == 3
+    assert (
+        full["methods"]["pooled"]["valid"]
+        == full["measured_tiles"]
+        == full["accepted_tiles"]
+        == 2
+    )
+    row = sample["methods"]["pooled"]
+    assert row["valid"] == 1 and row["mean"] == pytest.approx(
+        full["methods"]["pooled"]["mean"]
+    )
+    assert row["estimated_all_tiles_seconds"] == pytest.approx(2 * row["seconds"])
+    assert full["methods"]["pooled"]["estimated_all_tiles_seconds"] is None
+
+
+def test_page_sample_decodes_only_chosen_pages_and_keeps_native_indices(
+    cuda, holes, tmp_path, monkeypatch
+):
+    from actis import tiff_benchmark
+
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "sample.tif"
+    base = holes // 2
+    with tifffile.TiffWriter(path, bigtiff=True) as tif:
+        for i in range(12):
+            tif.write(base + i, compression="deflate")
+    decoded = []
+    read = tiff_benchmark._read_page
+
+    def record_page(page):
+        decoded.append(page.index)
+        return read(page)
+
+    monkeypatch.setattr(tiff_benchmark, "_read_page", record_page)
+    result = benchmark(path, method="raw", tile_size=96, shape="square", sample_pages=3)
+    indices = result["sample_page_indices_zero_based"]
+    assert decoded == [0, *indices]  # Reference plus three target pages
+    assert [i // 4 for i in indices] == [0, 1, 2]
+    assert result["pages"] == result["measured_tiles"] == 3
+    assert result["sample_locations_page_tile_zero_based"] == [(i, 0) for i in indices]
+    assert result["methods"]["raw"]["mean"] == pytest.approx(
+        base.mean() + np.mean(indices)
+    )
+
+
+def test_cli_defaults_bound_comparison_and_cover_every_page_for_all_tiles(
+    cuda, holes, tmp_path
+):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "many.tif"
+    tifffile.imwrite(path, np.repeat(holes[None], 40, axis=0), photometric="minisblack")
+    for name, flags, pages, measured in (
+        ("quick", [], 32, 32),
+        ("all_pages", ["--all-pages"], 40, 32),
+        ("full", ["--all-tiles"], 40, 40),
+    ):
+        output = tmp_path / f"{name}.json"
+        assert (
+            main(
+                [
+                    str(path),
+                    "--tile-size",
+                    "96",
+                    "--shape",
+                    "square",
+                    "--method",
+                    "raw",
+                    "--json",
+                    str(output),
+                    *flags,
+                ]
+            )
+            == 0
+        )
+        result = json.loads(output.read_text())
+        assert result["total_pages"] == 40
+        assert result["pages"] == result["accepted_tiles"] == pages
+        assert result["measured_tiles"] == result["methods"]["raw"]["valid"] == measured
+
+
 def test_sample_exhaustive_and_interrupted_report(cuda, holes, tmp_path):
     tifffile = pytest.importorskip("tifffile")
     path = tmp_path / "mixed.tif"
@@ -159,11 +286,16 @@ def test_sample_exhaustive_and_interrupted_report(cuda, holes, tmp_path):
     assert sampled["measured_tiles"] == sampled["methods"]["raw"]["valid"] == 2
     assert full["methods"]["raw"]["valid"] == 6
     assert len(sampled["sample_locations_page_tile_zero_based"]) == 2
+    sample_cost = sampled["stage_seconds"]["fit_setup"] + sum(
+        row["exclusive_seconds"] for row in sampled["methods"].values()
+    )
+    assert sampled["estimated_all_tiles_method_seconds"] == pytest.approx(
+        sample_cost * 3
+    )
+    assert full["estimated_all_tiles_method_seconds"] is None
     partial = PartialReport(tmp_path / "timing.json")
     with pytest.raises(ValueError, match="single-channel"):
         benchmark(path, checkpoint=partial.write, sample_tiles=None, **kwargs)
-    import json
-
     saved = json.loads(partial.path.read_text())
     assert saved["status"] == "running" and saved["measured_tiles"] >= 1
     assert saved["methods"]["raw"]["valid"] == saved["measured_tiles"]
