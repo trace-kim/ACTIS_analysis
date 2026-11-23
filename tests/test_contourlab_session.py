@@ -16,6 +16,7 @@ from actis.contourlab import contours as geometry
 from actis.contourlab import session as lab
 from actis.contourlab.server import start
 from actis.contourlab.session import (
+    SHOWN,
     ContourSet,
     LabError,
     Layer,
@@ -89,8 +90,16 @@ def unpacked(payload):
     diameter = np.frombuffer(payload, "<f4", n, at)
     at += 4 * n
     box = np.frombuffer(payload, "<f4", 4 * n, at).reshape(-1, 4)
-    assert at + 16 * n == len(payload)
+    assert at + 16 * n + 4 * n * len(SHOWN) == len(payload)
     return start, closed, xy, centre, diameter, box
+
+
+def shown(payload, count):
+    """The values a window colours the contours by: {key: (count,)}."""
+    values = np.frombuffer(payload[-4 * count * len(SHOWN) :], "<f4").reshape(
+        len(SHOWN), count
+    )
+    return {key: row for (key, *_), row in zip(SHOWN, values)}
 
 
 # --- Layers -----------------------------------------------------------------
@@ -172,6 +181,59 @@ def test_a_contour_set_is_one_buffer_for_a_window():
     np.testing.assert_allclose(box[0], [7, 17, 13, 23], atol=0.05)
     assert made.payload() is made.payload()  # made once
     assert len(ContourSet("C0", geometry.empty()).payload()) == 12
+
+
+def test_a_contour_set_carries_what_a_window_colours_the_contours_by():
+    y, x = np.mgrid[0:40, 0:40]
+    image = (100 + 10 * x).astype(np.uint16)  # brighter to the right
+    turn = np.linspace(0, 2 * np.pi, 40, endpoint=False)
+    circle = np.column_stack([np.cos(turn), np.sin(turn)])
+    centres = [
+        (8, 8),
+        (20, 8),
+        (32, 8),
+        (8, 20),
+        (20, 20),
+        (32, 20),
+        (8, 32),
+        (20, 32),
+        (32, 32),
+    ]
+    radii = [3.0] * 9
+    radii[4] = 3.6  # the one in the middle is a fifth larger than those around it
+    rounds = [np.asarray(c) + r * circle * [1.0, 1.25] for c, r in zip(centres, radii)]
+    made = ContourSet(
+        "C1",
+        geometry.from_list(rounds + [circle[:5] * 3 + 20], [True] * 9 + [False]),
+        image=image,
+    )
+
+    values = shown(made.payload(), 10)
+
+    assert (
+        list(values)
+        == [key for key, *_ in SHOWN]
+        == [m["key"] for m in meta()["measures"]]
+    )
+    np.testing.assert_allclose(
+        values["diameter"][:9], np.array(radii) * 2 * np.sqrt(1.25), rtol=0.01
+    )
+    assert values["deviation"][4] == pytest.approx(20, abs=0.5)
+    assert abs(values["deviation"][[0, 2, 6, 8]]).max() < 0.5
+    np.testing.assert_allclose(values["aspect"][:9], 1.25, rtol=0.01)
+    np.testing.assert_allclose(
+        values["height"][:9] / values["width"][:9], 1.25, rtol=0.02
+    )
+    np.testing.assert_allclose(values["brightness"][:3], [180, 300, 420], atol=1)
+    # an open contour has a place and no size
+    assert np.isnan(
+        [values[key][9] for key in ("diameter", "deviation", "width", "aspect")]
+    ).all()
+    assert made.detail(4)["deviation"] == pytest.approx(20, abs=0.5)
+    # without the image there is no brightness, and the rest is the same
+    bare = shown(ContourSet("C2", made.contours).payload(), 10)
+    assert np.isnan(bare["brightness"]).all()
+    np.testing.assert_array_equal(bare["diameter"], values["diameter"])
 
 
 def test_the_statistics_of_a_contour_set():
@@ -266,7 +328,7 @@ def test_a_tab_shows_an_image_and_runs_the_newest_workflow_on_it(
     assert traced["contours"] in result["contours"] and traced["made_by"] == 2
     assert traced["before"] is None and traced["mask"] == mask["mask"]
     stats = result["contours"][traced["contours"]]
-    assert stats["closed"] == stats["count"] > 300
+    assert stats["count"] >= stats["closed"] > 300
     assert 3.5 < stats["diameter"]["median"] < 5
     json.dumps(result, allow_nan=False)
     # what the lab's window draws is what the workflow finds by itself
@@ -560,6 +622,15 @@ def test_the_window_is_told_every_module_and_workflow_to_start_from():
         "whole image",
     ]
     assert parse_steps(told["presets"][0]["steps"]) == preset(START)
+    # what a window needs to say it briefly: a name in words, the few options to
+    # show first, a sentence per module, and for each workflow where it belongs
+    assert threshold["fraction"]["label"] == "Level between dark and bright"
+    assert not threshold["fraction"]["advanced"] and threshold["window_px"]["advanced"]
+    for module in told["modules"]:
+        assert module["summary"] and module["help"].startswith(module["summary"])
+        assert all(option["label"] for option in module["options"]), module["name"]
+    assert {p["group"] for p in told["presets"]} == set(told["groups"])
+    assert all(p["best"] and p["watch"] for p in told["presets"])
     json.dumps(told, allow_nan=False)
 
 

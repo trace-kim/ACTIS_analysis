@@ -22,13 +22,24 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
+from scipy.spatial import cKDTree
 
 from .. import __version__
 from . import contours as geometry
 from .contours import MEASURES, Contours
 from .modules import LEFT_OUT, MODULES, STAGES
 from .sources import SUFFIXES, ImageFile, display_range
-from .workflow import PRESETS, START, Run, run_workflow, workflow_data, workflow_steps
+from .workflow import (
+    GROUPS,
+    GUIDE,
+    PRESETS,
+    START,
+    Run,
+    run_workflow,
+    workflow_data,
+    workflow_steps,
+)
 
 TILE = 256  # pixels per side of a tile
 MAX_REGION_PIXELS = 24_000_000  # the most a workflow is run on at once
@@ -132,14 +143,78 @@ def finite(value, digits=6):
     return round(value, digits) if np.isfinite(value) else None
 
 
+# What a window can colour the contours by and list: (key, name, kind, what it is).
+# Kinds: a length in pixels, a percentage, a ratio, a grey level.
+SHOWN = (
+    (
+        "diameter",
+        "Diameter",
+        "length",
+        "Diameter of the circle with the contour's area",
+    ),
+    (
+        "deviation",
+        "Versus neighbours",
+        "percent",
+        "How much larger or smaller its diameter is than the median of its eight "
+        "nearest contours: what stands out locally, whatever the trend across the image",
+    ),
+    ("width", "Width", "length", "Extent along x"),
+    ("height", "Height", "length", "Extent along y"),
+    ("aspect", "Elongation", "ratio", "Long axis over short axis: 1 is round"),
+    (
+        "brightness",
+        "Brightness",
+        "level",
+        "Grey level of the image as loaded at the contour's centre: a size map that "
+        "looks like this one follows the illumination",
+    ),
+)
+
+
+def shown_values(contours, measures, image=None):
+    """The values of SHOWN for every contour: {key: (N,) float32}, NaN where a
+    contour has none (an open one has no diameter). image: the image as loaded,
+    in whose pixels the contours are."""
+    n = len(contours)
+    diameter = measures["diameter"]
+    whole = np.isfinite(diameter)
+    deviation = np.full(n, np.nan)
+    if whole.sum() > 2:
+        centres = measures["centre"][whole]
+        _, near = cKDTree(centres).query(centres, k=min(9, len(centres)))
+        around = np.median(diameter[whole][near[:, 1:]], axis=1)
+        deviation[whole] = 100 * (diameter[whole] / around - 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        aspect = measures["major"] / measures["minor"]
+    aspect = np.where(np.isfinite(aspect), aspect, np.nan)
+    brightness = np.full(n, np.nan)
+    if image is not None and n:
+        at = [measures["centre"][:, 1], measures["centre"][:, 0]]
+        brightness = ndimage.map_coordinates(
+            image, at, output=np.float32, order=1, mode="nearest"
+        )
+    values = {
+        "diameter": diameter,
+        "deviation": deviation,
+        "width": np.where(whole, measures["width"], np.nan),
+        "height": np.where(whole, measures["height"], np.nan),
+        "aspect": aspect,
+        "brightness": brightness,
+    }
+    return {key: np.asarray(values[key], dtype=np.float32) for key, *_ in SHOWN}
+
+
 class ContourSet:
     """The contours a step made, in the pixels of the image as loaded, with
-    their measures, as a window and the exports need them."""
+    their measures, as a window and the exports need them. image: that image,
+    for the brightness at every contour."""
 
-    def __init__(self, key, contours, of=None):
+    def __init__(self, key, contours, of=None, image=None):
         self.id, self.contours = key, contours
         self.of = of  # the contours of the workflow's state these were made from
         self.measures = geometry.measure(contours)
+        self.shown = shown_values(contours, self.measures, image)
         self._payload = None
         self._lock = threading.Lock()
 
@@ -148,7 +223,8 @@ class ContourSet:
 
         uint32 n, P; uint32 start[n + 1]; uint8 closed[n], padded to 4 bytes;
         float32 xy[2 P]; float32 centre[2 n]; float32 diameter[n];
-        float32 box[4 n] (least x, least y, most x, most y).
+        float32 box[4 n] (least x, least y, most x, most y);
+        then float32[n] for each of SHOWN, in its order.
         """
         with self._lock:
             if self._payload is None:
@@ -169,6 +245,7 @@ class ContourSet:
                     self.measures["centre"].astype("<f4"),
                     self.measures["diameter"].astype("<f4"),
                     np.hstack([low, high]).astype("<f4"),
+                    *(self.shown[key].astype("<f4") for key, *_ in SHOWN),
                 ]
                 self._payload = b"".join(part.tobytes() for part in parts)
             return self._payload
@@ -234,6 +311,8 @@ class ContourSet:
         )
         if row["angle"] is not None:
             row["angle"] = finite(np.degrees(m["angle"][index]), 3)
+        for key in ("deviation", "aspect", "brightness"):
+            row[key] = finite(self.shown[key][index], 4)
         return row
 
     def table(self, pixel_nm=None):
@@ -529,7 +608,7 @@ class Tab:
                 c = state.contours
                 xy = (c.xy + 0.5) / state.scale - 0.5 + [x0, y0]
                 placed = Contours(xy, c.start, c.closed, c.left_out)
-                found = ContourSet(f"C{self._number}", placed, of=c)
+                found = ContourSet(f"C{self._number}", placed, of=c, image=self.source)
             sets[id(state.contours)] = found
             return found.id
 
@@ -806,6 +885,8 @@ def meta():
             options.append(
                 {
                     "name": name,
+                    "label": option.label,
+                    "advanced": option.advanced,
                     "kind": kind,
                     "default": option.default,
                     "help": option.help,
@@ -821,12 +902,18 @@ def meta():
                 "name": module.name,
                 "title": module.title,
                 "stage": module.stage,
+                "summary": module.summary,
                 "help": module.help,
                 "options": options,
             }
         )
     presets = [
-        {"name": name, "help": text, "steps": workflow_data(steps)["steps"]}
+        {
+            "name": name,
+            "help": text,
+            **GUIDE[name],
+            "steps": workflow_data(steps)["steps"],
+        }
         for name, (text, steps) in PRESETS.items()
     ]
     return {
@@ -834,7 +921,12 @@ def meta():
         "stages": list(STAGES),
         "modules": modules,
         "presets": presets,
+        "groups": list(GROUPS),
         "start": START,
+        "measures": [
+            {"key": key, "label": label, "kind": kind, "help": text}
+            for key, label, kind, text in SHOWN
+        ],
         "format": workflow_data([]),
         "suffixes": list(SUFFIXES),
         "max_region_pixels": MAX_REGION_PIXELS,

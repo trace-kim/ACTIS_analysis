@@ -1,28 +1,58 @@
 "use strict";
-/* The image of the tab in front, with its layers: tiles of the image and of the mask, contours, the region
-   and the pointer's readout. app.js owns the state (S, the tabs); this file draws it and turns the mouse
-   into changes of it.
+/* The image of the tab in front. app.js owns the state (S, the tabs); this file draws it and turns the
+   mouse into changes of it.
+
+   Three canvases lie over each other, so that each is drawn only when what it shows changes:
+     image   the grey levels (and the mask), as tiles the server cuts at halving resolutions;
+     lines   the contours, drawn by the graphics card (gl.js), or by the canvas where there is none;
+     marks   what follows the pointer: the contour under it, the one picked, the region being drawn.
+   Moving the pointer over the image redraws the marks only; the numbers under the pointer are text.
 
    Coordinates. The server's are pixel centres: the first pixel is at (0, 0). On screen that pixel covers
    the square from 0 to 1, so a point (x, y) is drawn at x + 0.5, y + 0.5. A tab's camera is the place of
    the image at the middle of the window (in those screen units) and the zoom in CSS pixels per image pixel. */
 
 const TILE = 256;
-const COLOUR = { contours: "#35d3f0", before: "#e866d2", pinned: "#a6e36c", picked: "#ffffff", region: "#ffd27a" };
+const INK = { main: "#d95926", reference: "#199e70", before: "#3987e5", picked: "#ffffff", region: "#f0efec" };
+const MAIN_INKS = { orange: "#d95926", blue: "#3987e5", aqua: "#199e70", yellow: "#c98500", magenta: "#d55181", white: "#f0efec" };
+/* Colour scales for a measure. Two-sided: blue below the middle, red above, near white at it, so that with
+   their dark casing the contours show on dark and on bright areas alike. One-sided: one hue, lighter = more. */
+const SCALES = {
+  diverging: { name: "diverging", stops: [[42, 120, 214], [109, 167, 236], [183, 211, 246], [240, 239, 236], [236, 184, 181], [231, 128, 127], [227, 73, 72]] },
+  sequential: { name: "sequential", stops: [[24, 79, 149], [37, 106, 191], [57, 135, 229], [109, 167, 236], [158, 197, 244], [205, 226, 251]] },
+};
+
+function rgb(hex) {
+  return [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16) / 255);
+}
 
 const View = (() => {
-  const canvas = $("view");
-  const ctx = canvas.getContext("2d");
+  const image = $("image");
+  const ctx = image.getContext("2d");
+  const marks = $("marks");
+  const mk = marks.getContext("2d");
   const map = $("map");
   const mapCtx = map.getContext("2d");
+  let lines = $("lines");
+  let renderer = new URLSearchParams(location.search).get("draw") === "canvas" ? null : GLContours.create(lines);
+  let flat = null; // the canvas context that draws the contours where the card does not
+  if (!renderer) {
+    const plain = lines.cloneNode(); // a canvas that was asked for WebGL gives no other context
+    lines.replaceWith(plain);
+    lines = plain;
+    flat = lines.getContext("2d");
+  }
   let vw = 1;
   let vh = 1;
   let dpr = 1;
-  let pending = 0; // the animation frame asked for
-  let frame = 0; // counts the frames drawn
-  let pointer = null; // [x, y] in CSS pixels of the canvas; null: not over it
+  let pending = 0;
+  let dirty = { scene: true, marks: true };
+  let frame = 0;
+  let pointer = null; // [x, y] in CSS pixels of the view; null: not over it
   let gesture = null; // a drag in progress
   let bare = false; // Space held: the image without its layers
+  let rested = ""; // the camera of the last frame, and the timer of the full picture after it:
+  let resting = 0; // for drawing the contours without the graphics card
 
   // --- Tiles ----------------------------------------------------------------------------------------------
 
@@ -61,6 +91,7 @@ const View = (() => {
           loading--;
           pump();
           draw();
+          readout();
         });
     }
   }
@@ -89,11 +120,11 @@ const View = (() => {
     picture.width = tile.w;
     picture.height = tile.h;
     const g = picture.getContext("2d");
-    const image = g.createImageData(tile.w, tile.h);
-    const out = new Uint32Array(image.data.buffer); // one pixel each: alpha, blue, green, red
+    const data = g.createImageData(tile.w, tile.h);
+    const out = new Uint32Array(data.data.buffer); // one pixel each: alpha, blue, green, red
     const values = tile.values;
     if (layer.mask) {
-      for (let i = 0; i < values.length; i++) out[i] = (((values[i] * 0.45) | 0) << 24) | (0 << 16) | (192 << 8) | 240;
+      for (let i = 0; i < values.length; i++) out[i] = (((values[i] * 0.42) | 0) << 24) | (233 << 16) | (133 << 8) | 144;
     } else {
       const gain = 255 / Math.max(white - black, 1e-30);
       for (let i = 0; i < values.length; i++) {
@@ -102,7 +133,7 @@ const View = (() => {
         out[i] = 0xff000000 | (grey << 16) | (grey << 8) | grey;
       }
     }
-    g.putImageData(image, 0, 0);
+    g.putImageData(data, 0, 0);
     tile.canvas = picture;
     tile.variant = variant;
     return picture;
@@ -119,20 +150,20 @@ const View = (() => {
     return { left: x - vw / (2 * z), top: y - vh / (2 * z), right: x + vw / (2 * z), bottom: y + vh / (2 * z) };
   }
 
-  /* The place in the image under a point of the canvas (CSS pixels), in screen units (module comment). */
+  /* The place in the image under a point of the view (CSS pixels), in screen units (module comment). */
   function imageAt(tab, point) {
     return [tab.cam.x + (point[0] - vw / 2) / tab.cam.z, tab.cam.y + (point[1] - vh / 2) / tab.cam.z];
   }
 
   function fitZoom(tab) {
-    return 0.96 * Math.min(vw / tab.info.width, vh / tab.info.height);
+    return 0.94 * Math.min(vw / tab.info.width, vh / tab.info.height);
   }
 
   /* Show the whole image; of a long strip, its full width at the place of the region the workflow runs on. */
   function fit(tab) {
     measure();
     const whole = fitZoom(tab);
-    const across = (0.96 * vw) / tab.info.width;
+    const across = (0.94 * vw) / tab.info.width;
     if (whole < 0.3 * across) {
       const region = tab.region || [0, 0, tab.info.width, Math.min(tab.info.height, vh / across)];
       tab.cam = { x: tab.info.width / 2, y: (region[1] + region[3]) / 2, z: across };
@@ -184,15 +215,22 @@ const View = (() => {
 
   function measure() {
     dpr = window.devicePixelRatio || 1;
-    vw = Math.max(1, canvas.clientWidth);
-    vh = Math.max(1, canvas.clientHeight);
-    if (canvas.width !== Math.round(vw * dpr) || canvas.height !== Math.round(vh * dpr)) {
-      canvas.width = Math.round(vw * dpr);
-      canvas.height = Math.round(vh * dpr);
+    const box = $("viewport");
+    vw = Math.max(1, box.clientWidth);
+    vh = Math.max(1, box.clientHeight);
+    for (const canvas of [image, lines, marks]) {
+      if (canvas.width !== Math.round(vw * dpr) || canvas.height !== Math.round(vh * dpr)) {
+        canvas.width = Math.round(vw * dpr);
+        canvas.height = Math.round(vh * dpr);
+        dirty.scene = dirty.marks = true;
+      }
     }
   }
 
-  function draw() {
+  /* Draw again: everything, or (marksOnly) what follows the pointer. */
+  function draw(marksOnly = false) {
+    if (marksOnly) dirty.marks = true;
+    else dirty.scene = dirty.marks = true;
     if (!pending) pending = requestAnimationFrame(paint);
   }
 
@@ -200,41 +238,19 @@ const View = (() => {
     pending = 0;
     frame++;
     measure();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = "#0a0d10";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
     const tab = S.active;
     $("empty").hidden = Boolean(tab);
-    map.hidden = true;
-    if (!tab) return;
-    if (!tab.cam) fit(tab);
-    const view = shown(tab); // {state, layers...} of what the result holds for the step shown
-    const source = tab.info.source;
-    const top = view.image; // the processed image, if that is what is shown
-    if (!top || top.x || top.y || top.width / top.scale < tab.info.width || top.height / top.scale < tab.info.height) {
-      // the image as loaded: all there is to show, or what lies around the region that was processed
-      layer(tab, source, levelsOf(tab, source, !top), top ? 0.5 : 1);
+    document.body.classList.toggle("no-image", !tab);
+    if (tab && !tab.cam) fit(tab);
+    const scene = dirty.scene;
+    dirty = { scene: false, marks: false };
+    if (scene) {
+      paintImage(tab);
+      paintContours(tab);
+      paintMap(tab);
+      paintScale(tab);
     }
-    // an image no module changed is shown with the grey levels of the whole image, as what lies around it
-    if (top) layer(tab, top, levelsOf(tab, view.changed ? top : source, true), 1);
-    if (!bare) {
-      if (view.mask && S.show.mask) layer(tab, view.mask, null, 1);
-      pages(tab);
-      region(tab);
-      if (S.show.pinned && tab.pinned) contours(tab, tab.pinned.set, COLOUR.pinned, 1.2, false);
-      if (S.show.before && view.before) contours(tab, setOf(tab, view.before), COLOUR.before, 1.2, false);
-      if (view.contours) {
-        const set = setOf(tab, view.contours);
-        if (S.show.contours) contours(tab, set, COLOUR.contours, 1.5, S.show.centres);
-        else if (S.show.centres) contours(tab, set, COLOUR.contours, 0, true);
-        if (set) mark(tab, set);
-      }
-    }
-    if (gesture && gesture.kind === "region") rubber(tab);
-    ruler(tab);
-    overview(tab);
-    $("zoom").textContent = tab.cam.z >= 1 ? `${trim(tab.cam.z, 3)}×` : `1:${trim(1 / tab.cam.z, 3)}`;
-    readout(tab);
+    paintMarks(tab);
   }
 
   /* The grey levels shown as black and white: the tab's own if set by hand (for the image in front), else
@@ -242,6 +258,23 @@ const View = (() => {
   function levelsOf(tab, described, front) {
     if (front && !tab.levels.auto) return { black: tab.levels.black, white: tab.levels.white };
     return { black: described.black, white: described.white };
+  }
+
+  function paintImage(tab) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#0d0d0d";
+    ctx.fillRect(0, 0, image.width, image.height);
+    if (!tab) return;
+    const view = shown(tab);
+    const source = tab.info.source;
+    const top = view.image; // the processed image, if that is what is shown
+    if (!top || top.x || top.y || top.width / top.scale < tab.info.width || top.height / top.scale < tab.info.height) {
+      // the image as loaded: all there is to show, or what lies around the region that was processed
+      layer(tab, source, levelsOf(tab, source, !top), top ? 0.55 : 1);
+    }
+    // an image no module changed is shown with the grey levels of the whole image, as what lies around it
+    if (top) layer(tab, top, levelsOf(tab, view.changed ? top : source, true), 1);
+    if (!bare && view.mask && S.show.mask) layer(tab, view.mask, null, 1);
   }
 
   function layer(tab, described, levels, alpha) {
@@ -262,7 +295,6 @@ const View = (() => {
     ctx.globalAlpha = alpha;
     // smaller than the screen's pixels: averaged; larger: each pixel a square, unless asked otherwise
     ctx.imageSmoothingEnabled = each * size < 0.999 || (S.show.smooth && !described.mask);
-    ctx.imageSmoothingQuality = "high";
     tileOf(tab, described, described.levels - 1, 0, 0); // the whole layer, coarse: shown until the fine tiles come
     const place = (x, y) => [Math.round((x - e.left) * z), Math.round((y - e.top) * z)];
     for (let ty = y0; ty < y1; ty++) {
@@ -296,58 +328,126 @@ const View = (() => {
     ctx.globalAlpha = 1;
   }
 
-  /* The contours of a set that the window shows. Far out, where each is a few screen pixels, a dot each. */
-  function contours(tab, set, colour, width, centres) {
-    if (!set || !set.n) return;
+  /* The sets of contours the window shows, the one in front last: [set, how it looks]. */
+  function setsShown(tab) {
+    const out = [];
+    if (!tab || bare) return out;
+    const view = shown(tab);
+    const width = S.look.width * dpr;
+    const one = (set, hex, share) => ({ width: Math.max(1, width * share), colour: rgb(hex), values: null, low: 0, high: 1, scale: SCALES.diverging });
+    if (S.show.reference && tab.pinned) out.push([tab.pinned.set, one(tab.pinned.set, INK.reference, 0.8)]);
+    if (S.show.before && view.before) {
+      const set = setOf(tab, view.before);
+      if (set) out.push([set, one(set, INK.before, 0.8)]);
+    }
+    if (S.show.contours && view.contours) {
+      const set = setOf(tab, view.contours);
+      if (set) {
+        const main = one(set, MAIN_INKS[S.look.colour] || INK.main, 1);
+        const by = colouring(set); // app.js: the measure the contours are coloured by, if any
+        if (by) Object.assign(main, by);
+        out.push([set, main]);
+      }
+    }
+    return out;
+  }
+
+  function paintContours(tab) {
+    const e = tab ? edges(tab) : null;
+    if (renderer) {
+      renderer.begin(lines.width, lines.height);
+      if (!tab) return;
+      const view = { left: e.left, top: e.top, zoom: tab.cam.z * dpr, width: lines.width, height: lines.height };
+      for (const [set, look] of setsShown(tab)) renderer.draw(set, view, look);
+      return;
+    }
+    flat.setTransform(1, 0, 0, 1, 0, 0);
+    flat.clearRect(0, 0, lines.width, lines.height);
+    if (!tab) return;
+    // while the camera moves, a quick picture; the full one once it has rested
+    const place = `${tab.id} ${tab.cam.x} ${tab.cam.y} ${tab.cam.z}`;
+    const quick = place !== rested;
+    rested = place;
+    clearTimeout(resting);
+    if (quick) resting = setTimeout(() => draw(), 140);
+    for (const [set, look] of setsShown(tab)) plainContours(tab, set, look, quick);
+  }
+
+  /* Without the graphics card: outlines while few are in view, else a disc each. Never more work than a
+     frame can take: that many outlines as one path is what made the first lab slow. */
+  function plainContours(tab, set, look, quick) {
+    if (!set.n) return;
     const z = tab.cam.z * dpr;
     const e = edges(tab);
     const seen = visible(set, e.left - 0.5, e.top - 0.5, e.right - 0.5, e.bottom - 0.5);
     const ox = (0.5 - e.left) * z;
     const oy = (0.5 - e.top) * z;
     const { xy, start, closed, centre, diameter } = set;
-    ctx.fillStyle = ctx.strokeStyle = colour;
-    const typical = set.typical * z; // a contour's size on screen
-    if (seen.length > 20000 || typical < 5) {
-      const side = clamp(typical * 0.6, 1, 3) * (dpr > 1 ? 1.2 : 1);
-      ctx.globalAlpha = seen.length > 20000 ? 0.75 : 0.9;
+    const typical = set.typical * z;
+    const groups = 8;
+    const group = new Uint8Array(seen.length);
+    const inks = [];
+    if (look.values) {
       for (let k = 0; k < seen.length; k++) {
-        const i = seen[k];
-        ctx.fillRect(centre[2 * i] * z + ox - side / 2, centre[2 * i + 1] * z + oy - side / 2, side, side);
+        const value = look.values[seen[k]];
+        group[k] = Number.isNaN(value) ? groups : clamp(Math.floor(((value - look.low) / (look.high - look.low)) * groups), 0, groups - 1);
       }
-      ctx.globalAlpha = 1;
-      return;
+      for (let g = 0; g < groups; g++) inks.push(`rgb(${GLContours.colourAt(look.scale.stops, (g + 0.5) / groups).slice(0, 3).join(",")})`);
     }
-    if (width > 0) {
-      const skip = typical < 14 ? 3 : typical < 30 ? 2 : 1; // fewer points while they are closer than a pixel
-      ctx.beginPath();
-      for (let k = 0; k < seen.length; k++) {
-        const i = seen[k];
-        const a = start[i];
-        const b = start[i + 1];
-        ctx.moveTo(xy[2 * a] * z + ox, xy[2 * a + 1] * z + oy);
-        for (let p = a + skip; p < b; p += skip) ctx.lineTo(xy[2 * p] * z + ox, xy[2 * p + 1] * z + oy);
-        if (closed[i]) ctx.closePath();
-        else ctx.lineTo(xy[2 * b - 2] * z + ox, xy[2 * b - 1] * z + oy);
+    inks[groups] = `rgb(${look.colour.map((c) => Math.round(c * 255)).join(",")})`;
+    if (!look.values) group.fill(groups);
+    // an outline for a contour large enough on screen, while few enough are; else a disc of its size
+    const { box } = set;
+    const drawn = new Uint8Array(seen.length);
+    let budget = quick ? 300 : 2500;
+    for (let k = 0; k < seen.length && budget > 0; k++) {
+      const i = seen[k];
+      const size = Math.max(box[4 * i + 2] - box[4 * i], box[4 * i + 3] - box[4 * i + 1]) * z;
+      if (size >= GLContours.OUTLINE_FROM) {
+        drawn[k] = 1;
+        budget--;
       }
-      ctx.lineWidth = width * dpr;
-      ctx.lineJoin = "round";
-      ctx.stroke();
     }
-    if (centres && typical >= 12) {
-      const arm = clamp(typical * 0.09, 2.5, 7) * dpr;
-      ctx.beginPath();
-      for (let k = 0; k < seen.length; k++) {
-        const i = seen[k];
-        if (!closed[i] || Number.isNaN(diameter[i])) continue;
-        const cx = centre[2 * i] * z + ox;
-        const cy = centre[2 * i + 1] * z + oy;
-        ctx.moveTo(cx - arm, cy);
-        ctx.lineTo(cx + arm, cy);
-        ctx.moveTo(cx, cy - arm);
-        ctx.lineTo(cx, cy + arm);
+    const skip = typical < 30 ? 2 : 1; // fewer points while they are closer than a pixel
+    for (let g = 0; g <= groups; g++) {
+      for (const outlines of [0, 1]) {
+        flat.beginPath();
+        let any = false;
+        for (let k = 0; k < seen.length; k++) {
+          if (group[k] !== g || drawn[k] !== outlines) continue;
+          any = true;
+          const i = seen[k];
+          if (outlines) {
+            const a = start[i];
+            const b = start[i + 1];
+            flat.moveTo(xy[2 * a] * z + ox, xy[2 * a + 1] * z + oy);
+            for (let p = a + 1; p < b; p += skip) flat.lineTo(xy[2 * p] * z + ox, xy[2 * p + 1] * z + oy);
+            if (closed[i]) flat.closePath();
+          } else {
+            const radius = Math.max(1.2, ((Number.isNaN(diameter[i]) ? typical / z : diameter[i]) * z) / 2);
+            const cx = centre[2 * i] * z + ox;
+            const cy = centre[2 * i + 1] * z + oy;
+            if (radius < 2.5) flat.rect(cx - radius, cy - radius, 2 * radius, 2 * radius);
+            else {
+              flat.moveTo(cx + radius, cy);
+              flat.arc(cx, cy, radius, 0, 2 * Math.PI);
+            }
+          }
+        }
+        if (!any) continue;
+        if (outlines) {
+          flat.lineJoin = "round";
+          flat.strokeStyle = "rgba(10,10,10,0.9)";
+          flat.lineWidth = look.width + 2 * Math.max(1, 0.5 * look.width);
+          flat.stroke();
+          flat.strokeStyle = inks[g];
+          flat.lineWidth = look.width;
+          flat.stroke();
+        } else {
+          flat.fillStyle = inks[g];
+          flat.fill();
+        }
       }
-      ctx.lineWidth = 1.2 * dpr;
-      ctx.stroke();
     }
   }
 
@@ -356,19 +456,19 @@ const View = (() => {
     const g = set.grid;
     const out = [];
     if (!g) return out;
+    if (right < g.x || bottom < g.y || left > g.x + g.cols * g.cell || top > g.y + g.rows * g.cell) return out;
     const cx0 = clamp(Math.floor((left - g.x) / g.cell), 0, g.cols - 1);
     const cy0 = clamp(Math.floor((top - g.y) / g.cell), 0, g.rows - 1);
     const cx1 = clamp(Math.floor((right - g.x) / g.cell), 0, g.cols - 1);
     const cy1 = clamp(Math.floor((bottom - g.y) / g.cell), 0, g.rows - 1);
-    if (right < g.x || bottom < g.y || left > g.x + g.cols * g.cell || top > g.y + g.rows * g.cell) return out;
-    const mark = ++g.round;
+    const round = ++g.round;
     for (let cy = cy0; cy <= cy1; cy++) {
       for (let cx = cx0; cx <= cx1; cx++) {
         const cell = cy * g.cols + cx;
         for (let k = g.first[cell]; k < g.first[cell + 1]; k++) {
           const i = g.items[k];
-          if (g.seen[i] === mark) continue; // a contour lies in every cell its box touches
-          g.seen[i] = mark;
+          if (g.seen[i] === round) continue; // a contour lies in every cell its box touches
+          g.seen[i] = round;
           const b = 4 * i;
           if (set.box[b + 2] >= left && set.box[b] <= right && set.box[b + 3] >= top && set.box[b + 1] <= bottom) out.push(i);
         }
@@ -401,55 +501,93 @@ const View = (() => {
     return found;
   }
 
-  /* The contour under the pointer, and the one picked. */
-  function mark(tab, set) {
+  // --- What follows the pointer ---------------------------------------------------------------------------
+
+  function paintMarks(tab) {
+    mk.setTransform(1, 0, 0, 1, 0, 0);
+    mk.clearRect(0, 0, marks.width, marks.height);
+    if (!tab) return;
     const z = tab.cam.z * dpr;
     const e = edges(tab);
-    const one = (i, colour, width) => {
-      if (i < 0 || i >= set.n) return;
-      ctx.beginPath();
-      const a = set.start[i];
-      const b = set.start[i + 1];
-      for (let p = a; p < b; p++) {
-        const X = (set.xy[2 * p] + 0.5 - e.left) * z;
-        const Y = (set.xy[2 * p + 1] + 0.5 - e.top) * z;
-        if (p === a) ctx.moveTo(X, Y);
-        else ctx.lineTo(X, Y);
+    if (!bare) {
+      pages(tab, z, e);
+      if (tab.region) {
+        const [x, y, w, h] = boxOn(tab.region, z, e);
+        mk.setLineDash([7 * dpr, 5 * dpr]);
+        mk.lineWidth = 1.5 * dpr;
+        mk.strokeStyle = "#0d0d0dcc";
+        mk.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
+        mk.lineDashOffset = 6 * dpr;
+        mk.strokeStyle = INK.region;
+        mk.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
+        mk.setLineDash([]);
+        mk.lineDashOffset = 0;
       }
-      if (set.closed[i]) ctx.closePath();
-      ctx.strokeStyle = colour;
-      ctx.lineWidth = width * dpr;
-      ctx.stroke();
-    };
-    if (tab.hover >= 0 && tab.hover !== tab.picked) one(tab.hover, "#ffffffaa", 1.5);
-    if (tab.picked >= 0) one(tab.picked, COLOUR.picked, 2.4);
+      const view = shown(tab);
+      const set = view.contours ? tab.sets.get(view.contours)?.set : null;
+      if (set) {
+        if (S.show.centres && S.show.contours) centres(tab, set, z, e);
+        if (tab.hover >= 0 && tab.hover !== tab.picked) outline(set, tab.hover, z, e, 2.5, "#ffffffcc");
+        if (tab.picked >= 0) outline(set, tab.picked, z, e, 3.5, INK.picked);
+      }
+    }
+    if (gesture && gesture.kind === "region") {
+      const [x, y, w, h] = boxOn(normal(gesture.from, gesture.to), z, e);
+      mk.fillStyle = "#f0efec22";
+      mk.fillRect(x, y, w, h);
+      mk.lineWidth = 1.5 * dpr;
+      mk.strokeStyle = INK.region;
+      mk.strokeRect(x, y, w, h);
+    }
   }
 
-  function box(tab, [x0, y0, x1, y1]) {
-    const z = tab.cam.z * dpr;
-    const e = edges(tab);
+  function outline(set, i, z, e, width, colour) {
+    if (i < 0 || i >= set.n) return;
+    mk.beginPath();
+    const a = set.start[i];
+    const b = set.start[i + 1];
+    for (let p = a; p < b; p++) {
+      const X = (set.xy[2 * p] + 0.5 - e.left) * z;
+      const Y = (set.xy[2 * p + 1] + 0.5 - e.top) * z;
+      if (p === a) mk.moveTo(X, Y);
+      else mk.lineTo(X, Y);
+    }
+    if (set.closed[i]) mk.closePath();
+    mk.lineJoin = "round";
+    mk.strokeStyle = "#0d0d0d";
+    mk.lineWidth = (width + 2.5) * dpr;
+    mk.stroke();
+    mk.strokeStyle = colour;
+    mk.lineWidth = width * dpr;
+    mk.stroke();
+  }
+
+  /* A cross at the centre of every closed contour, while they are large and few enough to tell apart. */
+  function centres(tab, set, z, e) {
+    if (set.typical * z < 14) return;
+    const seen = visible(set, e.left - 0.5, e.top - 0.5, e.right - 0.5, e.bottom - 0.5);
+    if (seen.length > 6000) return;
+    const arm = clamp(set.typical * z * 0.09, 3, 8);
+    mk.beginPath();
+    for (const i of seen) {
+      if (!set.closed[i] || Number.isNaN(set.diameter[i])) continue;
+      const cx = (set.centre[2 * i] + 0.5 - e.left) * z;
+      const cy = (set.centre[2 * i + 1] + 0.5 - e.top) * z;
+      mk.moveTo(cx - arm, cy);
+      mk.lineTo(cx + arm, cy);
+      mk.moveTo(cx, cy - arm);
+      mk.lineTo(cx, cy + arm);
+    }
+    mk.strokeStyle = "#0d0d0d";
+    mk.lineWidth = 3.5 * dpr;
+    mk.stroke();
+    mk.strokeStyle = "#f0efec";
+    mk.lineWidth = 1.5 * dpr;
+    mk.stroke();
+  }
+
+  function boxOn([x0, y0, x1, y1], z, e) {
     return [(x0 - e.left) * z, (y0 - e.top) * z, (x1 - x0) * z, (y1 - y0) * z];
-  }
-
-  /* The region the workflow ran on, or will run on. */
-  function region(tab) {
-    const r = tab.region;
-    if (!r) return;
-    const [x, y, w, h] = box(tab, r);
-    ctx.setLineDash([6 * dpr, 4 * dpr]);
-    ctx.lineWidth = 1.2 * dpr;
-    ctx.strokeStyle = COLOUR.region;
-    ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
-    ctx.setLineDash([]);
-  }
-
-  function rubber(tab) {
-    const [x, y, w, h] = box(tab, normal(gesture.from, gesture.to));
-    ctx.fillStyle = "#ffd27a22";
-    ctx.fillRect(x, y, w, h);
-    ctx.lineWidth = 1.5 * dpr;
-    ctx.strokeStyle = COLOUR.region;
-    ctx.strokeRect(x, y, w, h);
   }
 
   function normal(a, b) {
@@ -457,74 +595,65 @@ const View = (() => {
   }
 
   /* Where one page of a strip ends and the next begins, with the pages' numbers. */
-  function pages(tab) {
+  function pages(tab, z, e) {
     const list = tab.info.shown_pages;
     if (list.length < 2) return;
-    const z = tab.cam.z * dpr;
-    const e = edges(tab);
     const tall = tab.info.page_height;
-    ctx.font = `${11 * dpr}px Consolas, monospace`;
-    ctx.textBaseline = "top";
+    mk.font = `600 ${13 * dpr}px "Segoe UI", system-ui, sans-serif`;
+    mk.textBaseline = "top";
     const first = Math.max(0, Math.floor(e.top / tall));
     const last = Math.min(list.length - 1, Math.floor(e.bottom / tall));
-    if ((last - first) * 14 * dpr > vh * dpr) return; // closer together than their labels
+    if ((last - first) * 20 > vh) return; // closer together than their labels
     for (let k = first; k <= last; k++) {
       const y = Math.round((k * tall - e.top) * z) + 0.5;
       if (k) {
-        ctx.setLineDash([2 * dpr, 4 * dpr]);
-        ctx.strokeStyle = "#9fb4c2";
-        ctx.lineWidth = dpr;
-        ctx.beginPath();
-        ctx.moveTo(Math.max(0, -e.left * z), y);
-        ctx.lineTo(Math.min(canvas.width, (tab.info.width - e.left) * z), y);
-        ctx.stroke();
-        ctx.setLineDash([]);
+        mk.setLineDash([3 * dpr, 5 * dpr]);
+        mk.strokeStyle = "#c3c2b7";
+        mk.lineWidth = dpr;
+        mk.beginPath();
+        mk.moveTo(Math.max(0, -e.left * z), y);
+        mk.lineTo(Math.min(marks.width, (tab.info.width - e.left) * z), y);
+        mk.stroke();
+        mk.setLineDash([]);
       }
-      const label = `page ${list[k] + 1}`;
-      const x = Math.max(4 * dpr, -e.left * z + 4 * dpr);
-      const wide = ctx.measureText(label).width + 8 * dpr;
-      ctx.fillStyle = "#0a0d10cc";
-      ctx.fillRect(x - 3 * dpr, Math.max(y, 0) + 3 * dpr, wide, 15 * dpr);
-      ctx.fillStyle = "#cfe3ea";
-      ctx.fillText(label, x + dpr, Math.max(y, 0) + 5 * dpr);
+      const label = `Page ${list[k] + 1}`;
+      const x = Math.max(8 * dpr, -e.left * z + 8 * dpr);
+      const wide = mk.measureText(label).width + 12 * dpr;
+      mk.fillStyle = "#0d0d0dd9";
+      mk.fillRect(x - 4 * dpr, Math.max(y, 0) + 5 * dpr, wide, 21 * dpr);
+      mk.fillStyle = "#f0efec";
+      mk.fillText(label, x + 2 * dpr, Math.max(y, 0) + 9 * dpr);
     }
   }
 
-  /* A length of round size, in pixels and (with the pixel size) nanometres. */
-  function ruler(tab) {
+  // --- The scale, the zoom and the small map --------------------------------------------------------------
+
+  function paintScale(tab) {
+    $("scale").hidden = !tab;
+    if (!tab) return;
     const z = tab.cam.z;
     const unit = S.pixelNm > 0 ? S.pixelNm : 1; // nm per pixel, or pixels
-    const wanted = (110 / z) * unit;
+    const wanted = (120 / z) * unit;
     const power = 10 ** Math.floor(Math.log10(wanted));
     const length = [1, 2, 5, 10].map((m) => m * power).reduce((a, b) => (Math.abs(b - wanted) < Math.abs(a - wanted) ? b : a));
     const pixels = length / unit;
-    const wide = pixels * z * dpr;
-    const x = 12 * dpr;
-    const y = canvas.height - 14 * dpr;
-    let text = S.pixelNm > 0 ? (length >= 1000 ? `${trim(length / 1000, 3)} µm` : `${trim(length, 3)} nm`) : "";
-    text += `${text ? "  ·  " : ""}${trim(pixels, 3)} px`;
-    ctx.font = `${11 * dpr}px Consolas, monospace`;
-    ctx.textBaseline = "bottom";
-    const back = Math.max(wide, ctx.measureText(text).width) + 12 * dpr;
-    ctx.fillStyle = "#0a0d10b0";
-    ctx.fillRect(x - 6 * dpr, y - 22 * dpr, back, 30 * dpr);
-    ctx.fillStyle = "#e6edf1";
-    ctx.fillRect(x, y, wide, 2 * dpr);
-    ctx.fillRect(x, y - 4 * dpr, dpr, 6 * dpr);
-    ctx.fillRect(x + wide - dpr, y - 4 * dpr, dpr, 6 * dpr);
-    ctx.fillText(text, x, y - 5 * dpr);
+    $("scale-bar").style.width = `${pixels * z}px`;
+    const nm = S.pixelNm > 0 ? (length >= 1000 ? `${trim(length / 1000, 3)} µm` : `${trim(length, 3)} nm`) : "";
+    $("scale-text").textContent = `${nm}${nm ? " · " : ""}${trim(pixels, 3)} px`;
+    const percent = z * dpr * 100;
+    $("zoom").textContent = percent >= 100 ? `${trim(percent, 3)} %` : `${trim(percent, 2)} %`;
   }
 
   /* The whole image, small, with the part the window shows: to find one's way in a long strip. */
-  function overview(tab) {
-    const e = edges(tab);
-    const all = e.left <= 0 && e.top <= 0 && e.right >= tab.info.width && e.bottom >= tab.info.height;
+  function paintMap(tab) {
+    const e = tab ? edges(tab) : null;
+    const all = !tab || (e.left <= 0 && e.top <= 0 && e.right >= tab.info.width && e.bottom >= tab.info.height);
+    map.hidden = all;
     if (all) return;
     const source = tab.info.source;
-    let scale = Math.min(150 / tab.info.width, Math.min(230, vh - 60) / tab.info.height);
-    const wide = Math.max(16, Math.round(tab.info.width * scale));
-    const high = Math.max(16, Math.round(tab.info.height * scale));
-    map.hidden = false;
+    const scale = Math.min(190 / tab.info.width, Math.min(260, vh - 150) / tab.info.height);
+    const wide = Math.max(20, Math.round(tab.info.width * scale));
+    const high = Math.max(20, Math.round(tab.info.height * scale));
     if (map.width !== wide || map.height !== high) {
       map.width = wide;
       map.height = high;
@@ -536,26 +665,40 @@ const View = (() => {
     const tile = tileOf(tab, source, source.levels - 1, 0, 0);
     if (tile) {
       mapCtx.imageSmoothingEnabled = true;
-      mapCtx.drawImage(painted(tile, source, source.black, source.white), 0, 0, wide, high);
+      // a picture of its own: the tile's is repainted whenever the display levels change
+      if (!tile.small) {
+        tile.small = document.createElement("canvas");
+        tile.small.width = tile.w;
+        tile.small.height = tile.h;
+        const g = tile.small.getContext("2d");
+        const data = g.createImageData(tile.w, tile.h);
+        const gain = 255 / Math.max(source.white - source.black, 1e-30);
+        for (let i = 0; i < tile.values.length; i++) {
+          const grey = clamp((tile.values[i] - source.black) * gain, 0, 255);
+          data.data[4 * i] = data.data[4 * i + 1] = data.data[4 * i + 2] = grey;
+          data.data[4 * i + 3] = 255;
+        }
+        g.putImageData(data, 0, 0);
+      }
+      mapCtx.drawImage(tile.small, 0, 0, wide, high);
     }
     const sx = wide / tab.info.width;
     const sy = high / tab.info.height;
-    if (tab.region) {
-      mapCtx.strokeStyle = COLOUR.region;
-      mapCtx.lineWidth = 1;
-      const [x0, y0, x1, y1] = tab.region;
-      mapCtx.strokeRect(x0 * sx + 0.5, y0 * sy + 0.5, Math.max(1, (x1 - x0) * sx - 1), Math.max(1, (y1 - y0) * sy - 1));
-    }
-    mapCtx.strokeStyle = "#ffffff";
-    mapCtx.lineWidth = 1.5;
     const x = clamp(e.left, 0, tab.info.width) * sx;
     const y = clamp(e.top, 0, tab.info.height) * sy;
     const w = clamp(e.right, 0, tab.info.width) * sx - x;
     const hgt = clamp(e.bottom, 0, tab.info.height) * sy - y;
-    mapCtx.strokeRect(x + 0.75, y + 0.75, Math.max(2, w - 1.5), Math.max(2, hgt - 1.5));
+    mapCtx.fillStyle = "#0d0d0d88";
+    mapCtx.fillRect(0, 0, wide, y);
+    mapCtx.fillRect(0, y + hgt, wide, high - y - hgt);
+    mapCtx.fillRect(0, y, x, hgt);
+    mapCtx.fillRect(x + w, y, wide - x - w, hgt);
+    mapCtx.strokeStyle = "#ffffff";
+    mapCtx.lineWidth = 2;
+    mapCtx.strokeRect(x + 1, y + 1, Math.max(3, w - 2), Math.max(3, hgt - 2));
   }
 
-  // --- The readout under the image ------------------------------------------------------------------------
+  // --- The numbers under the pointer ----------------------------------------------------------------------
 
   function valueAt(tab, described, x, y) {
     // the pixel of a layer under a place of the image; undefined: not loaded yet; null: outside it
@@ -568,140 +711,144 @@ const View = (() => {
     return tile.whole ? String(value) : trim(value, 5);
   }
 
-  function readout(tab) {
-    const line = $("readout");
-    if (!pointer) {
-      line.textContent = `${tab.info.width} × ${tab.info.height} px  ·  move over the image for its grey levels`;
-      return;
-    }
+  function readout() {
+    const tab = S.active;
+    const box = $("readout");
+    box.hidden = !tab;
+    if (!tab || !tab.cam) return;
+    if (!pointer) return put(box, h("span", { class: "dim", text: "Point at the image for its grey levels" }));
     const [sx, sy] = imageAt(tab, pointer);
-    if (sx < 0 || sy < 0 || sx >= tab.info.width || sy >= tab.info.height) {
-      line.textContent = "outside the image";
-      return;
-    }
-    const x = sx - 0.5; // the server's coordinates: pixel centres at whole numbers
-    const y = sy - 0.5;
-    const parts = [`x ${x.toFixed(2)}   y ${y.toFixed(2)}`];
+    if (sx < 0 || sy < 0 || sx >= tab.info.width || sy >= tab.info.height) return put(box, h("span", { class: "dim", text: "Outside the image" }));
+    const part = (name, value) => h("span", { class: "pair" }, h("span", { class: "dim", text: name }), ` ${value}`);
+    const parts = [part("x", (sx - 0.5).toFixed(1)), part("y", (sy - 0.5).toFixed(1))];
     const original = valueAt(tab, tab.info.source, sx, sy);
-    parts.push(`${original === undefined ? "…" : original} DN`);
+    parts.push(part("grey level", original === undefined ? "…" : original));
     const view = shown(tab);
     if (view.image && view.changed) {
       const made = valueAt(tab, view.image, sx, sy);
-      if (made !== null) parts.push(`processed ${made === undefined ? "…" : made}`);
-    }
-    if (view.mask) {
-      const m = valueAt(tab, view.mask, sx, sy);
-      if (m !== null && m !== undefined) parts.push(Number(m) ? "in the mask" : "not in the mask");
+      if (made !== null) parts.push(part("processed", made === undefined ? "…" : made));
     }
     if (tab.info.shown_pages.length > 1) {
-      const k = Math.floor(sy / tab.info.page_height);
-      parts.push(`page ${tab.info.shown_pages[k] + 1}, row ${Math.floor(sy - k * tab.info.page_height)}`);
+      const k = clamp(Math.floor(sy / tab.info.page_height), 0, tab.info.shown_pages.length - 1);
+      parts.push(part("page", `${tab.info.shown_pages[k] + 1}, row ${Math.floor(sy - k * tab.info.page_height)}`));
     }
-    const set = view.contours ? setOf(tab, view.contours) : null;
-    if (set && tab.hover >= 0 && tab.hover < set.n) {
-      const d = set.diameter[tab.hover];
-      parts.push(`contour ${tab.hover + 1}: ⌀ ${length(d)}`);
-    }
-    line.textContent = parts.join("   ·   ");
+    const set = view.contours ? tab.sets.get(view.contours)?.set : null;
+    if (set && tab.hover >= 0 && tab.hover < set.n) parts.push(part("contour", `⌀ ${lengthText(set.diameter[tab.hover])}`));
+    put(box, ...parts);
   }
 
   // --- Mouse and keys -------------------------------------------------------------------------------------
 
+  const stage = $("viewport");
+
   function at(event) {
-    const b = canvas.getBoundingClientRect();
+    const b = stage.getBoundingClientRect();
     return [event.clientX - b.left, event.clientY - b.top];
   }
 
+  /* The contour under the pointer; true if it is another than before. */
   function hover(tab) {
-    if (!pointer || gesture) return;
+    if (!pointer || gesture) return false;
     const view = shown(tab);
-    const set = view.contours && S.show.contours ? setOf(tab, view.contours) : null;
+    const set = view.contours && S.show.contours ? tab.sets.get(view.contours)?.set : null;
     let found = -1;
-    if (set && set.typical * tab.cam.z >= 5) {
+    if (set && set.typical * tab.cam.z * dpr >= 5) {
       const [sx, sy] = imageAt(tab, pointer);
       found = contourAt(set, sx - 0.5, sy - 0.5);
     }
-    if (found !== tab.hover) tab.hover = found;
+    const changed = found !== tab.hover;
+    tab.hover = found;
+    return changed;
   }
 
-  canvas.addEventListener(
+  marks.addEventListener(
     "wheel",
     (event) => {
       const tab = S.active;
       if (!tab) return;
       event.preventDefault();
       pointer = at(event);
-      zoomTo(tab, tab.cam.z * Math.exp(-clamp(event.deltaY, -240, 240) * 0.0035), pointer);
-      camMoved(tab);
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 200 : 1);
+      zoomTo(tab, tab.cam.z * Math.exp(-clamp(delta, -240, 240) * 0.0035), pointer);
     },
     { passive: false },
   );
 
-  canvas.addEventListener("pointerdown", (event) => {
+  marks.addEventListener("pointerdown", (event) => {
     const tab = S.active;
     if (!tab || event.button > 1) return;
-    canvas.focus();
-    canvas.setPointerCapture(event.pointerId);
+    marks.focus({ preventScroll: true });
+    marks.setPointerCapture(event.pointerId);
     pointer = at(event);
     if (event.shiftKey && event.button === 0) {
       const from = imageAt(tab, pointer);
       gesture = { kind: "region", from, to: from };
     } else {
       gesture = { kind: "move", start: pointer, cam: { ...tab.cam }, moved: false };
-      canvas.classList.add("moving");
     }
   });
 
-  canvas.addEventListener("pointermove", (event) => {
+  let told = 0; // the animation frame that will write the numbers under the pointer
+
+  marks.addEventListener("pointermove", (event) => {
     const tab = S.active;
     pointer = at(event);
-    if (!tab) return;
+    if (!tab || !tab.cam) return;
     if (gesture && gesture.kind === "move") {
       const dx = pointer[0] - gesture.start[0];
       const dy = pointer[1] - gesture.start[1];
-      if (Math.hypot(dx, dy) > 3) gesture.moved = true;
+      if (Math.hypot(dx, dy) > 3 && !gesture.moved) {
+        gesture.moved = true;
+        marks.classList.add("moving");
+      }
       if (gesture.moved) {
         tab.cam.x = gesture.cam.x - dx / tab.cam.z;
         tab.cam.y = gesture.cam.y - dy / tab.cam.z;
         hold(tab);
+        draw();
       }
     } else if (gesture && gesture.kind === "region") {
       gesture.to = imageAt(tab, pointer);
-    } else {
-      hover(tab);
+      draw(true);
+    } else if (hover(tab)) {
+      draw(true); // only what follows the pointer: the image and the contours stay as they are
     }
-    draw();
+    if (!told) {
+      told = requestAnimationFrame(() => {
+        told = 0;
+        readout();
+      });
+    }
   });
 
   function release(event) {
     const tab = S.active;
     const done = gesture;
     gesture = null;
-    canvas.classList.remove("moving");
+    marks.classList.remove("moving");
     if (!tab || !done) return;
     if (done.kind === "region") {
       const [x0, y0, x1, y1] = normal(done.from, done.to).map(Math.round);
       if (x1 - x0 >= 8 && y1 - y0 >= 8) regionDrawn(tab, [x0, y0, x1, y1]);
-    } else if (done.moved) {
-      camMoved(tab);
-    } else if (event.type === "pointerup") {
+    } else if (!done.moved && event.type === "pointerup") {
       hover(tab);
       contourPicked(tab, tab.hover);
     }
-    draw();
+    draw(true);
   }
-  canvas.addEventListener("pointerup", release);
-  canvas.addEventListener("pointercancel", release);
-  canvas.addEventListener("pointerleave", () => {
+  marks.addEventListener("pointerup", release);
+  marks.addEventListener("pointercancel", release);
+  marks.addEventListener("pointerleave", () => {
     pointer = null;
-    if (S.active) S.active.hover = -1;
-    draw();
+    if (S.active && S.active.hover >= 0) {
+      S.active.hover = -1;
+      draw(true);
+    }
+    readout();
   });
-  canvas.addEventListener("dblclick", (event) => {
+  marks.addEventListener("dblclick", (event) => {
     const tab = S.active;
-    if (!tab) return;
-    zoomTo(tab, tab.cam.z * (event.altKey ? 0.5 : 2), at(event));
-    camMoved(tab);
+    if (tab) zoomTo(tab, tab.cam.z * (event.altKey ? 0.5 : 2), at(event));
   });
 
   function navigate(event) {
@@ -711,7 +858,6 @@ const View = (() => {
     tab.cam.x = ((event.clientX - b.left) / b.width) * tab.info.width;
     tab.cam.y = ((event.clientY - b.top) / b.height) * tab.info.height;
     hold(tab);
-    camMoved(tab);
     draw();
   }
   map.addEventListener("pointerdown", (event) => {
@@ -722,8 +868,8 @@ const View = (() => {
     if (event.buttons & 1) navigate(event);
   });
 
-  new ResizeObserver(draw).observe($("viewport"));
-  window.matchMedia("(resolution: 1dppx)").addEventListener?.("change", draw);
+  new ResizeObserver(() => draw()).observe(stage);
+  window.matchMedia("(resolution: 1dppx)").addEventListener?.("change", () => draw());
 
   return {
     draw,
@@ -733,6 +879,11 @@ const View = (() => {
     forget,
     shownRegion,
     measure,
+    readout,
+    usesCard: Boolean(renderer),
+    dropSet(set) {
+      if (renderer && set) renderer.release(set);
+    },
     zoomBy(tab, factor) {
       zoomTo(tab, tab.cam.z * factor);
     },
@@ -751,14 +902,24 @@ const View = (() => {
         draw();
       }
     },
+    /* The view as a picture: the three canvases over each other. */
     picture() {
-      return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      dirty.scene = dirty.marks = true;
+      if (pending) cancelAnimationFrame(pending);
+      paint(); // now: what the card drew is gone once the browser has shown it
+      const whole = document.createElement("canvas");
+      whole.width = image.width;
+      whole.height = image.height;
+      const g = whole.getContext("2d");
+      for (const canvas of [image, lines, marks]) g.drawImage(canvas, 0, 0);
+      return new Promise((resolve) => whole.toBlob(resolve, "image/png"));
     },
   };
 })();
 
-/* The contours of a buffer of the server (ContourSet.payload), with a grid to find those in a rectangle. */
-function decodeContours(buffer) {
+/* The contours of a buffer of the server (ContourSet.payload), with a grid to find those in a rectangle.
+   keys: the measures that follow the contours in the buffer, in their order. */
+function decodeContours(buffer, keys) {
   const [n, points] = new Uint32Array(buffer, 0, 2);
   let at = 8;
   const start = new Uint32Array(buffer, at, n + 1);
@@ -772,7 +933,13 @@ function decodeContours(buffer) {
   const diameter = new Float32Array(buffer, at, n);
   at += 4 * n;
   const box = new Float32Array(buffer, at, 4 * n);
-  const set = { n, points, start, closed, xy, centre, diameter, box, grid: null, typical: 0 };
+  at += 16 * n;
+  const values = {};
+  for (const key of keys) {
+    values[key] = new Float32Array(buffer, at, n);
+    at += 4 * n;
+  }
+  const set = { n, points, start, closed, xy, centre, diameter, box, values, grid: null, typical: 0, bounds: [0, 0, 0, 0], summaries: {}, gpu: null };
   if (!n) return set;
   let x0 = Infinity;
   let y0 = Infinity;
@@ -786,6 +953,7 @@ function decodeContours(buffer) {
     y1 = Math.max(y1, box[4 * i + 3]);
     sizes[i] = Math.max(box[4 * i + 2] - box[4 * i], box[4 * i + 3] - box[4 * i + 1]);
   }
+  set.bounds = [x0, y0, x1, y1];
   set.typical = sizes.slice().sort()[n >> 1]; // the median extent: how large a contour is
   const cell = clamp(set.typical * 4, 16, 512);
   const cols = Math.max(1, Math.ceil((x1 - x0 + 1e-3) / cell));

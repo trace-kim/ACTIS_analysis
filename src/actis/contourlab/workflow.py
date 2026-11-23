@@ -87,7 +87,7 @@ def first_state(image):
     grey = np.asarray(image, dtype=np.float32)
     if grey.ndim != 2 or min(grey.shape) < 2:
         raise WorkflowError("a workflow needs a grey-level image of 2 x 2 px or more")
-    return State(grey, noise=ops.noise_sigma(grey))
+    return State(grey, noise=ops.noise_sigma(grey), origin=grey)
 
 
 def run_workflow(image, steps, previous=None, stop=None):
@@ -190,120 +190,156 @@ def load_workflow(path):
 
 
 # --- Workflows to start from ------------------------------------------------
+#
+# The first group was designed for ACTIS images: holes about four pixels wide,
+# optics that pass no detail finer than about two pixels, shot noise, 8-bit
+# pages that mix patterns. The second group are the general-purpose routes the
+# lab began with, kept to compare against. scripts/evaluate_contour_flows.py
+# scores all of them on synthetic images.
 
-HOLES = {"holes": False, "open_at_border": False}  # whole features only
+WHOLE = {"holes": False, "open_at_border": False}  # whole features only
+GROUPS = ("Designed for ACTIS images", "General-purpose routes, to compare")
+PRESETS = {}  # by name: (what it is for, its steps); preset() gives a copy
+GUIDE = {}  # by name: its group, what it is best for, what to watch
 
 
-def example(text, *steps):
-    """A workflow to start from: (what it is for, its steps)."""
-    return text, list(steps)
+def example(name, group, text, best, watch, *steps):
+    """A workflow to start from."""
+    assert group in GROUPS and name not in PRESETS, name
+    PRESETS[name] = (text, list(steps))
+    GUIDE[name] = {"group": group, "best": best, "watch": watch}
 
 
-PRESETS = {  # by name; preset() gives a copy of the steps to change
-    "Bright holes: local half level": example(
-        "Contact holes as ACTIS shows them, bright on dark. The outline is where "
-        "the image is half-way between the dark and the bright level of its "
-        "neighbourhood, traced between the pixels. Gain, offset and illumination "
-        "that vary across the image or between acquisitions drop out, and a "
-        "smaller hole gives a smaller contour. The most repeatable flow on "
-        "synthetic acquisitions: the place to start.",
-        step("mid_level_threshold"),
-        step("trace_contours", **HOLES),
-    ),
-    "Bright holes: deblurred": example(
-        "As the local half level, on an image with part of the optical blur taken "
-        "out first (Richardson-Lucy). Steeper edges make the outline depend less "
-        "on how blurred an acquisition was. Set the two sigmas to the blur of "
-        "your images; too much rings.",
-        step("deblur"),
-        step("mid_level_threshold"),
-        step("trace_contours", **HOLES),
-    ),
-    "Bright holes: each hole's own half maximum": example(
-        "Every hole against its own peak and its own surround, with no reference "
-        "to its neighbours: works for isolated holes and for holes of very "
-        "different brightness in one image. A fainter hole is not drawn smaller "
-        "for being fainter, so this follows a difference in hole size less than "
-        "the local half level does.",
-        step("mid_level_threshold", reference="each feature"),
-        step("trace_contours", **HOLES),
-    ),
-    "Bright holes: one level for the image (Otsu)": example(
-        "One grey level for the whole image, after the background has been "
-        "flattened. It follows a difference in hole size most strongly, and a "
-        "difference in illumination or gain just as strongly: for even, "
-        "comparable images.",
-        step("flatten_background"),
-        step("otsu_threshold"),
-        step("trace_contours", **HOLES),
-    ),
-    "Bright holes: steepest gradient": example(
-        "The holes are found by the local half level, then every contour point "
-        "is moved to where the brightness changes fastest. Needs no levels; on "
-        "holes of a few pixels the steepest slope is set by the blur more than "
-        "by the hole, so compare it with the half level before relying on it.",
-        step("mid_level_threshold"),
-        step("trace_contours", **HOLES),
-        step("refine_edges", rule="steepest gradient"),
-    ),
-    "Edges without a threshold": example(
-        "No dark or bright level at all: the lines where the brightness changes "
-        "fastest, traced between the pixels (the zero crossings of the second "
-        "derivative across the edge, where Canny's detector puts its edges).",
-        step("trace_gradient_edges"),
-    ),
-    "Noisy pages": example(
-        "Low signal or 8-bit scan pages: the threshold is taken on a more "
-        "strongly blurred image, and what is left of the noise in the outlines "
-        "is taken out by keeping only the lowest harmonics of each. Holes are "
-        "found reliably down to a contrast of about ten noise sigma.",
-        step("mid_level_threshold", blur_px=0.8),
-        step("trace_contours", **HOLES),
-        step("simplify_shape", harmonics=3),
-    ),
-    "Any pattern (lines, pads, mixed pages)": example(
-        "Nothing assumed about the pattern: every region's whole boundary, the "
-        "boundaries of holes inside it too, open where a region runs out of the "
-        "image. For lines and spaces, pads, and pages that mix patterns.",
-        step("mid_level_threshold"),
-        step("trace_contours", min_area_px=6.0),
-    ),
-    "Dark features on a bright background": example(
-        "The pattern is the darker side: absorber dots or lines on the bright "
-        "multilayer. Otherwise the local half level.",
-        step("mid_level_threshold", bright=False),
-        step("trace_contours", **HOLES),
-    ),
-    "Benchmark radial contour": example(
-        "What the benchmark of this repository measures as its contour method "
-        "(actis.estimators): 40 rays around every discovered hole centre, each "
-        "cut at the hole's own half level. To compare it with the other flows on "
-        "the same image.",
-        step("radial_contours"),
-    ),
-    "Pixel mask route (upscaled)": example(
-        "The classical route, for when the mask itself needs work: the image is "
-        "interpolated to 4 times as many pixels, thresholded, the mask cleaned "
-        "by an opening, its pixel outline traced and then put back on the edges. "
-        "Slower and no more exact than tracing between the pixels; a base for "
-        "trying mask operations.",
-        step("upscale"),
-        step("mid_level_threshold"),
-        step("morphology", operation="open", size_px=1.0),
-        step("trace_contours", **HOLES),
-        step("refine_edges"),
-        step("smooth_contours"),
-    ),
-    "Bright holes: one ellipse per hole": example(
-        "The local half level, with every outline reduced to the ellipse that "
-        "fits it: for holes of a few pixels a free outline carries little more, "
-        "and an ellipse gives width, height and orientation directly.",
-        step("mid_level_threshold"),
-        step("trace_contours", **HOLES),
-        step("simplify_shape", harmonics=1),
-    ),
-}
-START = "Bright holes: local half level"  # the workflow a window opens with
+example(
+    "Shared half level",
+    GROUPS[0],
+    "Every feature is outlined half way between its top and the dark level "
+    "around it. Both levels are shared with its nearest features of the same "
+    "kind, so no tile is laid over the image: holes, lines and pads of any size "
+    "and brightness are found on one page, and empty areas stay empty.",
+    "Any ACTIS page: the place to start",
+    "Follows a size difference about one to one only among features of one kind",
+    step("feature_threshold"),
+    step("trace_contours"),
+)
+example(
+    "Own half level",
+    GROUPS[0],
+    "As the shared half level, with every feature measured against its own top "
+    "alone. For features that have no neighbours of their kind: isolated holes, "
+    "one-off shapes, holes of very different brightness side by side.",
+    "Isolated or one-of-a-kind features",
+    "Hides part of a size difference, because a smaller hole is also fainter; "
+    "the least steady in noise",
+    step("feature_threshold", peers=1),
+    step("trace_contours"),
+)
+example(
+    "Optical low-pass first",
+    GROUPS[0],
+    "The spatial frequencies beyond what the optics deliver are cut off before "
+    "the shared half level, in place of a blur: the noise they carry goes and "
+    "the edges stay as sharp as they are. The step reports the cutoff it found "
+    "and how much noise went.",
+    "Images sampled more finely than their optics resolve",
+    "Removes nothing where the pattern reaches the sampling limit; on noisy "
+    "images set the cutoff by hand, the same for every image",
+    step("optical_filter"),
+    step("feature_threshold", blur_px=0.0),
+    step("trace_contours"),
+)
+example(
+    "Deblurred half level",
+    GROUPS[0],
+    "The blur of the optics is divided out inside their pass band before the "
+    "features are outlined: steeper edges and flatter tops. Set the two sigmas "
+    "to the blur of your images.",
+    "Images whose blur is known",
+    "Brings back noise; too large a sigma rings around the features",
+    step("optical_filter", deblur_x_px=0.7, deblur_y_px=0.7),
+    step("feature_threshold", blur_px=0.0),
+    step("trace_contours"),
+)
+example(
+    "Steepest edge",
+    GROUPS[0],
+    "No dark or bright level at all: the outline is where the brightness "
+    "changes fastest, found between the pixels. Gain, offset and illumination "
+    "cannot move it.",
+    "Wide features with real edges; images whose levels cannot be trusted",
+    "On holes of a few pixels the blur sets the steepest slope more than the "
+    "hole does, so sizes follow the hole weakly",
+    step("trace_gradient_edges"),
+)
+example(
+    "One ellipse per hole",
+    GROUPS[0],
+    "The shared half level, with every outline reduced to the ellipse of the "
+    "same area, centre, elongation and orientation. A hole four pixels wide "
+    "carries little more than that; the rest of a free outline is noise.",
+    "Width, height and orientation of small holes; a calmer picture",
+    "Hides a real irregular shape; features wider than 16 px keep their outline",
+    step("feature_threshold"),
+    step("trace_contours"),
+    step("simplify_shape", harmonics=1, max_diameter_px=16.0),
+)
+example(
+    "Dark features",
+    GROUPS[0],
+    "The shared half level for a pattern that is the darker side: absorber dots "
+    "or lines on the bright multilayer.",
+    "Dark-on-bright patterns",
+    "On a page of bright holes it outlines the gaps between them",
+    step("feature_threshold", bright=False),
+    step("trace_contours"),
+)
+example(
+    "Local tiles",
+    GROUPS[1],
+    "The image is cut into tiles of 128 pixels; the outline is half way between "
+    "two percentiles of each tile's grey levels. The lab's first default.",
+    "Even hole arrays that fill the image",
+    "A tile that holds few holes, two kinds of pattern, or only a bright area "
+    "gets the wrong level",
+    step("mid_level_threshold"),
+    step("trace_contours", **WHOLE),
+)
+example(
+    "One level for the page",
+    GROUPS[1],
+    "A single grey level for the whole image (Otsu's), after the background is "
+    "flattened.",
+    "Even, comparable images",
+    "Follows illumination and gain as strongly as it follows size",
+    step("flatten_background"),
+    step("otsu_threshold"),
+    step("trace_contours", **WHOLE),
+)
+example(
+    "Pixel mask route",
+    GROUPS[1],
+    "The classical route: upscale four times, threshold, clean the mask, trace "
+    "its pixels, put the outline back on the edges. A base for trying mask "
+    "operations.",
+    "When the mask itself needs work",
+    "Slower, and no more exact than tracing between the pixels",
+    step("upscale"),
+    step("mid_level_threshold"),
+    step("morphology", operation="open", size_px=1.0),
+    step("trace_contours", **WHOLE),
+    step("refine_edges"),
+    step("smooth_contours"),
+)
+example(
+    "Benchmark radial contour",
+    GROUPS[1],
+    "The contour method of this repository's benchmark: 40 rays around every "
+    "discovered hole centre, each cut at the hole's own half level.",
+    "Comparing the benchmark's contours with the others",
+    "Bright holes in arrays only",
+    step("radial_contours"),
+)
+START = "Shared half level"  # the workflow a window opens with
 
 
 def preset(name):

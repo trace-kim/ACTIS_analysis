@@ -1,10 +1,11 @@
 "use strict";
-/* The contour lab's window: the tabs, the workflow and its options, and when the workflow runs.
-   view.js draws the image of the tab in front. The server (session.py) holds the images and runs the
-   workflows; this page holds the workflows themselves and what is shown. */
+/* The contour lab's window. Left: the method (a list of steps) and the settings of the step selected.
+   Middle: the image (view.js draws it). Right: every number the method gives, in one place.
+   The server (session.py) holds the images and runs the methods; this page holds the methods themselves
+   and what is shown. */
 
 const KEY = document.body.dataset.key;
-const STORE = "actis-contour-lab";
+const STORE = "actis-contour-lab-2";
 const $ = (id) => document.getElementById(id);
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const clone = (value) => JSON.parse(JSON.stringify(value));
@@ -15,11 +16,14 @@ const S = {
   modules: new Map(), // by name
   tabs: [],
   active: null, // the tab in front
-  shared: null, // the workflow of every tab that has none of its own
+  shared: null, // the method of every tab that has none of its own
   auto: true,
   sync: true,
   pixelNm: 21,
-  show: { of: "result", image: "processed", contours: true, before: false, centres: false, mask: false, pinned: true, smooth: false },
+  show: { of: "result", image: "processed", contours: true, before: false, centres: false, mask: false, reference: true, smooth: false },
+  // how the contours look: coloured by a measure or in one colour, how wide, and what the colours span
+  look: { byMeasure: true, measure: "diameter", width: 2.5, colour: "orange", range: {} },
+  told: {}, // the explanations opened, by "module.option"
   folder: "",
   folders: [], // used lately, for the Open dialog
   request: (Math.floor(performance.timeOrigin) % 1e6) * 1000, // numbers the runs asked for
@@ -41,6 +45,11 @@ function h(tag, props = {}, ...kids) {
   return element;
 }
 
+/* Make these the children of an element: nodes and text, lists of them, and nothing for null or false. */
+function put(element, ...kids) {
+  element.replaceChildren(...kids.flat(3).filter((kid) => kid !== null && kid !== undefined && kid !== false));
+}
+
 /* A number with no more digits than say something. */
 function trim(value, digits = 4) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return "–";
@@ -51,11 +60,14 @@ function count(value) {
   return Number(value).toLocaleString("en-US");
 }
 
+function nm(pixels, digits = 4) {
+  return `${trim(pixels * S.pixelNm, digits)} nm`;
+}
+
 /* A length in pixels, and in nanometres if the pixel size is known. */
-function length(pixels, digits = 4) {
+function lengthText(pixels, digits = 4) {
   if (pixels === null || pixels === undefined || !Number.isFinite(Number(pixels))) return "–";
-  const nm = S.pixelNm > 0 ? ` = ${trim(pixels * S.pixelNm, digits)} nm` : "";
-  return `${trim(pixels, digits)} px${nm}`;
+  return `${trim(pixels, digits)} px${S.pixelNm > 0 ? ` · ${nm(pixels, digits)}` : ""}`;
 }
 
 function toast(message, kind = "info", ms = 7000) {
@@ -96,8 +108,8 @@ function download(blob, name) {
 
 function remember() {
   try {
-    const { shared, auto, sync, pixelNm, show, folder, folders } = S;
-    localStorage.setItem(STORE, JSON.stringify({ shared, auto, sync, pixelNm, show, folder, folders }));
+    const { shared, auto, sync, pixelNm, show, look, folder, folders } = S;
+    localStorage.setItem(STORE, JSON.stringify({ shared, auto, sync, pixelNm, show, look, folder, folders }));
     const own = {};
     const regions = {};
     for (const tab of S.tabs) {
@@ -118,7 +130,7 @@ function recalled(name) {
   }
 }
 
-// --- Workflows ------------------------------------------------------------------------------------------------
+// --- Methods: lists of steps ----------------------------------------------------------------------------------
 
 function defaults(moduleName) {
   const options = {};
@@ -126,24 +138,24 @@ function defaults(moduleName) {
   return options;
 }
 
-/* Steps as a workflow file or an example gives them, with every option of their modules (those the file does
-   not give at their defaults). An Error says what is wrong. */
+/* Steps as a file or an example gives them, with every option of their modules (those the file does not give
+   at their defaults). An Error says what is wrong. */
 function completed(steps) {
-  if (!Array.isArray(steps)) throw new Error("the workflow has no list of steps");
+  if (!Array.isArray(steps)) throw new Error("the method has no list of steps");
   return steps.map((entry, k) => {
     const module = entry && S.modules.get(entry.module);
-    if (!module) throw new Error(`step ${k + 1}: there is no module ${JSON.stringify(entry && entry.module)}`);
+    if (!module) throw new Error(`step ${k + 1}: there is no step called ${JSON.stringify(entry && entry.module)}`);
     const options = defaults(module.name);
     for (const [name, value] of Object.entries(entry.options || {})) {
-      if (!(name in options)) throw new Error(`step ${k + 1}: ${module.name} has no option ${JSON.stringify(name)}`);
+      if (!(name in options)) throw new Error(`step ${k + 1}: ${module.title} has no setting ${JSON.stringify(name)}`);
       options[name] = value;
     }
     return { module: module.name, enabled: entry.enabled !== false, options };
   });
 }
 
-/* A workflow: its name (of the example or file it came from), its steps, the row of the step selected, and
-   its steps as they were when it was opened or saved (to tell whether it was changed since). */
+/* A method: its name (of the example or file it came from), its steps, the row of the step selected, and its
+   steps as they were when it was chosen or saved (to tell whether it was changed since). */
 function workflow(name, steps, origin = null) {
   const made = completed(steps);
   return { name, steps: made, origin: origin || JSON.stringify(made), selected: Math.max(0, made.length - 1) };
@@ -153,20 +165,14 @@ function changedSince(wf) {
   return JSON.stringify(wf.steps) !== wf.origin;
 }
 
-/* The workflow a tab runs: its own, or the one of all tabs. */
+/* The method a tab runs: its own, or the one of all tabs. */
 function flow(tab = S.active) {
   return (tab && tab.own) || S.shared;
 }
 
-function title(steps, k) {
-  return `${k + 1}. ${S.modules.get(steps[k].module).title}`;
-}
-
-/* The row to put a new step of a module at, `selected` being the row of the step selected (-1: none): right
-   after that step if it is a module of the same kind; else after the last step of the new module's kind,
-   which keeps the image modules before the mask modules before the contours modules (a contours module added
-   while the threshold is selected goes after the tracing, which makes what it needs; a blur added while the
-   last step is selected goes before the threshold). A list not in that order already: after the step
+/* The row to put a new step at, `selected` being the row of the step selected (-1: none): right after that
+   step if it is of the same kind; else after the last step of the new step's kind, which keeps the image
+   steps before the mask steps before the contour steps. A list not in that order already: after the step
    selected, as it is. */
 function placeFor(steps, moduleName, selected) {
   const order = (name) => S.meta.stages.indexOf(S.modules.get(name).stage);
@@ -177,14 +183,12 @@ function placeFor(steps, moduleName, selected) {
   return stages.filter((other) => other <= stage).length;
 }
 
-/* The workflow was changed: show it, and run it once the changes pause (Auto process). */
+/* The method was changed: show it, and run it once the changes pause. */
 function edited(redraw = true) {
   remember();
-  if (redraw) renderFlow();
-  else {
-    renderFlowName();
-    renderSteps();
-  }
+  renderMethod();
+  renderSteps();
+  if (redraw) renderSettings();
   for (const tab of S.tabs) if (!tab.own || tab === S.active) tab.stale = true;
   schedule();
 }
@@ -200,14 +204,14 @@ function replaceFlow(name, steps) {
 
 function mayReplace() {
   const wf = flow();
-  return !changedSince(wf) || !wf.steps.length || confirm("Replace the workflow? Its changes are not saved.");
+  return !changedSince(wf) || !wf.steps.length || confirm("Replace the method? Its changes are not saved.");
 }
 
 function addStep(moduleName) {
   const wf = flow();
   const at = placeFor(wf.steps, moduleName, wf.steps.length ? wf.selected : -1);
   const options = defaults(moduleName);
-  if ("level" in options && S.active) {
+  if ("level" in options && moduleName === "fixed_threshold" && S.active) {
     // a grey level that divides this image, rather than one that suits none
     const { black, white } = S.active.info.source;
     options.level = Number(trim((black + white) / 2, 3));
@@ -237,19 +241,19 @@ function moveStep(by) {
 function saveFlow() {
   const wf = flow();
   const data = { ...S.meta.format, steps: wf.steps };
-  const name = (wf.name || "workflow").replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim() || "workflow";
+  const name = (wf.name || "method").replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim() || "method";
   download(new Blob([JSON.stringify(data, null, 2) + "\n"], { type: "application/json" }), `${name}.json`);
   wf.origin = JSON.stringify(wf.steps);
   remember();
-  renderFlowName();
+  renderMethod();
 }
 
 function openFlow(text, fileName) {
   try {
     const data = JSON.parse(text);
-    if (!data || data.format !== S.meta.format.format) throw new Error("not a contour workflow file");
+    if (!data || data.format !== S.meta.format.format) throw new Error("not a method file of the contour lab");
     if (!Number.isInteger(data.version) || data.version > S.meta.format.version) {
-      throw new Error(`a workflow file of version ${data.version}: this program reads up to ${S.meta.format.version}`);
+      throw new Error(`a file of version ${data.version}: this program reads up to ${S.meta.format.version}`);
     }
     completed(data.steps);
     if (!mayReplace()) return;
@@ -259,34 +263,36 @@ function openFlow(text, fileName) {
   }
 }
 
-// --- Menus ----------------------------------------------------------------------------------------------------
+// --- Menus and pop-overs --------------------------------------------------------------------------------------
+
+function place(box, anchor) {
+  box.hidden = false;
+  const at = anchor.getBoundingClientRect();
+  const wide = box.offsetWidth;
+  const high = box.offsetHeight;
+  box.style.left = `${clamp(at.left, 8, window.innerWidth - wide - 8)}px`;
+  box.style.top = `${at.bottom + high + 8 > window.innerHeight ? Math.max(8, at.top - high - 6) : at.bottom + 6}px`;
+}
 
 function openMenu(anchor, items) {
   const menu = $("menu");
-  menu.replaceChildren(
-    ...items.map((item) =>
-      item.heading
-        ? h("div", { class: "heading", text: item.heading })
-        : h(
-            "button",
-            {
-              type: "button",
-              onclick: () => {
-                closeMenu();
-                item.action();
-              },
-            },
-            h("b", { text: item.title }),
-            item.text ? h("span", { text: item.text }) : null,
-          ),
+  put(menu, 
+    ...items.filter(Boolean).map((item) =>
+      h(
+        "button",
+        {
+          type: "button",
+          onclick: () => {
+            closeMenu();
+            item.action();
+          },
+        },
+        h("b", { text: item.title }),
+        item.text ? h("span", { text: item.text }) : null,
+      ),
     ),
   );
-  menu.hidden = false;
-  const box = anchor.getBoundingClientRect();
-  const wide = menu.offsetWidth;
-  const high = menu.offsetHeight;
-  menu.style.left = `${clamp(box.left, 8, window.innerWidth - wide - 8)}px`;
-  menu.style.top = `${box.bottom + high + 8 > window.innerHeight ? Math.max(8, box.top - high - 4) : box.bottom + 4}px`;
+  place(menu, anchor);
   menu.scrollTop = 0;
   const first = menu.querySelector("button");
   if (first) first.focus();
@@ -296,28 +302,27 @@ function closeMenu() {
   $("menu").hidden = true;
 }
 
-function firstSentence(text) {
-  const end = text.search(/[.:](\s|$)/);
-  return end < 0 ? text : text.slice(0, end + 1).replace(/:$/, ".");
-}
-
-// --- The workflow panel ---------------------------------------------------------------------------------------
+// --- The method panel -----------------------------------------------------------------------------------------
 
 function renderFlow() {
-  renderFlowName();
+  renderMethod();
   renderSteps();
-  renderOptions();
+  renderSettings();
 }
 
-function renderFlowName() {
+function presetNamed(name) {
+  return S.meta.presets.find((preset) => preset.name === name);
+}
+
+function renderMethod() {
   const wf = flow();
-  $("flow-name").replaceChildren(wf.name || "Workflow", changedSince(wf) ? h("span", { class: "changed", text: "  (changed)" }) : "");
-  const own = Boolean(S.active && S.active.own);
-  for (const button of $("scope").children) {
-    button.classList.toggle("on", (button.dataset.value === "own") === own);
-    button.disabled = !S.active;
-  }
-  document.title = [S.active && S.active.info.name, wf.name, "ACTIS contour lab"].filter(Boolean).join(" – ");
+  const changed = changedSince(wf);
+  put($("flow-name"), wf.name || "Method", changed ? h("span", { class: "edited", text: "edited" }) : "");
+  const known = presetNamed(wf.name);
+  $("flow-lead").textContent = known ? `Best for: ${known.best.charAt(0).toLowerCase()}${known.best.slice(1)}.` : "A method of your own.";
+  const tab = S.active;
+  $("scope-note").textContent = tab && tab.own ? "This tab has a method of its own; the other tabs keep theirs." : "";
+  document.title = [tab && tab.info.name, wf.name, "Contour lab"].filter(Boolean).join(" – ");
 }
 
 /* How many steps, from the first, are those the result shown ran. */
@@ -335,138 +340,197 @@ function renderSteps() {
   const list = $("steps");
   const result = tab && tab.result;
   const matching = alike(tab);
-  list.replaceChildren(
+  put(list, 
     ...wf.steps.map((step, k) => {
       const module = S.modules.get(step.module);
       const ran = result && k < matching && k < result.ran;
       const failed = result && result.failed_step === k + 1 && k < matching; // and still the step that failed
-      let note = "";
+      let note = module.stage === "Image" ? "changes the image" : module.stage === "Mask" ? "marks the pattern" : "works on the contours";
       let time = "";
-      if (failed) note = result.error.replace(/^Step \d+ \([^)]*\) failed: /, "");
+      if (!step.enabled) note = "off: skipped";
+      else if (failed) note = result.error.replace(/^Step \d+ \([^)]*\) failed: /, "");
       else if (ran) {
-        note = result.steps[k].note || "";
-        time = `${result.steps[k].seconds.toFixed(2)} s`;
+        note = result.steps[k].note || "done";
+        time = ` · ${result.steps[k].seconds.toFixed(2)} s`;
       }
-      const options = Object.entries(step.options)
-        .map(([name, value]) => `${name} = ${value}`)
-        .join(", ");
       return h(
         "li",
         {
-          class: ["step", k === wf.selected && "selected", !step.enabled && "off", failed && "failed"].filter(Boolean).join(" "),
-          title: `${module.help}${options ? `\n\nOptions: ${options}` : ""}${note ? `\n\nFound: ${note}` : ""}`,
+          class: ["step", k === wf.selected && "selected", !step.enabled && "off", failed && "failed", !ran && !failed && "stale"].filter(Boolean).join(" "),
           onclick: (event) => {
-            if (event.target.tagName === "INPUT") return;
+            if (event.target.closest(".switch")) return;
             wf.selected = k;
             renderSteps();
-            renderOptions();
+            renderSettings();
+            $("settings").scrollIntoView({ block: "nearest", behavior: "smooth" });
             if (S.show.of === "step") shownChanged();
           },
         },
-        h("input", {
-          type: "checkbox",
-          checked: step.enabled,
-          title: "Run this step; unticked, the steps after it get what the steps before it made",
-          onchange: (event) => {
-            step.enabled = event.target.checked;
-            edited(false);
-          },
-        }),
-        h("span", { class: "title", text: title(wf.steps, k) }),
-        h("span", { class: "note", text: step.enabled || failed ? note : "off" }),
-        h("span", { class: "time", text: time }),
+        h("span", { class: "num", text: String(k + 1) }),
+        h("div", { class: "about" }, h("div", { class: "title", text: module.title }), h("div", { class: "note" }, note, time ? h("span", { class: "time", text: time }) : null)),
+        h(
+          "label",
+          { class: "switch", title: "Run this step. Off: it is skipped, and the steps after it get what the steps before it made." },
+          h("input", {
+            type: "checkbox",
+            checked: step.enabled,
+            "aria-label": `Run ${module.title}`,
+            onchange: (event) => {
+              step.enabled = event.target.checked;
+              edited(false);
+            },
+          }),
+          h("span"),
+        ),
       );
     }),
   );
-  if (!wf.steps.length) {
-    list.append(h("li", { class: "none", text: "No steps: add one, or choose a workflow to start from under Examples." }));
-  }
-  $("step-remove").disabled = !wf.steps.length;
-  $("step-up").disabled = wf.selected <= 0;
-  $("step-down").disabled = wf.selected >= wf.steps.length - 1;
-  const chosen = list.children[wf.selected];
-  if (chosen && chosen.scrollIntoView) chosen.scrollIntoView({ block: "nearest" });
+  if (!wf.steps.length) list.append(h("li", { class: "none", text: "No steps yet. Add one, or choose a method." }));
 }
 
-function renderOptions() {
+/* The control of one setting of a step. */
+function optionRow(step, module, option) {
+  const id = `option-${option.name}`;
+  const key = `${module.name}.${option.name}`;
+  const row = h("div", { class: "opt" });
+  const mark = () => row.classList.toggle("changed", step.options[option.name] !== option.default);
+  const set = (value) => {
+    if (step.options[option.name] === value) return;
+    step.options[option.name] = value;
+    mark();
+    edited(false);
+  };
+  let body;
+  if (option.kind === "flag") {
+    const state = h("span", { class: "dim", text: step.options[option.name] ? "On" : "Off" });
+    body = h(
+      "label",
+      { class: "switch" },
+      h("input", {
+        type: "checkbox",
+        id,
+        checked: step.options[option.name],
+        onchange: (event) => {
+          state.textContent = event.target.checked ? "On" : "Off";
+          set(event.target.checked);
+        },
+      }),
+      h("span"),
+      state,
+    );
+  } else if (option.kind === "choice") {
+    const buttons = option.choices.map((choice) =>
+      h("button", {
+        type: "button",
+        class: choice === step.options[option.name] ? "on" : "",
+        text: choice.charAt(0).toUpperCase() + choice.slice(1),
+        onclick: () => {
+          set(choice);
+          renderSettings();
+        },
+      }),
+    );
+    body = h("div", { class: "choices", id, role: "group" }, buttons);
+  } else {
+    const whole = option.kind === "whole";
+    const value = step.options[option.name];
+    const number = h("input", { type: "number", id, min: option.low, max: option.high, step: option.step, value });
+    // a slider over the values in use; the box beside it takes any value the setting allows
+    let most = option.default > 0 ? option.default * 4 : option.low + 100 * option.step;
+    most = Math.min(option.high, Math.max(most, value, option.low + 4 * option.step));
+    const usable = (most - option.low) / option.step <= 4000 && most > option.low;
+    const slider = usable ? h("input", { type: "range", min: option.low, max: most, step: option.step, value, "aria-label": option.label }) : null;
+    const taken = (entered, from) => {
+      const fits = Number.isFinite(entered) && entered >= option.low && entered <= option.high && (!whole || Number.isInteger(entered));
+      number.classList.toggle("invalid", !fits);
+      if (!fits) return;
+      if (from !== number) number.value = entered;
+      if (slider && from !== slider) slider.value = entered;
+      set(entered);
+    };
+    number.addEventListener("input", () => taken(number.valueAsNumber, number));
+    number.addEventListener("change", () => {
+      // left with something it cannot be: back to what it is
+      if (number.classList.contains("invalid")) {
+        number.value = step.options[option.name];
+        number.classList.remove("invalid");
+      }
+    });
+    if (slider) slider.addEventListener("input", () => taken(slider.valueAsNumber, slider));
+    body = h("div", { class: "opt-body" }, slider, number, option.unit ? h("span", { class: "unit", text: option.unit }) : null);
+  }
+  const help = h("p", { class: "opt-help", text: option.help, hidden: !S.told[key] });
+  const what = h("button", {
+    type: "button",
+    class: "what",
+    text: "?",
+    title: "What this setting does",
+    "aria-expanded": String(Boolean(S.told[key])),
+    onclick: () => {
+      S.told[key] = !S.told[key];
+      help.hidden = !S.told[key];
+      what.setAttribute("aria-expanded", String(S.told[key]));
+    },
+  });
+  row.append(h("div", { class: "opt-head" }, h("label", { for: id, text: option.label }), what), body, help);
+  mark();
+  return row;
+}
+
+function renderSettings() {
   const wf = flow();
-  const box = $("options");
+  const box = $("settings");
   const step = wf.steps[wf.selected];
   if (!step) {
-    box.replaceChildren(h("p", { class: "dim", text: "The options of the step selected appear here, each with what it does." }));
+    put(box, h("p", { class: "hint", text: "Click a step to see and change its settings." }));
     return;
   }
   const module = S.modules.get(step.module);
-  const rows = module.options.map((option) => {
-    const row = h("div", { class: "option" });
-    const mark = () => row.classList.toggle("changed", step.options[option.name] !== option.default);
-    const set = (value) => {
-      if (step.options[option.name] === value) return;
-      step.options[option.name] = value;
-      mark();
-      edited(false);
-    };
-    let control;
-    if (option.kind === "flag") {
-      control = h("input", { type: "checkbox", checked: step.options[option.name], onchange: (e) => set(e.target.checked) });
-    } else if (option.kind === "choice") {
-      control = h(
-        "select",
-        { onchange: (e) => set(e.target.value) },
-        option.choices.map((choice) => h("option", { value: choice, text: choice, selected: choice === step.options[option.name] })),
-      );
-    } else {
-      control = h("input", { type: "number", min: option.low, max: option.high, step: option.step, value: step.options[option.name] });
-      control.addEventListener("input", () => {
-        const value = control.valueAsNumber;
-        const fits = Number.isFinite(value) && value >= option.low && value <= option.high && (option.kind !== "whole" || Number.isInteger(value));
-        control.classList.toggle("invalid", !fits);
-        if (fits) set(value);
-      });
-      control.addEventListener("change", () => {
-        // left with something it cannot be: back to what it is
-        if (control.classList.contains("invalid")) {
-          control.value = step.options[option.name];
-          control.classList.remove("invalid");
-        }
-      });
-    }
-    const id = `option-${option.name}`;
-    control.id = id;
-    const range = option.kind === "number" || option.kind === "whole" ? `  (${trim(option.low, 6)} to ${trim(option.high, 6)})` : "";
-    row.append(
-      h("label", { class: "name", for: id, text: option.name, title: `Default: ${option.default}${range}` }),
-      h("span", { class: "control" }, control, option.unit ? h("span", { class: "unit", text: option.unit }) : null),
-      h("div", { class: "help", text: option.help }),
-    );
-    mark();
-    return row;
-  });
-  box.replaceChildren(
-    h("h3", {}, title(wf.steps, wf.selected), h("span", { class: "stage-name", text: `   ${module.stage.toLowerCase()} module` })),
-    h("p", { class: "about", text: module.help }),
-    ...rows,
-    module.options.length
+  const first = module.options.filter((option) => !option.advanced);
+  const more = module.options.filter((option) => option.advanced);
+  const changedMore = more.filter((option) => step.options[option.name] !== option.default).length;
+  const open = box.querySelector("details.more")?.open && box.dataset.module === step.module;
+  box.dataset.module = step.module;
+  put(box, 
+    h(
+      "div",
+      { class: "block-head" },
+      h("h3", { text: `${wf.selected + 1} · ${module.title}` }),
+      h(
+        "div",
+        { class: "tools" },
+        h("button", { type: "button", class: "small", text: "↑", title: "Run this step one step earlier (Alt+↑)", disabled: wf.selected <= 0, onclick: () => moveStep(-1) }),
+        h("button", { type: "button", class: "small", text: "↓", title: "Run this step one step later (Alt+↓)", disabled: wf.selected >= wf.steps.length - 1, onclick: () => moveStep(1) }),
+        h("button", { type: "button", class: "small", text: "Remove", title: "Take this step out of the method (Ctrl+Delete)", onclick: removeStep }),
+      ),
+    ),
+    h("p", { class: "lead", text: module.summary }),
+    module.help.length > module.summary.length + 2 ? h("details", {}, h("summary", { text: "More about this step" }), h("p", { text: module.help.slice(module.summary.length).trim() })) : null,
+    first.length ? h("div", { class: "opts" }, first.map((option) => optionRow(step, module, option))) : null,
+    more.length
       ? h(
-          "div",
-          { class: "defaults" },
-          h("button", {
-            type: "button",
-            text: "Defaults",
-            title: "Set the options of this step back to the module's defaults",
-            onclick: () => {
-              if (same(step.options, defaults(step.module))) return;
-              step.options = defaults(step.module);
-              edited();
-            },
-          }),
+          "details",
+          { class: "more", open: Boolean(open) },
+          h("summary", { text: `${first.length ? "More settings" : "Settings"} (${more.length})${changedMore ? ` · ${changedMore} changed` : ""}` }),
+          h("div", { class: "opts" }, more.map((option) => optionRow(step, module, option))),
         )
       : null,
+    !module.options.length ? h("p", { class: "hint", text: "This step has no settings." }) : null,
+    module.options.length && !same(step.options, defaults(step.module))
+      ? h("div", {}, h("button", {
+          type: "button",
+          class: "small",
+          text: "Back to this step's defaults",
+          onclick: () => {
+            step.options = defaults(step.module);
+            edited();
+          },
+        }))
+      : null,
   );
-  box.scrollTop = 0;
 }
 
-// --- Running the workflow -------------------------------------------------------------------------------------
+// --- Running the method ---------------------------------------------------------------------------------------
 
 let timer = 0;
 
@@ -481,8 +545,9 @@ function fresh(tab) {
 
 function schedule(ms = 250) {
   clearTimeout(timer);
-  renderBusy();
+  timer = 0;
   if (S.auto && S.active) timer = setTimeout(() => process(), ms);
+  renderBusy();
 }
 
 async function process(tab = S.active) {
@@ -490,19 +555,19 @@ async function process(tab = S.active) {
   timer = 0;
   if (!tab) return;
   const request = ++S.request;
-  tab.sent.set(request, { key: wanted(tab), steps: clone(flow(tab).steps) });
+  tab.sent.set(request, { key: wanted(tab), steps: clone(flow(tab).steps), name: flow(tab).name });
   for (const old of tab.sent.keys()) if (tab.sent.size > 30) tab.sent.delete(old);
   tab.busy = true;
   tab.refused = null;
   renderBusy();
-  if (!tab.result && tab === S.active) renderSummary();
+  if (!tab.result && tab === S.active) renderResults();
   try {
     await api.post(`/api/tabs/${tab.id}/run`, { steps: flow(tab).steps, region: tab.region, request });
   } catch (error) {
     tab.busy = false;
-    tab.refused = error.message; // not run at all: an option out of range, a region too large
+    tab.refused = error.message; // not run at all: a setting out of range, a part too large
     renderBusy();
-    renderSummary();
+    renderResults();
   }
 }
 
@@ -523,7 +588,7 @@ async function watch(tab) {
       notice(null);
     } catch (error) {
       if (mine.signal.aborted) return;
-      if (++failures > 2) notice("The lab does not answer: is it still running? (Start it again and reload this page.)");
+      if (++failures > 2) notice("The lab does not answer. Is it still running? Start it again and reload this page.");
       await new Promise((resolve) => setTimeout(resolve, 1500));
       continue;
     }
@@ -551,9 +616,14 @@ function adopt(tab, result) {
   tab.result = result;
   tab.ranKey = sent ? sent.key : null;
   tab.ranSteps = sent ? sent.steps : null;
+  tab.ranName = sent ? sent.name : "";
   tab.failedKey = sent && result.error ? sent.key : null;
   tab.stale = false;
-  for (const id of tab.sets.keys()) if (!(id in result.contours)) tab.sets.delete(id);
+  for (const [id, entry] of tab.sets) {
+    if (id in result.contours) continue;
+    if (!tab.pinned || tab.pinned.set !== entry.set) View.dropSet(entry.set);
+    tab.sets.delete(id);
+  }
   tab.picked = -1;
   tab.hover = -1;
   tab.detail = null;
@@ -567,8 +637,9 @@ function adopt(tab, result) {
 function renderBusy() {
   const tab = S.active;
   const waits = tab && !tab.busy && !timer && !fresh(tab) && !tab.refused;
-  $("busy").textContent = !tab ? "" : tab.busy || timer ? "Processing…" : waits ? "Changed: press Process (F5)" : "";
-  $("process").classList.toggle("waiting", Boolean(waits));
+  const line = $("busy");
+  line.classList.toggle("waiting", Boolean(waits));
+  line.textContent = !tab ? "Open an image to run the method on." : tab.busy || timer ? "Running…" : waits ? "Changed since the last run. Press Run (F5)." : "";
   $("process").disabled = !tab;
   renderTabs();
 }
@@ -604,8 +675,11 @@ function setOf(tab, id) {
       .call(`/api/tabs/${tab.id}/contours/${id}`)
       .then((reply) => reply.arrayBuffer())
       .then((buffer) => {
-        entry.set = decodeContours(buffer);
-        View.draw();
+        entry.set = decodeContours(buffer, S.meta.measures.map((m) => m.key));
+        if (tab === S.active) {
+          renderResults();
+          View.draw();
+        }
       })
       .catch(() => tab.sets.delete(id)); // of a result that is gone meanwhile
   }
@@ -613,9 +687,10 @@ function setOf(tab, id) {
 }
 
 function shownChanged() {
-  renderSummary();
+  renderResults();
   renderLayers();
   View.draw();
+  View.readout();
 }
 
 function renderLayers() {
@@ -626,19 +701,49 @@ function renderLayers() {
     before: Boolean(view.before),
     centres: Boolean(view.contours),
     mask: Boolean(view.mask),
-    pinned: Boolean(tab && tab.pinned),
+    reference: Boolean(tab && tab.pinned),
   };
   for (const box of document.querySelectorAll("[data-layer]")) {
-    box.checked = S.show[box.dataset.layer];
-    box.parentElement.classList.toggle("off", !there[box.dataset.layer]);
+    const name = box.dataset.layer;
+    box.checked = S.show[name];
+    box.parentElement.classList.toggle("on", S.show[name] && there[name]);
+    // a layer that is not there is not offered, but for the two a method always has
+    box.parentElement.classList.toggle("none", !there[name] && !["contours", "mask"].includes(name));
   }
   for (const [id, value] of [["view-of", S.show.of], ["image-of", S.show.image]]) {
     for (const button of $(id).children) button.classList.toggle("on", button.dataset.value === value);
   }
-  $("pin").classList.toggle("on", Boolean(tab && tab.pinned));
-  $("pin").textContent = tab && tab.pinned ? "Unpin" : "Pin";
-  $("pin").disabled = !tab || (!tab.pinned && !view.contours);
+  const wf = flow();
+  const selected = wf.steps[wf.selected];
+  $("view-of").children[1].textContent = selected ? `After step ${wf.selected + 1}` : "Selected step";
+  document.documentElement.style.setProperty("--main", MAIN_INKS[S.look.colour] || INK.main);
+}
+
+function renderDisplay() {
+  const tab = S.active;
+  $("line-width").value = S.look.width;
+  $("width-out").textContent = `${trim(S.look.width, 2)} px`;
+  put($("swatches"), 
+    ...Object.entries(MAIN_INKS).map(([name, hex]) =>
+      h("button", {
+        type: "button",
+        class: name === S.look.colour ? "on" : "",
+        style: `background:${hex}`,
+        title: name.charAt(0).toUpperCase() + name.slice(1),
+        "aria-label": name,
+        onclick: () => {
+          S.look.colour = name;
+          remember();
+          renderDisplay();
+          renderLayers();
+          renderResults();
+          View.draw();
+        },
+      }),
+    ),
+  );
   $("smooth").checked = S.show.smooth;
+  $("sync-view").checked = S.sync;
   const levels = tab ? tab.levels : { auto: true };
   $("levels-auto").checked = levels.auto;
   $("levels-auto").disabled = !tab;
@@ -648,36 +753,41 @@ function renderLayers() {
   }
 }
 
-/* The layer whose grey levels are shown: the image a module changed, else the image as loaded. */
+/* The layer whose grey levels are shown: the image a step changed, else the image as loaded. */
 function front(tab) {
   const view = shown(tab);
   return view.image && view.changed ? view.image : tab.info.source;
 }
 
+// --- The part of the image the method runs on -----------------------------------------------------------------
+
 function renderRegion() {
   const tab = S.active;
-  $("region-group").hidden = !tab;
+  const select = $("run-on");
+  select.disabled = !tab;
   if (!tab) return;
   const r = tab.region;
-  $("region-text").textContent = r
-    ? `x ${r[0]}–${r[2]}, y ${r[1]}–${r[3]}  (${r[2] - r[0]} × ${r[3] - r[1]} px)`
-    : `whole image  (${tab.info.width} × ${tab.info.height} px)`;
   const tooLarge = tab.info.width * tab.info.height > tab.info.max_region_pixels;
-  $("region-whole").disabled = !r || tooLarge;
-  $("region-whole").title = tooLarge
-    ? `The image is larger than a workflow runs on at once (${trim(tab.info.max_region_pixels / 1e6, 3)} million pixels): choose a region`
-    : "Run the workflow on the whole image";
+  select.options[0].disabled = tooLarge;
+  select.options[0].textContent = tooLarge ? "the whole image (too large to run at once)" : `the whole image (${count(tab.info.width)} × ${count(tab.info.height)} px)`;
+  select.options[2].textContent = r ? `a part: ${count(r[2] - r[0])} × ${count(r[3] - r[1])} px at ${r[0]}, ${r[1]}` : "a box drawn on the image (Shift + drag)";
+  select.value = r ? "box" : "whole";
 }
 
 function setRegion(tab, region) {
   if (region) {
     const [x0, y0, x1, y1] = region;
     region = [clamp(x0, 0, tab.info.width), clamp(y0, 0, tab.info.height), clamp(x1, 0, tab.info.width), clamp(y1, 0, tab.info.height)];
-    if (region[2] - region[0] < 8 || region[3] - region[1] < 8) return toast("A region needs at least 8 × 8 pixels.", "error");
-    if ((region[2] - region[0]) * (region[3] - region[1]) > tab.info.max_region_pixels) {
+    const pixels = (region[2] - region[0]) * (region[3] - region[1]);
+    if (region[2] - region[0] < 8 || region[3] - region[1] < 8) {
+      renderRegion();
+      return toast("The part needs at least 8 × 8 pixels.", "error");
+    }
+    if (pixels > tab.info.max_region_pixels) {
+      renderRegion();
       return toast(
-        `That is ${trim(((region[2] - region[0]) * (region[3] - region[1])) / 1e6, 3)} million pixels: a workflow runs on at most ` +
-          `${trim(tab.info.max_region_pixels / 1e6, 3)} million at once. Zoom in, or draw a smaller region with Shift + drag.`,
+        `That is ${trim(pixels / 1e6, 3)} million pixels; a method runs on at most ${trim(tab.info.max_region_pixels / 1e6, 3)} million at once. ` +
+          "Zoom in, or draw a smaller box with Shift + drag.",
         "error",
       );
     }
@@ -692,152 +802,302 @@ function setRegion(tab, region) {
   schedule(0);
 }
 
-// view.js calls these three.
+// view.js calls these two.
 function regionDrawn(tab, region) {
   setRegion(tab, region);
-}
-
-function camMoved() {
-  /* nothing to keep: a tab's camera is copied to the next tab when that comes to the front */
 }
 
 async function contourPicked(tab, index) {
   tab.picked = index;
   tab.detail = null;
-  renderSummary();
+  renderPicked();
   const view = shown(tab);
   if (index < 0 || !view.contours) return;
   try {
     const detail = await api.get(`/api/tabs/${tab.id}/contours/${view.contours}/${index}`);
     if (tab.picked === index) {
       tab.detail = detail;
-      renderSummary();
+      renderPicked();
     }
   } catch {
     /* of a result that is gone meanwhile */
   }
 }
 
-// --- The summary under the image ------------------------------------------------------------------------------
+// --- The results: every number in one place -------------------------------------------------------------------
 
-function renderSummary() {
+function measureOf(key) {
+  return S.meta.measures.find((m) => m.key === key) || S.meta.measures[0];
+}
+
+/* The numbers of one measure over a set's contours: how many have it, its median, its robust sigma (1.4826
+   times the median distance from the median), the values 2 % and 98 % of the contours lie below, and all of
+   them in rising order. Made once per set and measure. */
+function summary(set, key) {
+  if (set.summaries[key]) return set.summaries[key];
+  const sorted = set.values[key].filter((value) => !Number.isNaN(value)).sort();
+  const n = sorted.length;
+  const at = (share) => (n ? sorted[clamp(Math.round(share * (n - 1)), 0, n - 1)] : NaN);
+  const median = at(0.5);
+  const away = Float32Array.from(sorted, (value) => Math.abs(value - median)).sort();
+  const made = { count: n, sorted, median, sigma: n ? 1.4826 * away[n >> 1] : NaN, low: at(0.02), high: at(0.98), least: at(0), most: at(1) };
+  set.summaries[key] = made;
+  return made;
+}
+
+/* A value of a measure in words: [what it is, the same in another unit or ""]. */
+function told(kind, value, digits = 4) {
+  if (!Number.isFinite(value)) return ["–", ""];
+  if (kind === "length") return [`${trim(value, digits)} px`, S.pixelNm > 0 ? nm(value, digits) : ""];
+  if (kind === "percent") {
+    const shown = Number(value.toFixed(Math.abs(value) < 10 ? 2 : 1)); // no "-0.00014"
+    return [`${shown > 0 ? "+" : ""}${shown} %`, ""];
+  }
+  if (kind === "level") return [trim(value, 5), "grey levels"];
+  return [trim(value, digits), ""];
+}
+
+const SPANS = { length: [1, 2, 5, 10, 20], level: [2, 5, 10, 20, 50], percent: [1, 2, 5, 10, 20], ratio: [1.1, 1.25, 1.5, 2] };
+
+/* What the two ends of the colour scale stand for, for a measure of a set: {low, high, scale}. */
+function colourSpan(set, key) {
+  const kind = measureOf(key).kind;
+  const sum = summary(set, key);
+  const chosen = S.look.range[kind] || "auto";
+  if (kind === "ratio") return { low: 1, high: chosen === "auto" ? Math.max(sum.high, 1.05) : Number(chosen), scale: SCALES.sequential };
+  const middle = kind === "percent" ? 0 : sum.median;
+  let half = Math.max(sum.high - middle, middle - sum.low, 1e-9);
+  if (chosen !== "auto") half = kind === "percent" ? Number(chosen) : (Number(chosen) / 100) * Math.abs(middle);
+  return { low: middle - half, high: middle + half, scale: SCALES.diverging };
+}
+
+/* view.js asks: what the contours of a set are coloured by, or null for one colour. */
+function colouring(set) {
+  const key = S.look.measure;
+  if (!S.look.byMeasure || !set.values[key] || !summary(set, key).count) return null;
+  return { values: set.values[key], ...colourSpan(set, key) };
+}
+
+function renderResults() {
   const tab = S.active;
-  const box = $("summary-text");
-  const histogram = $("histogram");
-  const g = histogram.getContext("2d");
-  g.clearRect(0, 0, histogram.width, histogram.height);
-  for (const button of document.querySelectorAll("[data-export]")) button.disabled = true;
-  $("snapshot").disabled = !tab;
-  if (!tab) return box.replaceChildren();
-  const lines = [];
-  if (tab.refused) lines.push(h("div", { class: "failed", text: `Not run: ${tab.refused}` }));
+  const head = $("headline");
+  for (const id of ["measure-block", "picked-block", "reference-block", "export-block"]) $(id).hidden = true;
+  if (!tab) return put(head, h("p", { class: "hint", text: "The numbers of the contours appear here." }));
   const result = tab.result;
-  const view = shown(tab);
+  const lines = [];
+  if (tab.refused) lines.push(h("div", { class: "bad", text: `Not run: ${tab.refused}` }));
   if (!result) {
-    lines.push(h("div", { class: "dim", text: tab.busy ? "Processing…" : tab.refused ? "" : "Not processed yet." }));
-    return box.replaceChildren(...lines);
+    lines.push(h("div", { text: tab.busy ? "Running…" : tab.refused ? "" : "Not run yet." }));
+    return put(head, h("div", { class: "facts" }, lines));
   }
-  if (result.error) lines.push(h("div", { class: "failed", text: `${result.error}.` }), h("span", { class: "dim", text: "Shown: " }));
-  const steps = tab.ranSteps || flow(tab).steps;
-  const where =
-    view.index === 0
-      ? "in the image as loaded"
-      : `after step ${view.index} (${steps[view.index - 1] ? S.modules.get(steps[view.index - 1].module).title : "?"})`;
+  if (result.error) lines.push(h("div", { class: "bad", text: `${result.error}.` }));
+  const view = shown(tab);
   const stats = view.contours ? result.contours[view.contours] : null;
+  const steps = tab.ranSteps || flow(tab).steps;
+  const stepName = view.index > 0 && steps[view.index - 1] ? S.modules.get(steps[view.index - 1].module).title : "";
   const r = result.region;
-  const area = `${r[2] - r[0]} × ${r[3] - r[1]} px`;
+  const part = r[0] === 0 && r[1] === 0 && r[2] === tab.info.width && r[3] === tab.info.height ? "the whole image" : `a part of ${count(r[2] - r[0])} × ${count(r[3] - r[1])} px`;
+  const ran = `${view.index < result.states.length - 1 || S.show.of === "step" ? `After step ${view.index}${stepName ? `, ${stepName}` : ""} · ` : ""}${part} · ${result.seconds.toFixed(2)} s`;
   if (!stats) {
-    lines.push(h("span", {}, h("b", { text: "No contours" }), ` ${where}: ${area}, ${result.seconds.toFixed(2)} s.`));
+    put(head, h("div", { class: "count" }, "No contours", h("small", { text: view.index === 0 ? "yet" : "at this step" })), h("div", { class: "facts" }, lines, h("div", { text: ran })));
   } else {
-    const left = Object.entries(stats.left_out).map(([why, n]) => `${count(n)} ${why}`);
-    lines.push(
-      h(
-        "span",
-        {},
-        h("b", { text: `${count(stats.count)} contours` }),
-        ` ${where}: ${count(stats.closed)} closed, ${count(stats.open)} open`,
-        left.length ? `; left out: ${left.join(", ")}` : "",
-        `. ${area}, ${result.seconds.toFixed(2)} s.`,
-      ),
+    lines.push(h("div", { text: `${count(stats.closed)} closed · ${count(stats.open)} open` }), h("div", { text: ran }));
+    const left = Object.entries(stats.left_out);
+    put(head, 
+      h("div", { class: "count" }, count(stats.count), h("small", { text: stats.count === 1 ? "contour" : "contours" })),
+      h("div", { class: "facts" }, lines),
+      left.length ? h("div", { class: "left-out", title: "Candidates the method left out, and why" }, left.map(([why, n]) => h("span", { text: `${count(n)} ${why}` }))) : null,
     );
-    if (stats.diameter) {
-      const d = stats.diameter;
-      const three = d.median ? ` (3σ = ${trim((300 * d.robust_sigma) / d.median, 3)} %)` : "";
-      lines.push(
-        h(
-          "div",
-          {},
-          "Diameter of equal area: median ",
-          h("b", { text: length(d.median) }),
-          `, robust σ ${length(d.robust_sigma, 3)}${three}; width × height ${trim(stats.width.median)} × ${trim(stats.height.median)} px` +
-            (S.pixelNm > 0 ? ` = ${trim(stats.width.median * S.pixelNm)} × ${trim(stats.height.median * S.pixelNm)} nm.` : "."),
-        ),
-      );
-      drawHistogram(g, histogram, stats);
+  }
+  const set = view.contours ? setOf(tab, view.contours) : null;
+  renderMeasure(set);
+  renderPicked();
+  renderReference(tab, set, stats);
+  $("export-block").hidden = !stats;
+  for (const button of document.querySelectorAll("[data-export]")) button.disabled = !stats;
+}
+
+let chart = null; // what the histogram shows, for its tooltip
+
+function renderMeasure(set) {
+  const block = $("measure-block");
+  block.hidden = !set || !set.n;
+  chart = null;
+  if (block.hidden) return;
+  const measure = measureOf(S.look.measure);
+  const select = $("measure");
+  if (select.options.length !== S.meta.measures.length) put(select, ...S.meta.measures.map((m) => h("option", { value: m.key, text: m.label })));
+  select.value = measure.key;
+  $("measure-help").textContent = measure.help + ".";
+  const sum = summary(set, measure.key);
+  const kind = measure.kind;
+  const tiles = $("tiles");
+  if (!sum.count) {
+    put(tiles, h("p", { class: "hint", text: "No closed contours to measure." }));
+    $("chart").hidden = true;
+    return;
+  }
+  $("chart").hidden = false;
+  const [typical, typicalToo] = told(kind, sum.median);
+  const [spread, spreadToo] = told(kind === "percent" ? "percent" : kind, sum.sigma, 3);
+  const relative = kind === "length" || kind === "level" ? `3σ = ${trim((300 * sum.sigma) / Math.abs(sum.median), 3)} %` : spreadToo;
+  put(tiles, 
+    h("div", { class: "tile", title: "The median: half of the contours lie below it" }, h("div", { class: "k", text: "Typical" }), h("div", { class: "v", text: typical }), h("div", { class: "s", text: typicalToo || "median" })),
+    h(
+      "div",
+      { class: "tile", title: "Robust sigma: 1.4826 times the median distance from the median, which a few odd contours do not inflate" },
+      h("div", { class: "k", text: "Spread" }),
+      h("div", { class: "v", text: spread.replace(/^\+/, "") }),
+      h("div", { class: "s", text: relative || "robust sigma" }),
+    ),
+    h(
+      "div",
+      { class: "tile", title: "96 of 100 contours lie between these two values" },
+      h("div", { class: "k", text: "Most lie in" }),
+      h("div", { class: "v", text: `${trim(sum.low, 3)} – ${trim(sum.high, 3)}` }),
+      h("div", { class: "s", text: kind === "length" ? "px" : kind === "percent" ? "%" : kind === "level" ? "grey levels" : "" }),
+    ),
+  );
+  $("colour-on").checked = S.look.byMeasure;
+  const range = $("range");
+  const options = [["auto", kind === "ratio" ? "from 1 to where most lie" : "where most contours lie"]];
+  for (const span of SPANS[kind]) {
+    options.push([String(span), kind === "ratio" ? `from 1 to ${span}` : kind === "percent" ? `±${span} %` : `±${span} % around the typical value`]);
+  }
+  put(range, ...options.map(([value, text]) => h("option", { value, text })));
+  range.value = S.look.range[kind] || "auto";
+  $("range-row").hidden = !S.look.byMeasure;
+  drawHistogram(set, measure, sum);
+}
+
+function drawHistogram(set, measure, sum) {
+  const canvas = $("histogram");
+  const ratio = window.devicePixelRatio || 1;
+  const wide = canvas.clientWidth || 320;
+  const high = 150;
+  canvas.width = Math.round(wide * ratio);
+  canvas.height = Math.round(high * ratio);
+  const g = canvas.getContext("2d");
+  g.setTransform(ratio, 0, 0, ratio, 0, 0);
+  g.clearRect(0, 0, wide, high);
+  // the middle 99 % of the values, with a margin; what lies beyond is counted into the outermost bars
+  const n = sum.count;
+  const q = (share) => sum.sorted[clamp(Math.round(share * (n - 1)), 0, n - 1)];
+  let low = q(0.005);
+  let top = q(0.995);
+  const margin = Math.max((top - low) * 0.12, Math.abs(sum.median) * 1e-4, 1e-9);
+  low -= margin;
+  top += margin;
+  if (sum.least >= 0) low = Math.max(low, 0); // a length is not drawn below nothing
+  const bins = clamp(Math.round(Math.sqrt(n)), 8, 44);
+  const counts = new Uint32Array(bins);
+  for (const value of sum.sorted) counts[clamp(Math.floor(((value - low) / (top - low)) * bins), 0, bins - 1)]++;
+  const most = Math.max(...counts, 1);
+  const span = S.look.byMeasure ? colourSpan(set, measure.key) : null;
+  const base = high - 1;
+  const each = wide / bins;
+  for (let k = 0; k < bins; k++) {
+    const tall = Math.max(counts[k] ? 2 : 0, Math.round((counts[k] / most) * (base - 8)));
+    if (span) {
+      const value = low + ((k + 0.5) / bins) * (top - low);
+      const [r, gr, b] = GLContours.colourAt(span.scale.stops, (value - span.low) / (span.high - span.low));
+      g.fillStyle = `rgb(${r},${gr},${b})`;
+    } else {
+      g.fillStyle = MAIN_INKS[S.look.colour] || INK.main;
     }
-    for (const button of document.querySelectorAll("[data-export]")) button.disabled = false;
+    g.beginPath();
+    g.roundRect(k * each + 1, base - tall, Math.max(1, each - 2), tall, [Math.min(3, each / 3), Math.min(3, each / 3), 0, 0]);
+    g.fill();
   }
-  if (tab.pinned) {
-    const median = tab.pinned.median ? `, median ⌀ ${length(tab.pinned.median)}` : "";
-    lines.push(h("div", { class: "dim", text: `Pinned: ${count(tab.pinned.set.n)} contours of “${tab.pinned.label}”${median}.` }));
-  }
-  if (tab.detail) {
-    const d = tab.detail;
-    lines.push(
-      h(
-        "div",
-        { class: "picked" },
-        `Contour ${d.index + 1}: centre (${trim(d.x, 6)}, ${trim(d.y, 6)})` +
-          (d.closed
-            ? `, ⌀ ${length(d.diameter)}, area ${trim(d.area)} px², ${trim(d.width)} × ${trim(d.height)} px across, axes ` +
-              `${trim(d.major)} × ${trim(d.minor)} px at ${trim(d.angle, 3)}°`
-            : ", open") +
-          `, ${trim(d.length)} px long, ${d.points} points.`,
-      ),
-    );
-  }
-  box.replaceChildren(...lines);
+  g.fillStyle = "#55544f";
+  g.fillRect(0, base, wide, 1);
+  // the typical value
+  const at = ((sum.median - low) / (top - low)) * wide;
+  g.fillStyle = "#0d0d0d";
+  g.fillRect(Math.round(at) - 2, 0, 4, base);
+  g.fillStyle = "#f0efec";
+  g.fillRect(Math.round(at) - 1, 0, 2, base);
+  const unit = measure.kind === "length" ? " px" : measure.kind === "percent" ? " %" : "";
+  put($("axis"), h("span", { text: trim(low, 3) + unit }), h("span", { class: "mid", text: `typical ${trim(sum.median, 4)}${unit}` }), h("span", { text: trim(top, 3) + unit }));
+  chart = { low, top, bins, counts, unit, wide };
 }
 
-function drawHistogram(g, canvas, stats) {
-  const hist = stats.histogram;
-  if (!hist) return;
-  const wide = canvas.width;
-  const high = canvas.height;
-  const top = Math.max(...hist.counts, 1);
-  const base = high - 16;
-  const n = hist.counts.length;
-  const low = hist.edges[0];
-  const span = hist.edges[n] - low || 1;
-  g.fillStyle = "#35d3f0";
-  hist.counts.forEach((value, k) => {
-    const tall = Math.round((value / top) * (base - 4));
-    g.fillRect(Math.round((k * wide) / n), base - tall, Math.max(1, Math.round(wide / n) - 1), tall);
-  });
-  const x = ((stats.diameter.median - low) / span) * wide;
-  g.fillStyle = "#ffffff";
-  g.fillRect(Math.round(x), 0, 1, base);
-  g.fillStyle = "#93a3ae";
-  g.font = "10px Consolas, monospace";
-  g.textBaseline = "bottom";
-  g.textAlign = "left";
-  g.fillText(trim(low, 3), 0, high);
-  g.textAlign = "right";
-  g.fillText(`${trim(hist.edges[n], 3)} px`, wide, high);
-  g.textAlign = "center";
-  g.fillText(`⌀ ${trim(stats.diameter.median, 4)}`, clamp(x, 34, wide - 60), high);
+function chartTip(event) {
+  const tip = $("chart-tip");
+  if (!chart || !event) return (tip.hidden = true);
+  const box = $("histogram").getBoundingClientRect();
+  const k = clamp(Math.floor(((event.clientX - box.left) / box.width) * chart.bins), 0, chart.bins - 1);
+  const from = chart.low + (k / chart.bins) * (chart.top - chart.low);
+  const to = chart.low + ((k + 1) / chart.bins) * (chart.top - chart.low);
+  tip.textContent = `${trim(from, 4)} to ${trim(to, 4)}${chart.unit}: ${count(chart.counts[k])} contours`;
+  tip.hidden = false;
+  tip.style.left = `${clamp(event.clientX - box.left, 90, box.width - 90)}px`;
 }
 
-function notice(text, calm = false) {
+function renderPicked() {
+  const tab = S.active;
+  const block = $("picked-block");
+  block.hidden = !tab || tab.picked < 0;
+  if (block.hidden) return;
+  const d = tab.detail;
+  const rows = [];
+  const row = (name, value) => rows.push(h("dt", { text: name }), h("dd", { text: value }));
+  if (d) {
+    row("Centre", `x ${trim(d.x, 6)}, y ${trim(d.y, 6)}`);
+    if (d.closed) {
+      row("Diameter", lengthText(d.diameter));
+      row("Width × height", `${trim(d.width)} × ${trim(d.height)} px${S.pixelNm > 0 ? ` · ${trim(d.width * S.pixelNm)} × ${trim(d.height * S.pixelNm)} nm` : ""}`);
+      row("Long × short axis", `${trim(d.major)} × ${trim(d.minor)} px, long axis at ${trim(d.angle, 3)}°`);
+      row("Area", `${trim(d.area)} px²`);
+      if (d.deviation !== null) row("Versus neighbours", told("percent", d.deviation)[0]);
+    } else {
+      row("Kind", "open: it runs out of the image");
+    }
+    if (d.brightness !== null) row("Brightness", `${trim(d.brightness, 5)} grey levels at its centre`);
+    row("Outline", `${trim(d.length)} px long, ${count(d.points)} points`);
+  }
+  put(block, 
+    h(
+      "div",
+      { class: "block-head" },
+      h("h3", { text: `Contour ${count(tab.picked + 1)}` }),
+      h("button", { type: "button", class: "quiet small", text: "Clear", title: "Let the contour go (Esc)", onclick: () => contourPicked(tab, -1).then(() => View.draw(true)) }),
+    ),
+    d ? h("dl", { class: "numbers" }, rows) : h("p", { class: "hint", text: "…" }),
+  );
+}
+
+function renderReference(tab, set, stats) {
+  const block = $("reference-block");
+  block.hidden = !(tab.pinned || (set && set.n));
+  if (block.hidden) return;
+  const pin = $("pin");
+  const text = $("reference-text");
+  if (!tab.pinned) {
+    text.textContent = "Keep these contours on screen in green while you change the method or choose another, to see what changes.";
+    pin.textContent = "Keep these as a reference";
+    return;
+  }
+  const kept = tab.pinned;
+  let words = `Reference: ${count(kept.set.n)} contours of “${kept.label}”, typical diameter ${lengthText(kept.median)}.`;
+  if (set && set !== kept.set && set.n && Number.isFinite(kept.median)) {
+    const now = summary(set, "diameter").median;
+    if (Number.isFinite(now)) words += ` Now: ${count(set.n)} contours, ${told("percent", 100 * (now / kept.median - 1))[0]} in typical diameter.`;
+  }
+  text.textContent = words;
+  pin.textContent = "Let the reference go";
+  void stats;
+}
+
+function notice(text) {
   const box = $("notice");
   box.hidden = !text;
   box.textContent = text || "";
-  box.classList.toggle("calm", calm);
 }
 
 // --- Tabs and their images ------------------------------------------------------------------------------------
 
-/* A region kept from an earlier visit, if it still fits the image; else the one the server proposes. */
+/* A part kept from an earlier visit, if it still fits the image; else the one the server proposes. */
 function keptRegion(info, kept) {
   if (!kept.regions || !(info.id in kept.regions)) return info.region;
   const region = kept.regions[info.id];
@@ -859,6 +1119,7 @@ function makeTab(info, kept = {}) {
     result: null,
     ranKey: null,
     ranSteps: null,
+    ranName: "",
     failedKey: null,
     refused: null,
     busy: false,
@@ -875,19 +1136,19 @@ function makeTab(info, kept = {}) {
 function sub(info) {
   if (info.pages < 2) return "";
   const v = info.view;
-  return v.stack ? `pages ${v.first + 1}–${v.first + v.count}` : `page ${v.page + 1}/${info.pages}`;
+  return v.stack ? `pages ${v.first + 1}–${v.first + v.count}` : `page ${v.page + 1}`;
 }
 
 function renderTabs() {
   const bar = $("tabs");
-  bar.replaceChildren(
+  put(bar, 
     ...S.tabs.map((tab) =>
       h(
         "button",
         {
           type: "button",
           class: ["tab", tab === S.active && "active", tab.busy && "busy", tab.result && tab.result.error && "failed"].filter(Boolean).join(" "),
-          title: `${tab.info.path || tab.info.name}${tab.own ? "\nThis tab has a workflow of its own." : ""}`,
+          title: `${tab.info.path || tab.info.name}${tab.own ? "\nThis tab has a method of its own." : ""}`,
           onclick: () => activate(tab),
           onauxclick: (event) => {
             if (event.button === 1) closeTab(tab);
@@ -896,7 +1157,7 @@ function renderTabs() {
         h("span", { class: "dot" }),
         h("span", { class: "name", text: tab.info.name }),
         sub(tab.info) ? h("span", { class: "sub", text: sub(tab.info) }) : null,
-        tab.own ? h("span", { class: "own", text: "◆", title: "This tab has a workflow of its own" }) : null,
+        tab.own ? h("span", { class: "sub", text: "own method" }) : null,
         h("span", {
           class: "close",
           role: "button",
@@ -909,7 +1170,7 @@ function renderTabs() {
         }),
       ),
     ),
-    h("button", { type: "button", class: "tab-add", text: "+", title: "Open more images (Ctrl+O)", onclick: openDialog }),
+    h("button", { type: "button", class: "tab-add", text: S.tabs.length ? "+ Open" : "Open images…", title: "Open images, each in a tab of its own (Ctrl+O)", onclick: openDialog }),
   );
 }
 
@@ -922,9 +1183,10 @@ function activate(tab) {
   S.active = tab || null;
   remember();
   renderTabs();
-  renderSource();
+  renderPages();
   renderRegion();
   renderFlow();
+  renderDisplay();
   shownChanged();
   renderBusy();
   watch(S.active);
@@ -935,6 +1197,8 @@ async function closeTab(tab) {
   if (at < 0) return;
   S.tabs.splice(at, 1);
   View.forget(tab.id);
+  for (const entry of tab.sets.values()) View.dropSet(entry.set);
+  if (tab.pinned) View.dropSet(tab.pinned.set);
   if (S.active === tab) activate(S.tabs[Math.min(at, S.tabs.length - 1)] || null);
   else renderTabs();
   remember();
@@ -972,12 +1236,29 @@ async function upload(file) {
   }
 }
 
+async function duplicateTab() {
+  const tab = S.active;
+  if (!tab) return;
+  try {
+    const copy = makeTab(await api.post(`/api/tabs/${tab.id}/duplicate`));
+    copy.region = tab.region;
+    copy.cam = tab.cam && { ...tab.cam };
+    copy.own = clone(flow(tab));
+    S.tabs.splice(S.tabs.indexOf(tab) + 1, 0, copy);
+    activate(copy);
+    toast("The copy has a method of its own: choose another for it, and switch between the two tabs to compare.");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
 /* The server's new account of a tab's image: another page, or pages stacked. */
 function reloaded(tab, info) {
   const resized = info.width !== tab.info.width || info.height !== tab.info.height;
   tab.info = info;
   tab.result = null;
   tab.ranKey = tab.ranSteps = tab.failedKey = tab.refused = null;
+  for (const entry of tab.sets.values()) if (!tab.pinned || tab.pinned.set !== entry.set) View.dropSet(entry.set);
   tab.sets.clear();
   tab.picked = tab.hover = -1;
   tab.detail = null;
@@ -986,13 +1267,15 @@ function reloaded(tab, info) {
   if (resized) {
     tab.region = info.region;
     tab.cam = null;
+    if (tab.pinned) View.dropSet(tab.pinned.set);
     tab.pinned = null;
   }
   remember();
   renderTabs();
-  renderSource();
+  renderPages();
   renderRegion();
   renderSteps();
+  renderDisplay();
   shownChanged();
   schedule(0);
 }
@@ -1006,7 +1289,7 @@ function setView(tab, change) {
       reloaded(tab, await api.post(`/api/tabs/${tab.id}/view`, { ...tab.info.view, ...change }));
     } catch (error) {
       toast(error.message, "error");
-      renderSource();
+      renderPages();
     }
   });
 }
@@ -1024,115 +1307,64 @@ function stepPage(by) {
   }
 }
 
-function renderSource() {
+/* The bar under the image of a file with several pages: which page, or which pages stacked. */
+function renderPages() {
   const tab = S.active;
-  const bar = $("source-bar");
-  if (!tab) return bar.replaceChildren();
+  const bar = $("pagebar");
+  bar.hidden = !tab || tab.info.pages < 2;
+  if (bar.hidden) return put(bar);
   const info = tab.info;
   const v = info.view;
-  const bits = { uint8: "8 bit", uint16: "16 bit", float32: "float" }[info.dtype] || info.dtype;
-  const parts = [
-    h(
-      "span",
-      { class: "group" },
-      h("b", { text: info.name }),
-      h("span", { class: "dim mono", text: `${info.width} × ${info.height} px · ${bits} · ${trim(info.min, 6)}–${trim(info.max, 6)} DN` }),
-      info.notes.length ? h("span", { class: "dim", text: info.notes.join("; ") }) : null,
-    ),
-  ];
-  if (info.pages > 1) {
-    const number = (value, max, title, change, min = 1) =>
-      h("input", {
-        type: "number",
-        min,
-        max,
-        step: 1,
-        value,
-        title,
-        onchange: (event) => {
-          const chosen = Math.round(event.target.valueAsNumber);
-          if (Number.isFinite(chosen) && chosen >= min && chosen <= max) change(chosen);
-          else renderSource();
-        },
-      });
-    const first = v.stack ? v.first : v.page;
-    parts.push(
-      h(
-        "span",
-        { class: "group" },
-        h("span", { class: "label", text: v.stack ? "From page" : "Page" }),
-        h("button", { type: "button", text: "◂", title: "The page before (,)", disabled: first <= 0, onclick: () => stepPage(-1) }),
-        number(first + 1, info.pages, "Page of the file, from 1", (page) => setView(tab, v.stack ? { first: Math.min(page - 1, info.pages - v.count) } : { page: page - 1 })),
-        h("button", {
-          type: "button",
-          text: "▸",
-          title: "The page after (.)",
-          disabled: first + (v.stack ? v.count : 1) >= info.pages,
-          onclick: () => stepPage(1),
-        }),
-        h("span", { class: "dim", text: `of ${count(info.pages)}` }),
-      ),
-      h(
-        "span",
-        { class: "group" },
-        h(
-          "label",
-          { class: "check", title: "Join pages below each other into one long strip, as the scan recorded them" },
-          h("input", {
-            type: "checkbox",
-            checked: v.stack,
-            onchange: (event) =>
-              setView(
-                tab,
-                event.target.checked
-                  ? { stack: true, first: Math.min(v.page, info.pages - 1), count: Math.min(8, info.pages - v.page) }
-                  : { stack: false, page: v.first },
-              ),
-          }),
-          "Stack",
-        ),
-        v.stack
-          ? [
-              number(v.count, info.pages - v.first, "How many pages are stacked", (pages) => setView(tab, { count: pages })),
-              h("span", { class: "dim", text: "pages" }),
-              h(
-                "label",
-                { class: "check", title: "The last of the pages at the top: a stripe scanned upwards stores its pages in that order" },
-                h("input", { type: "checkbox", checked: v.reverse, onchange: (e) => setView(tab, { reverse: e.target.checked }) }),
-                "reverse order",
-              ),
-              h(
-                "label",
-                { class: "check", title: "Every page upside down: as a stripe scanned upwards stores them" },
-                h("input", { type: "checkbox", checked: v.flip, onchange: (e) => setView(tab, { flip: e.target.checked }) }),
-                "flip pages",
-              ),
-            ]
-          : null,
-      ),
-    );
-  }
-  parts.push(
-    h("span", { class: "grow" }),
-    h("button", {
-      type: "button",
-      text: "Duplicate tab",
-      title: "The same image in a second tab: give one of the two a workflow of its own (this tab) to compare two workflows on it",
-      onclick: async () => {
-        try {
-          const copy = makeTab(await api.post(`/api/tabs/${tab.id}/duplicate`));
-          copy.region = tab.region;
-          copy.cam = tab.cam && { ...tab.cam };
-          copy.own = clone(flow(tab));
-          S.tabs.splice(S.tabs.indexOf(tab) + 1, 0, copy);
-          activate(copy);
-        } catch (error) {
-          toast(error.message, "error");
-        }
+  const first = v.stack ? v.first : v.page;
+  const last = info.pages - (v.stack ? v.count : 1);
+  const go = (page) => setView(tab, v.stack ? { first: clamp(page, 0, last) } : { page: clamp(page, 0, last) });
+  const number = (value, max, label, change) =>
+    h("input", {
+      type: "number",
+      min: 1,
+      max,
+      step: 1,
+      value,
+      "aria-label": label,
+      onchange: (event) => {
+        const chosen = Math.round(event.target.valueAsNumber);
+        if (Number.isFinite(chosen) && chosen >= 1 && chosen <= max) change(chosen);
+        else renderPages();
       },
-    }),
+    });
+  put(bar, 
+    h("button", { type: "button", text: "◂", title: "The page before (,)", disabled: first <= 0, onclick: () => stepPage(-1) }),
+    h("span", { class: "dim", text: v.stack ? "From page" : "Page" }),
+    number(first + 1, last + 1, "Page", (page) => go(page - 1)),
+    h("span", { class: "dim", text: `of ${count(info.pages)}` }),
+    h("button", { type: "button", text: "▸", title: "The page after (.)", disabled: first >= last, onclick: () => stepPage(1) }),
+    v.stack ? null : h("input", { type: "range", min: 0, max: Math.max(last, 0), step: 1, value: first, "aria-label": "Page", title: "Drag to another page", onchange: (event) => go(event.target.valueAsNumber) }),
+    h("span", { class: "sep" }),
+    h(
+      "label",
+      { class: "switch", title: "Join pages below each other into one long strip, as the scan recorded them" },
+      h("input", {
+        type: "checkbox",
+        checked: v.stack,
+        onchange: (event) => setView(tab, event.target.checked ? { stack: true, first: Math.min(v.page, info.pages - 1), count: Math.min(4, info.pages - v.page) } : { stack: false, page: v.first }),
+      }),
+      h("span"),
+      "Stack",
+    ),
+    v.stack ? [number(v.count, info.pages - v.first, "Pages stacked", (pages) => setView(tab, { count: pages })), h("span", { class: "dim", text: "pages" })] : null,
+    v.stack
+      ? h("button", {
+          type: "button",
+          text: "Order ▾",
+          title: "For stripes scanned upwards, whose pages are stored last first and upside down",
+          onclick: (event) =>
+            openMenu(event.currentTarget, [
+              { title: v.reverse ? "✓ Last page at the top" : "Last page at the top", text: "A stripe scanned upwards stores its pages in that order.", action: () => setView(tab, { reverse: !v.reverse }) },
+              { title: v.flip ? "✓ Every page upside down" : "Every page upside down", text: "As a stripe scanned upwards stores them.", action: () => setView(tab, { flip: !v.flip }) },
+            ]),
+        })
+      : null,
   );
-  bar.replaceChildren(...parts);
 }
 
 // --- The Open dialog ------------------------------------------------------------------------------------------
@@ -1163,15 +1395,15 @@ async function browseTo(folder) {
       $("open-dialog").close();
       return openPaths([folder.trim()]);
     }
-    files.replaceChildren(h("div", { class: "failed", text: error.message }));
+    put(files, h("div", { class: "failed", text: error.message }));
   }
 }
 
 function renderPlaces() {
   const places = [...(picker.listing.drives || []), ...S.folders.filter((folder) => folder !== picker.listing.folder)];
-  $("places").replaceChildren(
+  put($("places"), 
     h("button", { type: "button", text: "Home", onclick: () => browseTo("") }),
-    ...places.slice(0, 14).map((place) => h("button", { type: "button", text: place.length > 34 ? `…${place.slice(-32)}` : place, title: place, onclick: () => browseTo(place) })),
+    ...places.slice(0, 12).map((spot) => h("button", { type: "button", text: spot.length > 34 ? `…${spot.slice(-32)}` : spot, title: spot, onclick: () => browseTo(spot) })),
   );
 }
 
@@ -1192,7 +1424,7 @@ function renderFiles() {
         class: ["file", entry.folder && "folder", picker.chosen.has(k) && "chosen"].filter(Boolean).join(" "),
         role: "option",
         onclick: (event) => {
-          if (entry.folder) return;
+          if (entry.folder) return browseTo(join(entry.name));
           if (event.shiftKey && picker.last >= 0) {
             for (let i = Math.min(k, picker.last); i <= Math.max(k, picker.last); i++) if (!entries[i].folder) picker.chosen.add(i);
           } else if (event.ctrlKey || event.metaKey) {
@@ -1206,7 +1438,7 @@ function renderFiles() {
           renderFiles();
         },
         ondblclick: () => {
-          if (entry.folder) return browseTo(join(entry.name));
+          if (entry.folder) return;
           picker.chosen.clear();
           picker.chosen.add(k);
           openChosen();
@@ -1219,7 +1451,7 @@ function renderFiles() {
     ),
   );
   const scroll = $("files").scrollTop;
-  $("files").replaceChildren(...(rows.length ? rows : [h("div", { class: "none", text: "No folders and no PNG or TIFF images here." })]));
+  put($("files"), ...(rows.length ? rows : [h("div", { class: "none", text: "No folders and no PNG or TIFF images here." })]));
   $("files").scrollTop = scroll;
   const n = picker.chosen.size;
   $("chosen").textContent = n ? `${n} image${n > 1 ? "s" : ""} chosen` : "Click an image; Ctrl or Shift + click for several. Double-click opens.";
@@ -1235,7 +1467,75 @@ function openChosen() {
   openPaths(paths);
 }
 
-// --- Exports --------------------------------------------------------------------------------------------------
+// --- Choosing a method, adding a step -------------------------------------------------------------------------
+
+function openMethods() {
+  const current = flow().name;
+  put($("methods"), 
+    ...S.meta.groups.flatMap((group) => [
+      h("div", { class: "group-name", text: group }),
+      h(
+        "div",
+        { class: "cards" },
+        S.meta.presets
+          .filter((preset) => preset.group === group)
+          .map((preset) =>
+            h(
+              "button",
+              {
+                type: "button",
+                class: `card${preset.name === current ? " current" : ""}`,
+                onclick: () => {
+                  if (!mayReplace()) return;
+                  $("methods-dialog").close();
+                  replaceFlow(preset.name, preset.steps);
+                },
+              },
+              h("b", { text: preset.name }),
+              h("span", { class: "text", text: preset.help }),
+              h("dl", {}, h("dt", { text: "Best for" }), h("dd", { text: preset.best }), h("dt", { text: "Watch" }), h("dd", { text: preset.watch })),
+              h("span", { class: "flow" }, preset.steps.flatMap((step, k) => [k ? "→" : null, h("span", { text: S.modules.get(step.module).title })])),
+            ),
+          ),
+      ),
+    ]),
+  );
+  $("methods-dialog").showModal();
+}
+
+const STAGE_WORDS = { Image: "Change the image", Mask: "Mark the pattern", Contours: "Make and change contours" };
+
+function openModules() {
+  put($("modules"), 
+    ...S.meta.stages.flatMap((stage) => [
+      h("div", { class: "group-name", text: STAGE_WORDS[stage] || stage }),
+      h(
+        "div",
+        { class: "cards" },
+        S.meta.modules
+          .filter((module) => module.stage === stage)
+          .map((module) =>
+            h(
+              "button",
+              {
+                type: "button",
+                class: "card module",
+                onclick: () => {
+                  $("steps-dialog").close();
+                  addStep(module.name);
+                },
+              },
+              h("b", { text: module.title }),
+              h("span", { class: "text", text: module.summary }),
+            ),
+          ),
+      ),
+    ]),
+  );
+  $("steps-dialog").showModal();
+}
+
+// --- Saving results -------------------------------------------------------------------------------------------
 
 async function exportContours(kind) {
   const tab = S.active;
@@ -1255,14 +1555,16 @@ async function exportContours(kind) {
 function togglePin() {
   const tab = S.active;
   if (!tab) return;
-  if (tab.pinned) tab.pinned = null;
-  else {
+  if (tab.pinned) {
+    const live = [...tab.sets.values()].some((entry) => entry.set === tab.pinned.set);
+    if (!live) View.dropSet(tab.pinned.set);
+    tab.pinned = null;
+  } else {
     const view = shown(tab);
     const set = view.contours && setOf(tab, view.contours);
     if (!set) return;
-    const stats = tab.result.contours[view.contours];
-    tab.pinned = { set, label: flow(tab).name || "workflow", median: stats && stats.diameter && stats.diameter.median };
-    S.show.pinned = true;
+    tab.pinned = { set, label: tab.ranName || flow(tab).name || "method", median: summary(set, "diameter").median };
+    S.show.reference = true;
   }
   shownChanged();
 }
@@ -1274,17 +1576,13 @@ function toggle(layer) {
 }
 
 function wire() {
-  $("open-images").onclick = $("open-images-2").onclick = openDialog;
+  $("open-first").onclick = openDialog;
   $("help").onclick = () => $("help-dialog").showModal();
   $("pixel-nm").oninput = (event) => {
     const value = event.target.valueAsNumber;
     S.pixelNm = Number.isFinite(value) && value > 0 ? value : 0;
     remember();
     shownChanged();
-  };
-  $("sync-view").onchange = (event) => {
-    S.sync = event.target.checked;
-    remember();
   };
   for (const [id, name] of [["view-of", "of"], ["image-of", "image"]]) {
     for (const button of $(id).children) {
@@ -1302,24 +1600,34 @@ function wire() {
       shownChanged();
     };
   }
-  $("pin").onclick = togglePin;
+  $("display").onclick = (event) => {
+    const pop = $("display-pop");
+    if (!pop.hidden) return (pop.hidden = true);
+    renderDisplay();
+    place(pop, event.currentTarget);
+  };
+  $("line-width").oninput = (event) => {
+    S.look.width = event.target.valueAsNumber;
+    $("width-out").textContent = `${trim(S.look.width, 2)} px`;
+    remember();
+    View.draw();
+  };
   $("smooth").onchange = (event) => {
     S.show.smooth = event.target.checked;
     remember();
     View.draw();
   };
-  $("zoom-fit").onclick = () => S.active && View.fit(S.active);
-  $("zoom-one").onclick = () => S.active && View.oneToOne(S.active);
-  $("zoom-in").onclick = () => S.active && View.zoomBy(S.active, 1.6);
-  $("zoom-out").onclick = () => S.active && View.zoomBy(S.active, 1 / 1.6);
-  $("region-whole").onclick = () => S.active && setRegion(S.active, null);
-  $("region-view").onclick = () => S.active && setRegion(S.active, View.shownRegion(S.active));
+  $("sync-view").onchange = (event) => {
+    S.sync = event.target.checked;
+    remember();
+  };
   $("levels-auto").onchange = (event) => {
     const tab = S.active;
     if (!tab) return;
     const { black, white } = front(tab);
     tab.levels = { auto: event.target.checked, black, white };
-    shownChanged();
+    renderDisplay();
+    View.draw();
   };
   for (const [id, name] of [["level-black", "black"], ["level-white", "white"]]) {
     $(id).oninput = (event) => {
@@ -1331,77 +1639,105 @@ function wire() {
       View.draw();
     };
   }
+  $("zoom-fit").onclick = () => S.active && View.fit(S.active);
+  $("zoom-one").onclick = () => S.active && View.oneToOne(S.active);
+  $("zoom-in").onclick = () => S.active && View.zoomBy(S.active, 1.6);
+  $("zoom-out").onclick = () => S.active && View.zoomBy(S.active, 1 / 1.6);
+
+  // the results
+  $("measure").onchange = (event) => {
+    S.look.measure = event.target.value;
+    remember();
+    renderResults();
+    View.draw();
+  };
+  $("colour-on").onchange = (event) => {
+    S.look.byMeasure = event.target.checked;
+    remember();
+    renderResults();
+    View.draw();
+  };
+  $("range").onchange = (event) => {
+    S.look.range[measureOf(S.look.measure).kind] = event.target.value;
+    remember();
+    renderResults();
+    View.draw();
+  };
+  $("histogram").onpointermove = chartTip;
+  $("histogram").onpointerleave = () => chartTip(null);
+  $("pin").onclick = togglePin;
   for (const button of document.querySelectorAll("[data-export]")) button.onclick = () => exportContours(button.dataset.export);
   $("snapshot").onclick = async () => {
     const tab = S.active;
-    if (tab) download(await View.picture(), `${tab.info.name.replace(/\.[^.]+$/, "")}-snapshot.png`);
+    if (tab) download(await View.picture(), `${tab.info.name.replace(/\.[^.]+$/, "")}-contours.png`);
   };
 
-  // the workflow
-  $("examples").onclick = (event) =>
-    openMenu(
-      event.currentTarget,
-      S.meta.presets.map((preset) => ({
-        title: preset.name,
-        text: preset.help,
-        action: () => mayReplace() && replaceFlow(preset.name, preset.steps),
-      })),
-    );
-  $("step-add").onclick = (event) =>
-    openMenu(
-      event.currentTarget,
-      S.meta.stages.flatMap((stage) => [
-        { heading: `${stage} modules` },
-        ...S.meta.modules
-          .filter((module) => module.stage === stage)
-          .map((module) => ({ title: module.title, text: firstSentence(module.help), action: () => addStep(module.name) })),
-      ]),
-    );
-  $("step-remove").onclick = removeStep;
-  $("step-up").onclick = () => moveStep(-1);
-  $("step-down").onclick = () => moveStep(1);
-  $("flow-save").onclick = saveFlow;
-  $("flow-open").onclick = () => $("flow-file").click();
+  // the method
+  $("choose-method").onclick = openMethods;
+  $("step-add").onclick = openModules;
+  $("flow-more").onclick = (event) => {
+    const tab = S.active;
+    const wf = flow();
+    const known = presetNamed(wf.name);
+    openMenu(event.currentTarget, [
+      { title: "Open a method file…", text: "A method saved here before. Or drop the file on the window.", action: () => $("flow-file").click() },
+      { title: "Save the method to a file…", text: "To open it here another day, or to run it from Python without this window (Ctrl+S).", action: saveFlow },
+      known && changedSince(wf) ? { title: `Back to “${wf.name}” as it came`, text: "Undo every change to its steps and settings.", action: () => replaceFlow(known.name, known.steps) } : null,
+      tab && !tab.own
+        ? {
+            title: "Give this tab a method of its own",
+            text: "Changes then apply to this image only; the other tabs keep the method they have.",
+            action: () => {
+              tab.own = clone(S.shared);
+              remember();
+              renderFlow();
+              renderTabs();
+            },
+          }
+        : null,
+      tab && tab.own
+        ? {
+            title: "Use this method in every tab",
+            text: "This tab's method becomes the one all tabs run.",
+            action: () => {
+              S.shared = tab.own;
+              tab.own = null;
+              remember();
+              renderFlow();
+              renderTabs();
+              schedule(0);
+            },
+          }
+        : null,
+      tab && tab.own
+        ? {
+            title: "Go back to the method of the other tabs",
+            text: "This tab's own method is dropped.",
+            action: () => {
+              tab.own = null;
+              remember();
+              renderFlow();
+              renderTabs();
+              schedule(0);
+            },
+          }
+        : null,
+      tab ? { title: "Duplicate this tab", text: "The same image in a second tab with a method of its own: to compare two methods on one image.", action: duplicateTab } : null,
+    ]);
+  };
   $("flow-file").onchange = async (event) => {
     const file = event.target.files[0];
     event.target.value = "";
     if (file) openFlow(await file.text(), file.name);
   };
-  $("scope").onclick = (event) => {
+  $("run-on").onchange = (event) => {
     const tab = S.active;
-    const value = event.target.dataset.value;
-    if (!tab || !value) return;
-    if (value === "own" && !tab.own) {
-      tab.own = clone(S.shared);
-      remember();
-      renderFlow();
-      renderTabs();
-    } else if (value === "all" && tab.own) {
-      openMenu(event.target, [
-        {
-          title: "Use this workflow in all tabs",
-          text: "This tab's workflow becomes the one every tab runs.",
-          action: () => {
-            S.shared = tab.own;
-            tab.own = null;
-            remember();
-            renderFlow();
-            renderTabs();
-            schedule(0);
-          },
-        },
-        {
-          title: "Go back to the workflow of the other tabs",
-          text: "This tab's own workflow is dropped.",
-          action: () => {
-            tab.own = null;
-            remember();
-            renderFlow();
-            renderTabs();
-            schedule(0);
-          },
-        },
-      ]);
+    if (!tab) return;
+    if (event.target.value === "whole") setRegion(tab, null);
+    else if (event.target.value === "view") setRegion(tab, View.shownRegion(tab));
+    else {
+      renderRegion();
+      toast("Hold Shift and drag on the image to draw the box the method runs on.");
     }
   };
   $("auto").onchange = (event) => {
@@ -1440,9 +1776,11 @@ function wire() {
   };
 
   document.addEventListener("pointerdown", (event) => {
-    if (!$("menu").hidden && !$("menu").contains(event.target) && !event.target.closest("#examples, #step-add, #scope")) closeMenu();
+    if (!$("menu").hidden && !$("menu").contains(event.target) && !event.target.closest("#flow-more, .pagebar")) closeMenu();
+    if (!$("display-pop").hidden && !$("display-pop").contains(event.target) && !event.target.closest("#display")) $("display-pop").hidden = true;
   });
   window.addEventListener("blur", closeMenu);
+  window.addEventListener("resize", () => S.active && renderResults());
 
   // files dropped anywhere on the window
   let depth = 0;
@@ -1482,7 +1820,8 @@ function keyDown(event) {
   const command = event.ctrlKey || event.metaKey;
   if (event.key === "Escape") {
     if (!$("menu").hidden) return closeMenu();
-    if (!modal && S.active && S.active.picked >= 0) contourPicked(S.active, -1).then(View.draw);
+    if (!$("display-pop").hidden) return ($("display-pop").hidden = true);
+    if (!modal && S.active && S.active.picked >= 0) contourPicked(S.active, -1).then(() => View.draw(true));
     return;
   }
   if (modal) return;
@@ -1525,7 +1864,6 @@ function keyDown(event) {
     },
     c: () => toggle("contours"),
     m: () => toggle("mask"),
-    p: togglePin,
     ArrowLeft: () => tab && View.pan(tab, -1, 0),
     ArrowRight: () => tab && View.pan(tab, 1, 0),
     ArrowUp: () => tab && View.pan(tab, 0, -1),
@@ -1536,7 +1874,7 @@ function keyDown(event) {
     return View.bare(true);
   }
   const act = keys[event.key.length === 1 ? event.key.toLowerCase() : event.key];
-  if (act && !(event.key.startsWith("Arrow") && event.target.id !== "view" && event.target !== document.body)) {
+  if (act && !(event.key.startsWith("Arrow") && event.target.id !== "marks" && event.target !== document.body)) {
     event.preventDefault();
     act();
   }
@@ -1554,13 +1892,16 @@ async function start() {
   const kept = recalled(STORE);
   for (const name of ["auto", "sync", "pixelNm", "folder", "folders"]) if (name in kept) S[name] = kept[name];
   Object.assign(S.show, kept.show || {});
-  const first = S.meta.presets.find((preset) => preset.name === S.meta.start);
+  Object.assign(S.look, kept.look || {});
+  if (!measureOf(S.look.measure) || measureOf(S.look.measure).key !== S.look.measure) S.look.measure = S.meta.measures[0].key;
+  if (!S.look.range || typeof S.look.range !== "object") S.look.range = {};
+  const first = presetNamed(S.meta.start);
   S.shared = workflow(first.name, first.steps);
   if (kept.shared) {
     try {
       S.shared = { ...workflow(kept.shared.name, kept.shared.steps, kept.shared.origin), selected: kept.shared.selected || 0 };
     } catch {
-      /* of another version of the modules: the workflow to start from instead */
+      /* of another version of the steps: the method to start from instead */
     }
   }
   for (const name of Object.keys(localStorage)) if (name.startsWith(`${STORE}:`) && name !== `${STORE}:${KEY}`) localStorage.removeItem(name);
@@ -1574,16 +1915,17 @@ async function start() {
     }
   }
   $("auto").checked = S.auto;
-  $("sync-view").checked = S.sync;
   $("pixel-nm").value = S.pixelNm || "";
   wire();
   const session = await api.get("/api/session");
   S.tabs = session.tabs.map((info) => makeTab(info, here));
   renderFlow();
   renderLayers();
+  renderDisplay();
   renderRegion();
-  renderSummary();
+  renderResults();
   renderBusy();
+  renderPages();
   activate(S.tabs.find((tab) => tab.id === here.active) || S.tabs[0] || null);
   if (!S.tabs.length) View.draw();
 }

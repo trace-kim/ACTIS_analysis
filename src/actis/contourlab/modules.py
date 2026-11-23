@@ -52,8 +52,10 @@ class State:
     bright: bool = True  # the regions are the brighter side
     level: float = np.nan  # the one grey level the mask was cut at; NaN: none
     contours: Contours | None = None  # in the pixels of `image`
-    noise: float = np.nan  # pixel noise (sigma, grey levels) of the image as loaded
+    noise: float = np.nan  # pixel noise (sigma, grey levels) of `image`, as tracked
     note: str = ""  # what the last module says of what it did
+    origin: np.ndarray | None = None  # the image as loaded: where the noise is known
+    band: tuple | None = None  # (x, y) cycles/px a low pass confined the noise to
 
     @property
     def measured(self):
@@ -79,6 +81,8 @@ class Option:
     step: float = 1.0
     choices: tuple = ()
     unit: str = ""
+    label: str = ""  # its name in a window
+    advanced: bool = False  # not one of the few a window shows first
 
     def checked(self, value, name):
         """The value as the option's type; a ValueError says why it cannot be."""
@@ -124,8 +128,102 @@ class Module:
     options: dict  # Option by name, in the function's order
     function: Callable  # function(state, **options) -> State
 
+    @property
+    def summary(self):
+        """What it does, in its docstring's first sentence."""
+        end = self.help.find(". ")
+        return self.help if end < 0 else self.help[: end + 1]
+
 
 MODULES = {}  # by name, in the order a window lists them
+
+# The options a window shows first, per module; the others are one click away.
+KEY_OPTIONS = {
+    "optical_filter": ("cutoff", "deblur_x_px", "deblur_y_px"),
+    "gaussian_blur": ("sigma_px",),
+    "median_filter": ("size_px",),
+    "remove_stripes": ("rows", "columns"),
+    "flatten_background": ("tile_px",),
+    "normalize_contrast": ("tile_px",),
+    "deblur": ("sigma_x_px", "sigma_y_px", "iterations"),
+    "unsharp_mask": ("sigma_px", "amount"),
+    "band_pass": ("small_px", "large_px"),
+    "non_local_means": ("strength",),
+    "upscale": ("factor", "method"),
+    "feature_threshold": ("fraction", "peers", "min_contrast", "bright"),
+    "mid_level_threshold": ("reference", "fraction"),
+    "otsu_threshold": ("classes",),
+    "fixed_threshold": ("level",),
+    "adaptive_threshold": ("block_px", "offset_percent"),
+    "morphology": ("operation", "size_px"),
+    "trace_contours": ("min_area_px", "holes", "open_at_border"),
+    "trace_gradient_edges": ("blur_px", "high", "closed_only"),
+    "radial_contours": ("pitch_px",),
+    "refine_edges": ("rule", "search_px"),
+    "filter_contours": (
+        "closed_only",
+        "min_diameter_px",
+        "max_diameter_px",
+        "min_contrast",
+    ),
+    "smooth_contours": ("window",),
+    "simplify_shape": ("harmonics", "max_diameter_px"),
+}
+
+# What a window calls an option, by its name (or by "module.option" where one
+# name means different things); any other is its name in words.
+LABELS = {
+    "sigma_px": "Blur radius",
+    "size_px": "Window width",
+    "morphology.size_px": "Disk width",
+    "tile_px": "Tile size",
+    "smooth_px": "Compared over",
+    "low_percent": "Dark percentile",
+    "high_percent": "Bright percentile",
+    "min_contrast": "Least contrast",
+    "sigma_x_px": "Blur along x",
+    "sigma_y_px": "Blur along y",
+    "deblur_x_px": "Blur to take out, along x",
+    "deblur_y_px": "Blur to take out, along y",
+    "max_gain": "Most amplification",
+    "small_px": "Finest detail kept",
+    "large_px": "Widest detail kept",
+    "patch_px": "Patch width",
+    "search_px": "Search window",
+    "refine_edges.search_px": "Search distance",
+    "reference": "Levels come from",
+    "fraction": "Level between dark and bright",
+    "peers": "Features that share their levels",
+    "reach_px": "Search for the dark level up to",
+    "window_px": "Window",
+    "background_percent": "Background percentile",
+    "pattern_percent": "Pattern percentile",
+    "above_noise": "Noise guard",
+    "blur_px": "Blur",
+    "bright": "Pattern is the bright side",
+    "level": "Grey level",
+    "block_px": "Neighbourhood",
+    "offset_percent": "Offset",
+    "min_area_px": "Smallest area",
+    "max_area_px": "Largest area",
+    "holes": "Inner boundaries too",
+    "open_at_border": "Keep features cut by the border",
+    "spacing_px": "Point spacing",
+    "high": "Edge strength",
+    "low_ratio": "Follow an edge down to",
+    "min_length_px": "Shortest edge",
+    "closed_only": "Closed contours only",
+    "pitch_px": "Hole spacing",
+    "rule": "The edge is where",
+    "step_px": "Sampling step",
+    "min_diameter_px": "Smallest diameter",
+    "max_diameter_px": "Largest diameter",
+    "max_aspect": "Most elongated",
+    "size_outliers": "Size outliers",
+    "border_px": "Border margin",
+    "window": "Points per fit",
+    "cutoff": "Finest detail kept",
+}
 
 
 def module(title, stage, **options):
@@ -133,12 +231,18 @@ def module(title, stage, **options):
     state are its options."""
 
     def register(function):
+        name = function.__name__
         arguments = list(inspect.signature(function).parameters)[1:]
         assert stage in STAGES and arguments == list(options), function
         text = " ".join(function.__doc__.split())
-        MODULES[function.__name__] = Module(
-            function.__name__, title, stage, text, options, function
-        )
+        first = KEY_OPTIONS.get(name, ())
+        assert set(first) <= set(options), (name, first)
+        named = {}
+        for key, option in options.items():
+            words = key.removesuffix("_px").replace("_", " ").capitalize()
+            label = LABELS.get(f"{name}.{key}") or LABELS.get(key) or words
+            named[key] = replace(option, label=label, advanced=key not in first)
+        MODULES[name] = Module(name, title, stage, text, named, function)
         return function
 
     return register
@@ -192,12 +296,107 @@ def measured_noise(state, image):
     return ops.noise_sigma(image) if state.scale == 1 else state.noise
 
 
+def noise_at(state):
+    """Pixel noise (sigma) at every pixel of the state's image: brighter areas
+    are noisier. One number where the image as loaded is not known."""
+    overall = noise_of(state)
+    if state.origin is None:
+        return overall
+    sigma, loaded = ops.noise_map(state.origin)
+    if not loaded > 0:
+        return overall
+    if state.scale != 1:
+        sigma = ndimage.zoom(
+            sigma, state.scale, order=1, mode="nearest", grid_mode=True
+        )
+    if sigma.shape != state.image.shape:
+        return overall
+    # by as much as the image modules so far changed the noise of the whole image
+    return sigma * np.float32(overall / loaded)
+
+
 # --- Image modules ----------------------------------------------------------
 
 BRIGHT = (
     "The pattern is the brighter side (openings in the absorber, as ACTIS shows "
     "contact holes); off: the darker side"
 )
+
+
+@module(
+    "Optical low-pass",
+    "Image",
+    cutoff=number(
+        0.0,
+        0,
+        0.5,
+        0.01,
+        "Spatial frequency beyond which everything is removed. 0: measured from "
+        "the image, where its pattern sinks into its noise, and never taken "
+        "below 0.3. Set it by hand to treat every image alike, which is steadier "
+        "on noisy images, or to go lower. 0.5 is the sampling limit: nothing is "
+        "removed",
+        "cycles/px",
+    ),
+    deblur_x_px=number(
+        0.0,
+        0,
+        3,
+        0.05,
+        "Sigma of an optical blur along the rows to divide out inside the band; "
+        "0: none",
+        "px",
+    ),
+    deblur_y_px=number(
+        0.0,
+        0,
+        3,
+        0.05,
+        "Sigma of a blur down the columns (the TDI scan) to divide out; 0: none",
+        "px",
+    ),
+    max_gain=number(
+        3.0,
+        1,
+        20,
+        0.5,
+        "No frequency is amplified more than this when a blur is divided out: "
+        "higher sharpens more and brings back more noise",
+    ),
+)
+def optical_filter(state, cutoff, deblur_x_px, deblur_y_px, max_gain):
+    """Remove the spatial frequencies that hold noise and no pattern. An image
+    holds no detail finer than its optics resolve; if the detector samples
+    more finely than that, the frequencies beyond the optics' cutoff carry
+    detector noise only, and cutting them off removes that noise without
+    softening an edge, which a blur cannot do. Whether an image has such a
+    cutoff shows in what this step reports: on images that hold pattern up
+    to the sampling limit it removes nothing. With the two blur sigmas set,
+    the blur of the optics is also divided out inside the band (steeper
+    edges, flatter tops), at the price of more noise."""
+    if state.scale != 1:
+        raise WorkflowError(
+            "Optical low-pass works on the detector's own pixels: put it before Upscale"
+        )
+    if cutoff > 0:
+        along_x = along_y = float(cutoff)
+    else:
+        # one cutoff for both directions, and a cautious one: the measurement
+        # falls short on a noisy image, and a cutoff too low costs pattern
+        along_x = along_y = max(0.3, *ops.pass_band(state.image))
+    deblurs = deblur_x_px > 0 or deblur_y_px > 0
+    if min(along_x, along_y) >= 0.45 and not deblurs:  # only the corners would go
+        return replace(
+            state, note="pattern up to the sampling limit: nothing to remove"
+        )
+    image, gain = ops.optical_filter(
+        state.image, along_x, along_y, deblur_x_px, deblur_y_px, max_gain
+    )
+    note = f"cut at {along_x:.2f} cycles/px, noise x {gain:.2f}"
+    band = (min(1.07 * along_x, 0.71), min(1.07 * along_y, 0.71))
+    return replace(
+        state, image=image, noise=noise_of(state) * gain, note=note, band=band
+    )
 
 
 @module(
@@ -508,6 +707,87 @@ def sampled(image, limit=1_000_000):
     """About `limit` pixels of an image, evenly spread: for percentiles."""
     stride = max(1, int(np.sqrt(image.size / limit)))
     return image[::stride, ::stride]
+
+
+@module(
+    "Feature levels",
+    "Mask",
+    fraction=number(
+        0.5,
+        0.05,
+        0.95,
+        0.05,
+        "The threshold is this share of the way from a feature's dark level to "
+        "its bright level: 0.5 is its half-maximum outline; lower follows the "
+        "foot of the profile, higher its top",
+    ),
+    peers=number(
+        64,
+        1,
+        1000,
+        1,
+        "A feature's two levels are the medians over this many nearest "
+        "features of like contrast (within a factor of 1.4), itself included. "
+        "More: steadier levels, and a hole smaller than its neighbours gets a "
+        "smaller outline, as it should. Fewer: the levels follow illumination "
+        "more closely. 1: every feature against its own top alone, which "
+        "hides part of a size difference (a smaller hole is also fainter) and "
+        "is the least steady in noise",
+    ),
+    min_contrast=number(
+        10.0,
+        2,
+        1000,
+        0.5,
+        "A bump that stands less than this many noise sigma above its surround "
+        "is noise and not a feature. Both are read from the image smoothed over "
+        "a feature's width, and the noise is taken where the bump is: bright "
+        "areas are noisier than dark ones. Lower finds fainter features, and "
+        "specks",
+        "sigma",
+    ),
+    reach_px=number(
+        48,
+        4,
+        512,
+        1,
+        "How far from a feature's top its dark level is looked for: at least "
+        "the width of the widest rounded feature. A flat-topped feature (a pad, "
+        "a wide line) may be any size",
+        "px",
+    ),
+    blur_px=number(0.5, 0, 20, 0.1, THRESHOLD_BLUR, "px"),
+    bright=flag(True, BRIGHT),
+)
+def feature_threshold(state, fraction, peers, min_contrast, reach_px, blur_px, bright):
+    """Make the mask with a threshold that the features set for themselves. It
+    lies half way (or another share) between a feature's top and the dark
+    level around it, both shared with its nearest features of like contrast.
+    No tile is laid over the image and nothing is assumed about the pattern:
+    faint holes beside a bright pad, sparse holes, lines, pads and arrays of
+    any spacing each get the level of their own kind on one page, and
+    illumination, gain and offset drop out. What does not rise clearly above
+    the noise where it lies sets no level, so empty areas, dark or bright,
+    give no contours. The module for ACTIS pages: start here."""
+    f = state.scale
+    sign = np.float32(1.0 if bright else -1.0)
+    # A dark pattern is found as a bright one in the negative of the image.
+    signed = ops.blur(state.image, blur_px * f) * sign
+    # the noise of that image, and of it smoothed once more to tell features from noise
+    blurred = ops.blur_noise_gain(blur_px, state.band)
+    gathered = ops.blur_noise_gain(float(np.hypot(blur_px, 0.8)), state.band)
+    field, found, ignored = ops.feature_field(
+        signed,
+        noise_at(state) * np.float32(blurred),
+        fraction,
+        peers,
+        min_contrast,
+        reach_px * f,
+        gathered_gain=gathered / blurred,
+        scale=f,
+    )
+    note = f"{found} tops set levels" + (f", {ignored} too faint" if ignored else "")
+    return with_mask(state, field, note, bright=bright, level=np.nan)
 
 
 @module(
@@ -1222,8 +1502,17 @@ def smooth_contours(state, window):
         "More: that many Fourier harmonics of the outline are kept: 2 to 4 give "
         "a rounded polygon, more follow the outline in more detail",
     ),
+    max_diameter_px=number(
+        0.0,
+        0,
+        1e5,
+        1,
+        "Contours of a larger equal-area diameter keep their outline: a pad or a "
+        "line is no ellipse; 0: every closed contour is simplified",
+        "px",
+    ),
 )
-def simplify_shape(state, harmonics):
+def simplify_shape(state, harmonics, max_diameter_px):
     """Reduce every closed contour to a simple shape of the same area: an
     ellipse, or the lowest harmonics of its outline (Fourier descriptors). A
     hole of four pixels carries only a few numbers' worth of shape; the rest of
@@ -1233,4 +1522,12 @@ def simplify_shape(state, harmonics):
     contours = need_contours(state, "Simplify shape")
     simple = geometry.fourier_shape(contours, harmonics)
     note = "ellipses" if harmonics <= 1 else f"{harmonics} harmonics"
+    if max_diameter_px > 0 and len(contours):
+        wide = np.nan_to_num(geometry.measure(contours)["diameter"])
+        wide = wide > max_diameter_px * state.scale
+        if wide.any():
+            parts = zip(contours.split(), simple.split(), wide)
+            kept = [old if is_wide else new for old, new, is_wide in parts]
+            simple = geometry.from_list(kept, contours.closed, contours.left_out)
+            note += f", {int(wide.sum())} wide ones kept as they are"
     return replace(state, contours=simple, note=note)

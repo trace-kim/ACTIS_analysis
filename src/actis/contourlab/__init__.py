@@ -20,6 +20,8 @@ from .contours import Contours, measure
 from .modules import MODULES, STAGES, State, WorkflowError, image_contours
 from .sources import ImageFile, load_image
 from .workflow import (
+    GROUPS,
+    GUIDE,
     PRESETS,
     START,
     Run,
@@ -33,6 +35,8 @@ from .workflow import (
 )
 
 __all__ = [
+    "GROUPS",
+    "GUIDE",
     "MODULES",
     "PRESETS",
     "STAGES",

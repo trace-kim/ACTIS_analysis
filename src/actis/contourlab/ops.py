@@ -11,12 +11,15 @@ the zero of the field's cubic-spline interpolation.
 """
 
 import os
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from contourpy import LineType, contour_generator
 from PIL import Image
-from scipy import ndimage
+from scipy import fft as sfft
+from scipy import ndimage, stats
+from scipy.spatial import cKDTree
 
 from . import contours as geometry
 from .contours import Contours
@@ -71,10 +74,21 @@ def blur(image, sigma):
     return ndimage.gaussian_filter(image, sigma, mode="nearest") if sigma > 0 else image
 
 
-def blur_noise_gain(sigma):
-    """Factor by which a Gaussian blur of this sigma lowers white pixel noise."""
+def blur_noise_gain(sigma, band=None):
+    """Factor by which a Gaussian blur of this sigma lowers pixel noise: white
+    noise, or (band = (cutoff along x, along y), cycles per pixel) noise that a
+    low pass has confined to those frequencies already, which a blur lowers
+    much less."""
     if sigma <= 0:
         return 1.0
+    if band is not None:
+        f = (np.arange(128) + 0.5) / 128 - 0.5
+        fx, fy = np.meshgrid(f, f)
+        inside = (fx / band[0]) ** 2 + (fy / band[1]) ** 2 <= 1
+        if not inside.any():
+            return 1.0
+        passed = np.exp(-4 * np.pi**2 * sigma**2 * (fx**2 + fy**2))
+        return float(np.sqrt(passed[inside].mean()))
     impulse = np.zeros(2 * int(4 * sigma + 1) + 1)
     impulse[len(impulse) // 2] = 1
     return float((ndimage.gaussian_filter1d(impulse, sigma) ** 2).sum())
@@ -652,3 +666,397 @@ def runs(contours, keep):
     pieces = Contours(points, start, closed, contours.left_out)
     enough = np.diff(start) >= np.where(closed, 3, 2)
     return pieces.select(enough), origin[enough]
+
+
+# --- What the optics pass, and what is noise --------------------------------
+#
+# An actinic image holds no detail finer than its optics resolve: beyond their
+# cutoff the spectrum of the image is detector noise only. ACTIS samples about
+# twice as finely as that cutoff needs, so most of the frequency plane carries
+# noise and no pattern, and can be removed without touching an edge.
+
+
+def _tile_power(a, side, most=4):
+    """Mean windowed periodogram of up to most x most tiles of `side` pixels,
+    and how many tiles it is the mean of."""
+    h, w = a.shape
+    taper = np.hanning(side) ** 2  # its leakage falls off fast enough for 16 bits
+    window = np.outer(taper, taper).astype(np.float32)
+    total, count = np.zeros((side, side)), 0
+    for y in np.linspace(0, h - side, max(1, min(most, h // side))).astype(int):
+        for x in np.linspace(0, w - side, max(1, min(most, w // side))).astype(int):
+            part = a[y : y + side, x : x + side]
+            total += np.abs(sfft.fft2((part - part.mean()) * window)) ** 2
+            count += 1
+    return total / count, count
+
+
+def pass_band(image, keep=0.1):
+    """(along x, along y): the highest spatial frequencies, in cycles per pixel,
+    at which the image holds pattern above its noise. (0.5, 0.5): up to the
+    sampling limit, nothing to remove.
+
+    The averaged periodogram of up to sixteen tiles is compared with its noise
+    floor (the corners of the spectrum, as noise_sigma). Off the two axes, the
+    band ends after the last ring in which the mean power exceeds the floor by
+    more than `keep` of it, or in which a single harmonic of a repeating
+    pattern stands out of the noise. On the axes, where line patterns aligned with the
+    pixel grid put all their harmonics and where stripe noise lies too, it ends
+    after the last isolated peak far above that axis's own level.
+    """
+    a = np.asarray(image, dtype=np.float32)
+    side = int(min(256, *a.shape)) // 2 * 2
+    if side < 48:
+        return 0.5, 0.5
+    power, count = _tile_power(a, side)
+    frequency = np.abs(np.fft.fftfreq(side))
+    fy, fx = frequency[:, None], frequency[None, :]
+    corner = (fx > 0.3) & (fy > 0.3)
+    # the median of a mean of `count` exponentials, as a share of their mean
+    floor = float(np.median(power[corner])) / stats.gamma.median(count, scale=1 / count)
+    if not floor > 0:
+        return 0.5, 0.5
+    radius = np.hypot(fx, fy)
+    # the power noise alone reaches in one of a thousand spectra, in any of its values
+    harmonic = floor * stats.gamma.isf(1e-3 / power.size, count, scale=1 / count)
+    near_axis = 1.5 / side
+    edges = np.arange(0.06, 0.5 + 1e-9, 1 / 64)
+    found = []
+    for along_x in (True, False):
+        sector = (fx > near_axis) & (fy > near_axis)
+        sector = sector & ((fx >= fy) if along_x else (fy > fx))
+        ring = np.digitize(radius[sector], edges)
+        total = np.bincount(ring, power[sector], len(edges) + 1)[1:-1]
+        counts = np.bincount(ring, minlength=len(edges) + 1)[1:-1]
+        # a ring's mean is only known to about 1 / sqrt(its independent values): on
+        # a small image noise alone would look like pattern in some ring
+        unsure = 4 / np.sqrt(np.maximum(counts, 1) * count / 2)
+        above = total / np.maximum(counts, 1) / floor - 1 > np.maximum(keep, unsure)
+        last = np.flatnonzero(above[:-1] & above[1:])  # two rings in a row
+        cut = edges[last[-1] + 2] if len(last) else edges[0]
+        # a repeating pattern puts its power in a few harmonics, which a ring's
+        # mean hides: the band reaches as far as any harmonic stands out
+        peaks = np.bincount(ring, power[sector] > harmonic, len(edges) + 1)[1:-1]
+        outer = np.flatnonzero(peaks)
+        if len(outer):
+            cut = max(cut, edges[outer[-1] + 1])
+        # the axis itself: the strongest of its three lines of the spectrum
+        lines = power[[0, 1, -1], :] if along_x else power[:, [0, 1, -1]].T
+        line = lines.max(axis=0)[: side // 2]
+        along = frequency[: side // 2]
+        level = float(np.median(line[along > 0.1]))
+        peaks = np.flatnonzero((line > 30 * level) & (along > 0.06))
+        if len(peaks):
+            cut = max(cut, along[peaks[-1]] + 2 / side)
+        found.append(float(min(cut, 0.5)))
+    return found[0], found[1]
+
+
+def optical_filter(
+    image, cutoff_x, cutoff_y, deblur_x=0.0, deblur_y=0.0, max_gain=3.0, edge=0.15
+):
+    """(the image without what lies beyond the cutoffs, the factor by which its
+    pixel noise changed).
+
+    A low pass in the frequency plane: all of the ellipse with half axes
+    cutoff_x and cutoff_y (cycles per pixel), nothing beyond 1 + `edge` times
+    it, a smooth step between. deblur_x, deblur_y: sigma in pixels of a
+    Gaussian blur divided out inside the band, by at most max_gain at any
+    frequency. The image is mirrored at its borders first, so that they do not
+    ring.
+    """
+    a = np.asarray(image, dtype=np.float32)
+    h, w = a.shape
+    pad_y, pad_x = min(32, h), min(32, w)
+    rows = sfft.next_fast_len(h + 2 * pad_y, real=True)
+    cols = sfft.next_fast_len(w + 2 * pad_x, real=True)
+    padded = np.pad(
+        a, ((pad_y, rows - h - pad_y), (pad_x, cols - w - pad_x)), mode="symmetric"
+    )
+    spectrum = sfft.rfft2(padded, workers=-1)
+    fy = np.abs(sfft.fftfreq(rows)).astype(np.float32)[:, None]
+    fx = sfft.rfftfreq(cols).astype(np.float32)[None, :]
+    reach = np.hypot(fx / np.float32(cutoff_x), fy / np.float32(cutoff_y))
+    gain = np.clip((1 + edge - reach) / edge, 0, 1)
+    gain = gain * gain * (3 - 2 * gain)
+    if deblur_x > 0 or deblur_y > 0:
+        blur = np.exp(-2 * np.pi**2 * ((deblur_x * fx) ** 2 + (deblur_y * fy) ** 2))
+        gain = gain / np.maximum(blur, 1 / max_gain)
+    gain = gain.astype(np.float32)
+    spectrum *= gain
+    out = sfft.irfft2(spectrum, s=(rows, cols), workers=-1)
+    # Each column of the half plane stands for two of the whole, but the first
+    # (and the last, if the width is even).
+    weight = np.full(gain.shape[1], 2.0)
+    weight[0] = 1.0
+    if cols % 2 == 0:
+        weight[-1] = 1.0
+    squared = (gain.astype(np.float64) ** 2 * weight).sum()
+    noise_gain = float(np.sqrt(squared / (rows * cols)))
+    return np.ascontiguousarray(out[pad_y : pad_y + h, pad_x : pad_x + w]), noise_gain
+
+
+def noise_by_level(image, bins=24):
+    """How the pixel noise depends on the grey level: (levels, sigmas), rising
+    levels, for np.interp. Shot noise makes bright areas noisier than dark
+    ones, so one sigma for a page that holds both fits neither.
+
+    The noise is what the image holds in the corners of its spectrum (both
+    frequencies above 0.3 cycles per pixel, without the lattice harmonics that
+    stand out there); its strength is taken per class of local brightness.
+    """
+    a = np.asarray(image, dtype=np.float32)
+    h, w = a.shape
+    overall = noise_sigma(a)
+    flat = np.array([float(a.min()), float(a.max()) + 1.0]), np.array([overall] * 2)
+    if min(h, w) < 48 or not overall > 0:
+        return flat
+    spectrum = sfft.rfft2(a, workers=-1)
+    fy = np.abs(sfft.fftfreq(h))[:, None]
+    fx = sfft.rfftfreq(w)[None, :]
+    corner = (fx > 0.3) & (fy > 0.3)
+    power = spectrum.real**2 + spectrum.imag**2
+    typical = float(np.median(power[corner]))
+
+    # the corners come in gently (from 0.25 to 0.4 cycles per pixel), so that the
+    # noise of a bright area does not ring far into a dark one beside it
+    def rise(f):
+        t = np.clip((f - 0.25) / 0.15, 0, 1)
+        return t * t * (3 - 2 * t)
+
+    weight = rise(fx) * rise(fy) * (power <= 12 * typical)
+    share = 2.0 * float((weight**2).sum()) / (h * w)  # of the whole frequency plane
+    if not share > 0.01:
+        return flat
+    spectrum *= weight
+    rest = sfft.irfft2(spectrum, s=(h, w), workers=-1)
+    local = ndimage.gaussian_filter(a, 1.5, mode="nearest")
+    stride = max(1, int(np.sqrt(a.size / 1_000_000)))
+    level = local[::stride, ::stride].ravel()
+    square = (rest[::stride, ::stride] ** 2).ravel()
+    order = np.argsort(level)
+    groups = np.array_split(order, max(2, min(bins, len(order) // 2000)))
+    levels = np.array([np.median(level[g]) for g in groups], dtype=float)
+    # the median of a squared normal deviate is 0.4549 of its variance
+    sigmas = np.sqrt([np.median(square[g]) / 0.4549 / share for g in groups])
+    sigmas = np.maximum(sigmas, 0.1 * overall)  # a clipped area has no noise to measure
+    keep = np.concatenate([[True], np.diff(levels) > 0])
+    return levels[keep], sigmas[keep]
+
+
+_noise_maps = {}  # id(image) -> (weak reference to it, its noise map, its overall noise)
+
+
+def noise_map(image):
+    """(sigma of the pixel noise at every pixel, the one sigma of the whole
+    image): the noise each pixel's local brightness goes with (noise_by_level).
+    Kept for as long as the image is, so that asking again costs nothing."""
+    kept = _noise_maps.get(id(image))
+    if kept is not None and kept[0]() is image:
+        return kept[1], kept[2]
+    a = np.asarray(image, dtype=np.float32)
+    levels, sigmas = noise_by_level(a)
+    local = ndimage.gaussian_filter(a, 1.5, mode="nearest")
+    sigma = np.interp(local, levels, sigmas).astype(np.float32)
+    overall = noise_sigma(a)
+    key = id(image)
+    try:
+        watch = weakref.ref(image, lambda _: _noise_maps.pop(key, None))
+    except TypeError:  # not an array that can be watched: made again next time
+        return sigma, overall
+    _noise_maps[key] = (watch, sigma, overall)
+    return sigma, overall
+
+
+# --- Levels of each feature's own ------------------------------------------
+
+_QUADRIC = np.linalg.pinv(
+    np.array(
+        [[1, x, y, x * x, x * y, y * y] for y in (-1, 0, 1) for x in (-1, 0, 1)],
+        dtype=float,
+    )
+)
+
+
+_GATHER = 0.8  # sigma of the smoothing a feature is told from noise in, pixels
+
+
+def peak_values(image, ys, xs, base):
+    """The image's value at the top of the peak at each of the pixels (ys, xs),
+    between the pixels. A hole only a few pixels wide is as much as a tenth
+    brighter at its top than at the centre of the pixel nearest to it, by an
+    amount that depends on where the hole lies on the pixel grid.
+
+    base (M,): the dark level under each peak. The top is that of the quadric
+    fitted to the logarithm of the 3 x 3 values above the base, which is exact
+    for a Gaussian peak and close for a blurred opening.
+    """
+    h, w = image.shape
+    values = np.stack(
+        [
+            image[np.clip(ys + dy, 0, h - 1), np.clip(xs + dx, 0, w - 1)]
+            for dy in (-1, 0, 1)
+            for dx in (-1, 0, 1)
+        ],
+        axis=1,
+    ).astype(float)
+    above = values - base[:, None]
+    height = above[:, 4]
+    usable = height > 0
+    scale = np.where(usable, height, 1.0)
+    c = np.log(np.maximum(above / scale[:, None], 1e-3)) @ _QUADRIC.T
+    bend = 4 * c[:, 3] * c[:, 5] - c[:, 4] ** 2
+    dome = usable & (bend > 0) & (c[:, 3] < 0)
+    safe = np.where(dome, bend, 1.0)
+    dx = np.clip((c[:, 4] * c[:, 2] - 2 * c[:, 5] * c[:, 1]) / safe, -0.75, 0.75)
+    dy = np.clip((c[:, 4] * c[:, 1] - 2 * c[:, 3] * c[:, 2]) / safe, -0.75, 0.75)
+    # the fitted surface at its top, less what it is at the centre pixel
+    rise = np.where(dome, 0.5 * (c[:, 1] * dx + c[:, 2] * dy), 0.0)
+    return base + height * np.exp(np.clip(rise, 0.0, 0.5))
+
+
+def feature_field(
+    image,
+    sigma,
+    fraction=0.5,
+    peers=1,
+    min_contrast=10.0,
+    reach=48,
+    smooth=1.0,
+    gathered_gain=None,
+    scale=1,
+):
+    """(field, how many tops set levels, how many were ignored as noise): the
+    image minus a threshold level that the features set for themselves.
+
+    A feature is anything with a top: a hole, a line, a pad.
+    Which tops count. A top must stand out: above the pass to any higher
+    ground within eight pixels by four noise sigma and by a fifth of its
+    height over its surround, so that a noise bump on the ridge between two
+    holes, or a second bump on one hole, is no top. It must not lie on the
+    border of the image, where a feature's top is outside. It must have an edge
+    within reach: in the image smoothed by 0.8 px (which gathers a feature's
+    light, so that a faint hole is told from noise by all of its pixels), the
+    lowest value around it falls by min_contrast noise sigma between one
+    distance and four times it, for distances of 2, 4, 8 ... pixels up to
+    about `reach`, by more than twice the fall over the distances before (as
+    brightness that slopes evenly would). A bump on an empty area fails that,
+    also where the area is bright, uneven, and noisier than the dark. And its
+    dark level must not lie
+    above the middle level of its eight nearest tops: one that does is a
+    ripple on top of a feature.
+    Its two levels. Bright: the image at the top, between the pixels. Dark:
+    the lowest value of the smoothed image around the top (a valley read from
+    single pixels depends on where the pixels fall in it), taken further and
+    further out until going twice as far no longer finds anything lower by a
+    tenth of the contrast. peers > 1: both are the medians over the top's
+    `peers` nearest tops of like contrast (within a factor of 1.4 of its own).
+    The field. Every pixel takes the level, dark + fraction x (bright - dark),
+    of the top nearest to it, so a wide feature is inside all the way to its
+    middle and an empty area is outside; `smooth` (sigma, pixels) rounds the
+    steps between neighbouring levels. Without any top the field is negative
+    everywhere.
+    sigma: the pixel noise of the image, a number or a map. gathered_gain: the
+    factor by which the 0.8 px smoothing lowers that noise (None: as for
+    white noise; less is gained on an image that was blurred already).
+    scale: pixels of the image per pixel of the detector (an upscaled image):
+    every distance above but `reach` is in detector pixels.
+    """
+    a = np.asarray(image, dtype=np.float32)
+    nothing = np.full(a.shape, -1.0, np.float32)
+    span = float(a.max()) - float(a.min())
+    if not span > 0:
+        return nothing, 0, 0
+    noise = np.maximum(np.asarray(sigma, dtype=np.float32), np.float32(1e-4 * span))
+    noise = np.broadcast_to(noise, a.shape)
+    if gathered_gain is None:
+        gathered_gain = blur_noise_gain(_GATHER)
+    scale = int(scale)
+    gathered = ndimage.gaussian_filter(a, _GATHER * scale, mode="nearest")
+    first = 4 * scale + 1  # a window of 5 detector pixels, then 9, then 17
+    lows = [ndimage.minimum_filter(gathered, size=first, mode="nearest")]
+    for size in (first, 2 * first - 1):
+        lows.append(ndimage.minimum_filter(lows[-1], size=size, mode="nearest"))
+    # tops that stand out: what is left of a top after the ground around it has
+    # risen to within `stand` of every higher top near it
+    stand = np.maximum(4 * noise, np.float32(0.2) * (a - lows[2]))
+    sunk = a - stand
+    flood = sunk
+    for _ in range(8):
+        risen = ndimage.maximum_filter(flood, size=2 * scale + 1, mode="nearest")
+        flood = np.minimum(risen, a)
+    # equal neighbours (8-bit flats) take turns, by an amount far below a grey level
+    jitter = np.random.default_rng(0).random(a.shape, dtype=np.float32)
+    order = a + jitter * np.float32(1e-5 * span)
+    tops = order == ndimage.maximum_filter(order, size=3, mode="nearest")
+    tops &= flood <= sunk + np.float32(1e-6 * span)
+    # What is brightest at the very border of the image has its top outside it:
+    # it sets no level of its own and takes its neighbours'.
+    tops[:scale] = tops[-scale:] = False
+    tops[:, :scale] = tops[:, -scale:] = False
+    del jitter, order, flood, sunk, stand
+    ys, xs = np.nonzero(tops)
+    if not len(ys):
+        return nothing, 0, 0
+    steps = [gathered[ys, xs].astype(float)] + [
+        low[ys, xs].astype(float) for low in lows
+    ]
+    low, size = lows[2], 4 * first - 3
+    del lows, gathered
+    while size < 2 * reach + 1:
+        low = ndimage.minimum_filter(low, size=size, mode="nearest")
+        size = 2 * size - 1
+        steps.append(low[ys, xs].astype(float))
+    del low
+    steps = np.stack(steps, axis=1)  # the top, then its surround ever further out
+    fall = steps[:, :-2] - steps[:, 2:]
+    # Brightness that slopes evenly falls twice as far over twice the distance:
+    # only what a fall exceeds that by is an edge.
+    fall[:, 1:] -= 2 * fall[:, :-1].copy()
+    needed = min_contrast * gathered_gain * noise[ys, xs]
+    real = fall.max(axis=1) >= needed
+    ignored = int((~real).sum())
+    ys, xs, steps, needed = ys[real], xs[real], steps[real], needed[real]
+    if not len(ys):
+        return nothing, 0, ignored
+    base, settled = steps[:, 1].copy(), np.zeros(len(ys), bool)
+    for k in range(2, steps.shape[1]):
+        # not before the edge is reached: on a flat top, noise alone looks settled
+        below = steps[:, 0] - base >= needed
+        now = ~settled & below
+        now &= base - steps[:, k] <= 0.1 * (steps[:, 0] - steps[:, k])
+        # the floor is what the wider look found: the same valley, seen whole
+        base = np.where(settled, base, steps[:, k])
+        settled |= now
+    top = peak_values(a, ys, xs, base)
+    if len(ys) > 2:
+        # A top that stands on ground its neighbours call the inside of a feature is a
+        # ripple on that feature (a bright area is never quite flat), not a feature.
+        tree = cKDTree(np.column_stack([xs, ys]))
+        _, near = tree.query(tree.data, k=min(9, len(ys)), workers=-1)
+        middle = np.median(((base + top) / 2)[near[:, 1:]], axis=1)
+        stands = base <= middle
+        ignored += int((~stands).sum())
+        ys, xs, top, base = ys[stands], xs[stands], top[stands], base[stands]
+    if peers > 1 and len(ys) > 1:
+        tree = cKDTree(np.column_stack([xs, ys]))
+        _, near = tree.query(tree.data, k=min(int(peers), len(ys)), workers=-1)
+        near = near.reshape(len(ys), -1)
+        contrast = np.maximum(top - base, 1e-9 * span)
+        ratio = contrast[near] / contrast[:, None]
+        alike = (ratio >= 1 / 1.4) & (ratio <= 1.4)
+        top = np.nanmedian(np.where(alike, top[near], np.nan), axis=1)
+        base = np.nanmedian(np.where(alike, base[near], np.nan), axis=1)
+    level = (base + fraction * (top - base)).astype(np.float32)
+    number = np.zeros(a.shape, np.int32)
+    number[ys, xs] = np.arange(len(ys), dtype=np.int32)
+    unmarked = np.ones(a.shape, bool)
+    unmarked[ys, xs] = False
+    nearest = ndimage.distance_transform_edt(
+        unmarked, return_distances=False, return_indices=True
+    )
+    levels = level[number[nearest[0], nearest[1]]]
+    del nearest, number, unmarked
+    if smooth > 0:
+        levels = ndimage.gaussian_filter(levels, smooth * scale, mode="nearest")
+    return a - levels, len(ys), ignored
