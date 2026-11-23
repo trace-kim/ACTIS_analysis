@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ACTIS contour lab</title>
+<link rel="stylesheet" href="/static/app.css?key={{key}}">
+</head>
+<body data-key="{{key}}">
+<header class="top">
+  <div class="brand"><span class="mark" aria-hidden="true"></span>ACTIS contour lab</div>
+  <button id="open-images" class="primary" title="Open PNG or TIFF images, each in a tab of its own (Ctrl+O). Or drop files on the window.">Open images…</button>
+  <span class="grow"></span>
+  <label class="field" title="Size of one image pixel on the mask. Lengths are also given in nanometres with it.">Pixel <input id="pixel-nm" type="number" min="0" step="0.1" value="21"> nm</label>
+  <label class="check" title="Keep the same place and zoom when switching between tabs whose images have the same size: switch back and forth to compare them.">
+    <input id="sync-view" type="checkbox" checked> Same view in all tabs</label>
+  <button id="help" title="What the window does, and its keys (F1)">Help</button>
+</header>
+
+<nav class="tabs" id="tabs" aria-label="Open images"></nav>
+
+<main>
+  <section class="stage">
+    <div class="toolbar" id="source-bar"></div>
+    <div class="toolbar" id="view-bar">
+      <span class="group" role="group" aria-label="What is shown">
+        <span class="label">Show</span>
+        <span class="segmented" id="view-of">
+          <button data-value="result" title="What the whole workflow made: the state after its last step">result</button>
+          <button data-value="step" title="What the workflow had made after the step selected in the list: to see what each step does">selected step</button>
+        </span>
+      </span>
+      <span class="group" role="group" aria-label="Image under the layers">
+        <span class="label">on</span>
+        <span class="segmented" id="image-of">
+          <button data-value="processed" title="The image as the image modules made it, up to the step shown (O switches)">processed</button>
+          <button data-value="original" title="The image as loaded (O switches)">original</button>
+        </span>
+      </span>
+      <span class="group layers" role="group" aria-label="Layers">
+        <label class="check swatch contours" title="The contours at the step shown (C)"><input type="checkbox" data-layer="contours" checked><i></i>Contours</label>
+        <label class="check swatch before" title="The contours as they were before the step that last changed them"><input type="checkbox" data-layer="before"><i></i>Before</label>
+        <label class="check swatch centres" title="The area centroid of every closed contour"><input type="checkbox" data-layer="centres"><i></i>Centres</label>
+        <label class="check swatch mask" title="The mask at the step shown: the pixels a threshold took (M)"><input type="checkbox" data-layer="mask"><i></i>Mask</label>
+        <label class="check swatch pinned" title="The contours you pinned, to compare another workflow with them"><input type="checkbox" data-layer="pinned" checked><i></i>Pinned</label>
+        <button id="pin" title="Keep the contours shown now as a second layer, in this tab, while you change the workflow (P). Again: let them go.">Pin</button>
+      </span>
+      <span class="grow"></span>
+      <span class="group" role="group" aria-label="Zoom">
+        <button id="zoom-fit" title="Show the whole image (0)">Fit</button>
+        <button id="zoom-one" title="One image pixel per screen pixel (1)">1:1</button>
+        <button id="zoom-out" title="Zoom out (-)">−</button>
+        <button id="zoom-in" title="Zoom in (+). The wheel zooms at the pointer; drag moves the image.">+</button>
+        <span id="zoom" class="mono dim"></span>
+      </span>
+    </div>
+    <div class="toolbar" id="display-bar">
+      <span class="group" id="region-group" role="group" aria-label="Region the workflow runs on">
+        <span class="label" title="The part of the image the workflow runs on. A small region answers at once while you try options.">Region</span>
+        <span id="region-text" class="mono"></span>
+        <button id="region-whole" title="Run the workflow on the whole image">Whole image</button>
+        <button id="region-view" title="Run the workflow on the part of the image the window shows now">Current view</button>
+        <span class="dim">Shift + drag draws one</span>
+      </span>
+      <span class="grow"></span>
+      <span class="group" role="group" aria-label="Grey levels of the display">
+        <span class="label" title="The grey levels shown as black and as white. They change the display only, never the workflow.">Levels</span>
+        <label class="check"><input id="levels-auto" type="checkbox" checked> auto</label>
+        <input id="level-black" type="number" class="level" title="Grey level shown as black" disabled>
+        <input id="level-white" type="number" class="level" title="Grey level shown as white" disabled>
+        <label class="check" title="Interpolate between the pixels when zoomed in. Off: every pixel as a square, as the detector recorded it."><input id="smooth" type="checkbox"> smooth</label>
+      </span>
+    </div>
+
+    <div class="viewport" id="viewport">
+      <canvas id="view" tabindex="0" aria-label="Image with the contours found in it. Wheel zooms, drag moves, Shift and drag draws the region."></canvas>
+      <canvas id="map" class="map" title="The whole image; the frame is what the window shows. Click or drag to go there."></canvas>
+      <div class="empty" id="empty">
+        <h2>Find the contours in ACTIS images</h2>
+        <p>Open one or more PNG or TIFF images. Each gets a tab; the workflow on the right runs on the image
+          in front, and switching tabs shows what it finds in the others. A multi-page TIFF is shown page by page,
+          or with pages stacked into one strip.</p>
+        <p><button class="primary" id="open-images-2">Open images…</button> <span class="dim">or drop files anywhere on the window</span></p>
+      </div>
+      <div class="notice" id="notice" hidden></div>
+    </div>
+    <div class="readout mono" id="readout">&nbsp;</div>
+    <div class="summary" id="summary">
+      <div class="summary-text" id="summary-text"></div>
+      <canvas id="histogram" width="260" height="74" title="How many closed contours have each equal-area diameter"></canvas>
+      <div class="exports">
+        <span class="label">Export</span>
+        <button data-export="csv" title="One row per contour: centre, area, diameter, width, height, axes (px and nm)">CSV</button>
+        <button data-export="json" title="Every contour with its points and measures, and the workflow that made them">JSON</button>
+        <button data-export="npz" title="NumPy arrays: xy, start, closed and the measures; np.split(xy, start[1:-1]) gives the contours">NPZ</button>
+        <button id="snapshot" title="The image as the window shows it now, with its layers, as a PNG">Snapshot</button>
+      </div>
+    </div>
+  </section>
+
+  <aside class="flow" aria-label="Workflow">
+    <div class="flow-head">
+      <div class="flow-title"><span class="label">Workflow</span> <b id="flow-name"></b></div>
+      <div class="row">
+        <button id="examples" title="Workflows to start from, for different kinds of ACTIS image">Examples ▾</button>
+        <button id="flow-open" title="Open a workflow saved in a file; or drop the file on the window">Open…</button>
+        <button id="flow-save" title="Save the workflow in a file (Ctrl+S): to open it here another day, or to run it without this window (actis.contourlab.load_workflow)">Save…</button>
+        <span class="grow"></span>
+        <span class="segmented" id="scope" title="Whether this workflow is the one every tab runs, or this tab's own. Give a tab its own to compare two workflows on one image: duplicate the tab, and switch between the two.">
+          <button data-value="all">all tabs</button>
+          <button data-value="own">this tab</button>
+        </span>
+      </div>
+    </div>
+    <ol class="steps" id="steps"></ol>
+    <div class="row step-buttons">
+      <button id="step-add" title="Put a module into the workflow, after the step selected or at the nearest place where a module of its kind belongs">Add step ▾</button>
+      <button id="step-remove" title="Take the step selected out of the workflow (Ctrl+Delete)">Remove</button>
+      <button id="step-up" title="Run the step selected one step earlier (Alt+↑)">↑</button>
+      <button id="step-down" title="Run the step selected one step later (Alt+↓)">↓</button>
+    </div>
+    <div class="options" id="options"></div>
+    <div class="flow-foot">
+      <label class="check" title="Run the workflow again after every change of an option, of the steps or of the image. Off (a slow workflow, several changes at once): Process runs it.">
+        <input id="auto" type="checkbox" checked> Auto process</label>
+      <span id="busy" class="dim"></span>
+      <span class="grow"></span>
+      <button id="process" title="Run the workflow on the image now (F5)">Process</button>
+    </div>
+  </aside>
+</main>
+
+<div class="menu" id="menu" hidden></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<dialog id="open-dialog" class="dialog">
+  <form method="dialog">
+    <h2>Open images</h2>
+    <div class="row">
+      <input id="folder" type="text" spellcheck="false" aria-label="Folder, or the path of an image" placeholder="Folder, or the path of an image">
+      <button type="button" id="folder-go">Go</button>
+      <button type="button" id="folder-up" title="The folder this one is in">Up</button>
+    </div>
+    <div class="row wrap" id="places"></div>
+    <div class="files" id="files" tabindex="0" role="listbox" aria-multiselectable="true"></div>
+    <div class="row">
+      <span class="dim" id="chosen">Click a file; Ctrl or Shift + click for several.</span>
+      <span class="grow"></span>
+      <button type="button" id="open-cancel">Cancel</button>
+      <button type="button" id="open-ok" class="primary">Open</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="help-dialog" class="dialog help">
+  <form method="dialog">
+    <h2>Contour lab</h2>
+    <p>A <b>workflow</b> is a list of steps. Each step is a module: <b>Image</b> modules change the grey-level
+      image, <b>Mask</b> modules mark the pattern's pixels, <b>Contours</b> modules make contours and choose, move
+      or smooth them. The list on the right runs from top to bottom on the image in front, and says beside every
+      step what it found and how long it took. Untick a step to see the result without it.</p>
+    <p><b>Examples</b> holds workflows to start from. <b>Show: selected step</b> shows what the workflow had made
+      after the step you click in the list. <b>Pin</b> keeps the contours on screen as a second layer while you
+      change the workflow, to compare the two.</p>
+    <p><b>Tabs</b> hold one image each. With <i>all tabs</i>, every tab runs the same workflow: switch tabs to
+      see it on the other images. With <i>this tab</i>, the tab in front keeps a workflow of its own: duplicate
+      a tab and give the copy another workflow to compare the two on one image.</p>
+    <p><b>TIFF pages:</b> the page box and its arrows go through the pages; <i>Stack</i> joins pages into one
+      strip (<i>reverse</i> and <i>flip</i> for stripes scanned upwards). A workflow runs on the <b>region</b>:
+      the whole image, or on large strips the part you choose with Shift + drag or <i>Current view</i>.</p>
+    <table class="keys">
+      <tr><td>Wheel · drag</td><td>zoom at the pointer · move the image</td></tr>
+      <tr><td>Shift + drag</td><td>draw the region the workflow runs on</td></tr>
+      <tr><td>Click a contour</td><td>its measures; Esc lets it go</td></tr>
+      <tr><td>0 · 1 · + · −</td><td>whole image · one pixel per pixel · zoom</td></tr>
+      <tr><td>Arrow keys</td><td>move the image (when the image has the focus)</td></tr>
+      <tr><td>Space (held)</td><td>hide the layers: the bare image</td></tr>
+      <tr><td>O · C · M · P</td><td>original / processed · contours · mask · pin</td></tr>
+      <tr><td>[ · ]</td><td>the tab before · after</td></tr>
+      <tr><td>, · .</td><td>the page before · after (TIFF)</td></tr>
+      <tr><td>F5</td><td>process now</td></tr>
+      <tr><td>Ctrl+O · Ctrl+S</td><td>open images · save the workflow</td></tr>
+      <tr><td>Alt+↑ · Alt+↓ · Ctrl+Del</td><td>move · remove the step selected</td></tr>
+    </table>
+    <p class="dim">Coordinates are (x, y) = (column, row) in pixels of the image as loaded, from 0 at the centre
+      of its first pixel, y pointing down. The grey levels shown never change what a workflow finds.</p>
+    <div class="row"><span class="grow"></span><button class="primary">Close</button></div>
+  </form>
+</dialog>
+
+<input type="file" id="flow-file" accept=".json,application/json" hidden>
+<script src="/static/app.js?key={{key}}"></script>
+<script src="/static/view.js?key={{key}}"></script>
+</body>
+</html>

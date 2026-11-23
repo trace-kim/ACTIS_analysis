@@ -38,6 +38,52 @@ For a single-image lattice harmonic walkthrough, run the following command from 
 
 The inspector accepts single-channel 8- and 16-bit bright-opening PNGs and TIFFs. It defaults to 128 px tiles and automatic shape discovery. Set `--tile-px` for another tile side, `--page` for a zero-based TIFF page, or `--pixel-nm` for calibrated units. The report embeds its image pyramid and measurements in one file. Hover over a pixel for its native DN, click a Fourier order to see its pixel contributions, or use **Hole detail** to compare the fitted tile-average opening with the image.
 
+## Find contours interactively
+
+The contour lab is a window for trying combinations of image-processing steps on real images until the contours sit where they should. It opens in the browser and is served from this PC only. It needs nothing beyond the base install.
+
+~~~powershell
+.\.venv\Scripts\python -m actis.contourlab "D:\ACTIS\reference-pngs\ref-01.png" "D:\ACTIS\stripes\2_1_1.tiff"
+~~~
+
+The command prints an address, opens it, and keeps running until Ctrl+C. Images can also be opened from the window (**Open images…**, Ctrl+O) or dropped on it. `.\.venv\Scripts\actis contours` and `python scripts\contour_lab.py` start the same window. Plain TIFFs are read with Pillow. For compressed or very large stacks, install the faster reader with `pip install -e ".[tiff]"`.
+
+- **Tabs.** Every image gets a tab. With **all tabs** selected, every tab runs the same workflow, so switching tabs shows it on the other images, at the same place and zoom when the images have the same size. With **this tab**, the tab in front keeps a workflow of its own. **Duplicate tab** opens the same image again to compare two workflows on it.
+- **TIFF pages.** A multi-page TIFF is shown one page at a time, with arrows and a page box. **Stack** joins consecutive pages below each other into one strip. **reverse order** and **flip pages** undo the storage order of stripes scanned upwards.
+- **Region.** A workflow runs on the whole image, or on a region drawn with Shift + drag. A small region answers at once while options are tried. An image above 6 million pixels starts with a region at its top (the first page of a strip), and a region can hold at most 24 million pixels.
+- **The image.** The wheel zooms at the pointer and dragging moves the image. The line under the image gives the pointer's position, the grey level there, the page and row in a strip, and the diameter of the contour under it. Clicking a contour lists its measures. **Pin** keeps the current contours as a second layer while the workflow is changed.
+- **The workflow.** Steps run from top to bottom. Each is a module of one of three kinds: *Image* modules change the grey levels, *Mask* modules mark the pattern, *Contours* modules make contours and choose, move or smooth them. Every module and option is explained in the panel. **Show: selected step** displays what the workflow had made after the step clicked in the list.
+- **Results.** Contours export as CSV (one row of measures per contour), JSON (with points and the workflow) or NPZ. Lengths are also given in nanometres using the pixel size in the top bar.
+
+Contours are traced between the pixels: a threshold keeps the image minus its level, and the outline is the zero line of that on the cubic spline through the pixel values. A four-pixel hole gets a smooth outline with no upscaling.
+
+**Examples** holds twelve workflows to start from. The table gives their results on synthetic acquisitions from this repository's renderer: 256 × 224 px, eight repeats with gain, offset, illumination, blur, shift and noise varied. The three cases are (A) 80 nm squares at 6.77 px pitch, (B) 100 nm circles at 12 px, staggered, and (C) 70 nm squares at 6 px with stronger blur. Repeatability is the median over sites of the standard deviation of the equal-area diameter across the eight repeats. Size response is the slope of measured against true diameter, where 1 means a size difference is followed one to one.
+
+| Example | Holes found | Repeatability, nm (A / B / C) | Size response (A / B / C) |
+|---|---|---|---|
+| Bright holes: local half level | 100 % | 0.80 / 0.90 / 2.37 | 1.09 / 1.05 / 1.36 |
+| Bright holes: deblurred | 100 % | 0.76 / 0.61 / 2.14 | 1.07 / 1.07 / 1.13 |
+| Bright holes: each hole's own half maximum | 100 % | 1.01 / 1.12 / 2.24 | 0.78 / 0.82 / 0.51 |
+| Bright holes: one level for the image (Otsu) | 99–100 % | 1.23 / 2.65 / 4.16 | 1.21 / 1.19 / 1.67 |
+| Bright holes: steepest gradient | 100 % | 2.08 / 1.80 / 2.31 | 0.92 / 1.00 / 0.49 |
+| Edges without a threshold | 99.5–100 % | 0.97 / 0.91 / 1.84 | 0.68 / 0.87 / 0.29 |
+| Noisy pages | 100 % | 0.77 / 1.43 / 3.27 | 1.14 / 1.05 / 1.67 |
+| Pixel mask route (upscaled) | 100 % | 1.22 / 0.91 / 2.03 | 0.73 / 0.83 / 0.34 |
+| Benchmark radial contour | 93–96 % | 1.56 / 1.00 / 2.34 | 0.73 / 0.85 / 0.35 |
+
+*Any pattern* (lines, pads, mixed pages), *Dark features on a bright background* and *One ellipse per hole* use the local half level and score as it does on these arrays. On an 8-bit version of case A with a contrast of ten noise sigma, all holes are still found; repeatability is 2.8 nm for the local half level and 4.6 nm for the benchmark's radial contour. Every example except the benchmark's radial contour gives no contours on a page of noise alone. These numbers describe the renderer's optics, which have no calibration to the instrument. Use them to choose where to start, and judge the contours on real images.
+
+The size of the tiles the local levels come from (`window_px` of the Mid-level threshold, 128 px by default) decides how much of a regional difference is taken for illumination. Smaller tiles follow illumination more closely and follow a regional difference in hole size less.
+
+A workflow saved from the window (**Save…**) runs without it:
+
+~~~python
+from actis.contourlab import load_image, load_workflow, measure, workflow_contours
+
+contours = workflow_contours(load_image("2_1_1.tiff", page=17), load_workflow("my workflow.json"))
+diameters_px = measure(contours)["diameter"]  # one per contour; contours.split() gives the points
+~~~
+
 ## Try a complete study without mask data
 
 ~~~powershell

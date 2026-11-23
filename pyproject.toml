@@ -8,22 +8,25 @@ version = "0.1.0"
 description = "Reference-image CD and placement benchmark for actinic EUV photomask inspection"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.26", "scipy>=1.11", "pillow>=10", "matplotlib>=3.8"]
+dependencies = ["numpy>=1.26", "scipy>=1.11", "pillow>=10", "matplotlib>=3.8", "contourpy>=1.1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
 gpu = ["cupy-cuda12x[ctk]>=14", "tifffile", "imagecodecs"]
 fast = ["numba>=0.60"]
+tiff = ["tifffile", "imagecodecs"]
 
 [project.scripts]
 actis = "actis.cli:main"
 actis-benchmark-tiff = "actis.tiff_benchmark:main"
+actis-contours = "actis.contourlab.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 actis = ["report.html", "report.css", "report.js"]
+"actis.contourlab" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

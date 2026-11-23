@@ -493,11 +493,31 @@ def build_parser():
             help="Optional representative board file for a sequential read timing",
         )
     synth.set_defaults(tile_um=1.25)
+    contours = commands.add_parser(
+        "contours",
+        help="Design a contour-finding workflow on images, in a browser window",
+    )
+    contours.add_argument(
+        "images", nargs="*", type=Path, help="PNG or TIFF images to open"
+    )
+    contours.add_argument("--port", type=int, help="Port of the window's server")
+    contours.add_argument(
+        "--no-browser", action="store_true", help="Only print the window's address"
+    )
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.command == "contours":
+        from .contourlab.server import main as contour_lab
+
+        forwarded = [str(path) for path in args.images]
+        if args.port is not None:
+            forwarded += ["--port", str(args.port)]
+        if args.no_browser:
+            forwarded.append("--no-browser")
+        return contour_lab(forwarded)
     if args.command == "diagnose-reference":
         try:
             images, _ = read_reference(args.input)
