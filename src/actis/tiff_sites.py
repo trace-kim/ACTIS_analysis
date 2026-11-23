@@ -1,12 +1,10 @@
-"""Batched native-site measurements for independent, reference-matched TIFF tiles."""
+"""Batched native-site measurements for the reference-matched tiles of one TIFF page."""
 
 from dataclasses import dataclass
 from functools import lru_cache
-from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from .estimators import (
     BLUR_CANDIDATES,
@@ -14,7 +12,6 @@ from .estimators import (
     N_RAYS,
     _blur_result,
     _blur_vertex,
-    _representative,
 )
 
 
@@ -36,6 +33,7 @@ class Sites:
     tiles: object
     centers: np.ndarray
     tile_id: np.ndarray
+    seed: np.ndarray
     positions: object
     owners: object
     region: object
@@ -52,6 +50,7 @@ class Sites:
             tiles.astype(cp.float32),
             centers,
             tile_id,
+            seed,
             cp.asarray(centers),
             cp.asarray(tile_id, dtype=cp.int32),
             region,
@@ -127,49 +126,27 @@ def supported(region):
     )
 
 
-@dataclass
-class FitTile:
-    index: int
-    median: np.ndarray
-    half: int
-    centers: np.ndarray
-    seeds: np.ndarray
-    neighbors: np.ndarray
-    use: np.ndarray
+def _tile_medians(values, valid, sites, count):
+    """Median of every column over each tile's valid sites. NaN for a tile without any."""
+    # One row of lattice seeds per tile. Unused places sort to the end.
+    grid = np.full((count, len(sites.region.centers), values.shape[1]), np.inf)
+    grid[sites.tile_id[valid], sites.seed[valid]] = values[valid]
+    grid.sort(axis=1)
+    sizes = np.bincount(sites.tile_id[valid], minlength=count)
+    tiles = np.arange(count)
+    medians = 0.5 * (
+        grid[tiles, np.maximum(sizes - 1, 0) // 2] + grid[tiles, sizes // 2]
+    )
+    medians[sizes == 0] = np.nan
+    return medians
 
 
-def _fit_tiles(sites, contours):
-    side = sites.tiles.shape[-1]
-    groups = {}
-    ends = np.searchsorted(sites.tile_id, np.arange(len(sites.tiles) + 1))
-    for i, (lo, hi) in enumerate(pairwise(ends)):
-        seeds = contours[lo:hi].copy()
-        valid = np.isfinite(seeds[:, 0])
-        if not valid.any():
-            continue
-        median = np.median(seeds[valid], axis=0)
-        seeds[~valid, :2] = median[:2]
-        # Even an open contour can supply the contrast of a neighboring hole.
-        contrast = seeds[:, 2]
-        contrast[~np.isfinite(contrast) | (contrast <= 0)] = median[2]
-        half = max(
-            3, int(np.ceil(min(0.54 * sites.region.pitch, 0.7 * max(median[:2]) + 3)))
-        )
-        centers = sites.centers[lo:hi]
-        rounded = np.rint(centers)
-        ids = np.flatnonzero(
-            valid & ((rounded >= half) & (rounded < side - half)).all(axis=1)
-        )
-        if len(ids):
-            near = (
-                cKDTree(centers)
-                .query(centers, k=min(9, len(centers)))[1]
-                .reshape(len(centers), -1)[:, 1:]
-            )
-            groups.setdefault(half, []).append(
-                FitTile(i, median[:2], half, centers, seeds, near, ids)
-            )
-    return groups
+def tile_means(values, tile_id, count):
+    """Mean of the finite values in each tile, and how many there were."""
+    finite = np.isfinite(values)
+    sites = np.bincount(tile_id[finite], minlength=count)
+    total = np.bincount(tile_id[finite], weights=values[finite], minlength=count)
+    return np.where(sites > 0, total / np.maximum(sites, 1), np.nan), sites
 
 
 @lru_cache(maxsize=512)
@@ -187,122 +164,117 @@ def _filter_matrix(sigma, radius, support):
     ).astype("f4")
 
 
-class TileLibraries:
-    """Each tile retains its own contour-derived aperture size interpolation grid."""
+class Library:
+    """Blurred, pixel-integrated openings at nine sizes (81 for an ellipse).
 
-    def __init__(self, tiles, region, cp):
+    The sizes span the page's typical contour size, so one library serves every
+    tile of the page. Only the blur step is repeated during the blur search.
+    """
+
+    def __init__(self, width, height, region, cp):
         self.cp, self.shape = cp, region.shape
         self.nh = 9 if self.shape == "ellipse" else 1
-        w, h = np.array([t.median for t in tiles]).T
-        self.lo_w, self.hi_w = np.maximum(0.6, w * 0.48), np.maximum(w * 1.72, 2.5)
-        self.lo_h, self.hi_h = np.maximum(0.6, h * 0.48), np.maximum(h * 1.72, 2.5)
-        self.max_size = np.maximum(self.hi_w, self.hi_h if self.nh == 9 else h)
-        self.support = int(np.ceil((0.72 * max(self.max_size) + 0.2) * 5))
+        lo_w, hi_w = max(0.6, width * 0.48), max(width * 1.72, 2.5)
+        lo_h, hi_h = max(0.6, height * 0.48), max(height * 1.72, 2.5)
+        self.bounds = np.array((lo_w, hi_w, lo_h, hi_h), dtype="f4")
+        self.max_size = max(hi_w, hi_h if self.nh == 9 else height)
+        self.support = int(np.ceil((0.72 * self.max_size + 0.2) * 5))
         axis = cp.arange(-self.support, self.support + 1, dtype=cp.float32) / 5
         y, x = cp.meshgrid(axis, axis, indexing="ij")
         u = np.cos(region.angle) * x + np.sin(region.angle) * y
         v = -np.sin(region.angle) * x + np.cos(region.angle) * y
-        sizes = np.linspace(self.lo_w, self.hi_w, 9).T
-        wi = cp.asarray(np.repeat(sizes, self.nh, axis=1), dtype=cp.float32)[
-            :, :, None, None
-        ]
+        widths = np.repeat(np.linspace(lo_w, hi_w, 9), self.nh)
+        wi = cp.asarray(widths, dtype=cp.float32)[:, None, None]
         if self.shape == "square":
             inside = cp.maximum(abs(u) - wi / 2, abs(v) - wi / 2)
         else:
-            hi = (
-                wi
-                if self.nh == 1
-                else cp.asarray(
-                    np.tile(np.linspace(self.lo_h, self.hi_h, 9).T, (1, 9)),
-                    dtype=cp.float32,
-                )[:, :, None, None]
-            )
+            hi = wi
+            if self.nh == 9:
+                heights = np.tile(np.linspace(lo_h, hi_h, 9), 9)
+                hi = cp.asarray(heights, dtype=cp.float32)[:, None, None]
             r = cp.hypot(2 * u / wi, 2 * v / hi)
             grad = cp.hypot(4 * u / wi**2, 4 * v / hi**2) / cp.maximum(r, 1e-8)
             inside = (r - 1) / cp.maximum(grad, 1 / cp.maximum(wi, hi))
         self.mask = cp.clip(0.5 - inside * 5, 0, 1).astype(cp.float32)
 
-    def filter(self, sigmas):
+    def blur(self, sigma):
         cp = self.cp
-        self.radii = np.ceil(
-            0.72 * self.max_size + 4.5 * np.max(sigmas, axis=1) + 2
-        ).astype(int)
-        self.radius = int(max(self.radii))
-        sx, sy = np.asarray(sigmas).T
-
-        def matrix(s):
-            return cp.asarray(
-                np.stack(
-                    [_filter_matrix(float(v), 5 * self.radius, self.support) for v in s]
-                )
-            )
-
+        self.radius = int(np.ceil(0.72 * self.max_size + 4.5 * max(sigma) + 2))
+        across, down = (
+            cp.asarray(_filter_matrix(float(s), 5 * self.radius, self.support))
+            for s in sigma
+        )
         # Two matrix products apply the separable filters to all size planes.
-        self.data = cp.ascontiguousarray(
-            (matrix(sy)[:, None] @ self.mask) @ matrix(sx)[:, None].swapaxes(-1, -2)
+        self.data = cp.ascontiguousarray((down @ self.mask) @ across.T)
+
+
+class PageFits:
+    """Model and differential fits for one page, with one blur found on that page.
+
+    Every opening keeps its own contour seed, position and fitted size. The blur
+    is the one setting they share: it is searched once, on up to ten openings
+    from each tile, by how well the blurred templates reproduce their pixels.
+    """
+
+    def __init__(self, sites, contours, neighbors, cp):
+        self.cp, self.sites = cp, sites
+        region, side, count = sites.region, sites.tiles.shape[-1], len(sites.tiles)
+        valid = np.isfinite(contours[:, 0])
+        typical = np.median(contours[valid], axis=0)
+        local = _tile_medians(contours, valid, sites, count)[sites.tile_id]
+        local = np.where(np.isfinite(local), local, typical)
+        seeds = contours.copy()
+        seeds[~valid, :2] = local[~valid, :2]
+        # Even an open contour can supply the contrast of a neighboring hole.
+        faint = ~np.isfinite(seeds[:, 2]) | (seeds[:, 2] <= 0)
+        seeds[faint, 2] = local[faint, 2]
+        self.half = max(
+            3, int(np.ceil(min(0.54 * region.pitch, 0.7 * max(typical[:2]) + 3)))
         )
-
-
-class TileFits:
-    """Profile blur per tile and solve its native stamps in parallel on CUDA."""
-
-    def __init__(self, pixels, group, region, cp):
-        self.cp, self.group = cp, group
-        self.tables = TileLibraries(group, region, cp)
-        self.half = group[0].half
-        centers = np.concatenate([t.centers for t in group])
-        self.centers = cp.asarray(centers)
-        self.seeds = cp.asarray(np.concatenate([t.seeds for t in group]), dtype="f4")
-        starts = np.cumsum([0] + [len(t.centers) for t in group[:-1]])
-        near = np.full((len(centers), 8), -1, dtype="i4")
-        for t, start in zip(group, starts):
-            near[start : start + len(t.centers), : t.neighbors.shape[1]] = (
-                t.neighbors + start
-            )
-        self.near = cp.asarray(near)
-        self.ids = [t.use + s for t, s in zip(group, starts)]
-        owner = np.repeat(np.arange(len(group)), [len(t.centers) for t in group])
-        self.owners = cp.asarray(owner, dtype="i4")
-        self.full_ids = cp.asarray(np.concatenate(self.ids), dtype="i4")
-        self.pixels = pixels[cp.asarray([t.index for t in group])]
-        self.bounds = cp.asarray(
-            np.stack(
-                (
-                    self.tables.lo_w,
-                    self.tables.hi_w,
-                    self.tables.lo_h,
-                    self.tables.hi_h,
-                ),
-                axis=1,
-            ),
-            dtype="f4",
-        )
-        picks = [_representative(ids) for ids in self.ids]
-        self.picks = cp.asarray(np.concatenate(picks), dtype="i4")
-        self.ends = np.cumsum([0] + list(map(len, picks)))
-        self.profiles = [[] for t in group]
+        rounded = np.rint(sites.centers)
+        inside = ((rounded >= self.half) & (rounded < side - self.half)).all(axis=1)
+        self.use = np.flatnonzero(valid & inside)
+        # The eight nearest lattice sites that lie in the same tile. The extra
+        # column absorbs the padding index of lattices with fewer neighbors.
+        index = np.full((count, len(region.centers) + 1), -1, dtype=np.int32)
+        index[sites.tile_id, sites.seed] = np.arange(len(seeds))
+        self.near = cp.asarray(index[sites.tile_id[:, None], neighbors[sites.seed]])
+        self.seeds = cp.asarray(seeds, dtype="f4")
+        self.ids = cp.asarray(self.use, dtype="i4")
+        self.library = Library(typical[0], typical[1], region, cp)
+        self.bounds = cp.asarray(self.library.bounds)
+        sizes = np.bincount(sites.tile_id[self.use], minlength=count)
+        first = np.cumsum(sizes) - sizes
+        picks = [
+            first[sizes == size][:, None]
+            + np.linspace(0, size - 1, min(10, size), dtype=int)
+            for size in np.unique(sizes[sizes > 0])
+        ]
+        if picks:
+            picks = self.use[np.sort(np.concatenate(picks, axis=None))]
+        self.picks = cp.asarray(picks, dtype="i4")
+        self.sigma, self.usable = None, True
 
     def solve(self, ids, steps, profile):
-        tables = self.tables
+        library, sites = self.library, self.sites
         threads = _power_two((2 * self.half + 1) ** 2)
         result = self.cp.empty((len(ids), 2), dtype="f4")
         _kernels(self.cp, max(512, threads)).get_function("fit_apertures")(
             (len(ids),),
             (threads,),
             (
-                self.pixels,
-                np.int32(self.pixels.shape[-1]),
-                self.centers,
+                sites.tiles,
+                np.int32(sites.tiles.shape[-1]),
+                sites.positions,
                 self.seeds,
                 self.near,
-                self.owners,
+                sites.owners,
                 ids,
                 np.int32(self.half),
-                tables.data,
+                library.data,
                 self.bounds,
-                self.cp.asarray(tables.radii, dtype="i4"),
-                np.int32(tables.radius),
-                np.int32(tables.nh),
+                np.int32(library.radius),
+                np.int32(library.nh),
                 np.int32(steps),
                 np.int32(profile),
                 result,
@@ -311,84 +283,82 @@ class TileFits:
         )
         return result.get()
 
-    def profile(self, sigmas, include=None):
-        self.tables.filter(sigmas)
-        result = self.solve(self.picks, 3, True)
-        if np.all(np.diff(self.ends) == self.ends[1]):
-            medians = np.median(result.reshape(len(self.group), -1, 2), axis=1)
-        else:
-            medians = [
-                np.median(result[a:b], axis=0) for a, b in pairwise(self.ends)
-            ]
-        for i, (rmse, width) in enumerate(medians):
-            if include is None or include[i]:
-                self.profiles[i].append((float(rmse), tuple(sigmas[i]), float(width)))
-
     def prepare(self, psf):
-        nt = len(self.group)
+        """Set the page's blur: the supplied one, or the best of a short search."""
         if psf is not None:
-            self.tables.filter(np.tile(psf, (nt, 1)))
-            self.exclude = np.zeros(nt, dtype=bool)
+            self.sigma = tuple(psf)
+            self.library.blur(self.sigma)
             return
+        profile = []
+
+        def trial(sigma):
+            self.library.blur(sigma)
+            rmse, width = np.median(self.solve(self.picks, 3, True), axis=0)
+            profile.append((float(rmse), sigma, float(width)))
+
         for sigma in BLUR_CANDIDATES:
-            self.profile(np.tile(sigma, (nt, 1)))
-        coarse = np.array([min(p)[1] for p in self.profiles])
-        for direction in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            self.profile(np.round(coarse + BLUR_STEP * np.array(direction), 3))
-        extra = [
-            _blur_vertex(tuple(base), profile)
-            for base, profile in zip(coarse, self.profiles)
-        ]
-        include = [s not in {v[1] for v in p} for s, p in zip(extra, self.profiles)]
-        if any(include):
-            self.profile(extra, include)
-        results = [_blur_result(profile, psf) for profile in self.profiles]
-        self.tables.filter(np.array([best[1] for best, _, _, _ in results]))
-        self.exclude = np.array([weak or at_limit for _, _, weak, at_limit in results])
+            trial(sigma)
+        coarse = min(profile)[1]
+        for ax, ay in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            trial(
+                (
+                    round(coarse[0] + BLUR_STEP * ax, 3),
+                    round(coarse[1] + BLUR_STEP * ay, 3),
+                )
+            )
+        vertex = _blur_vertex(coarse, profile)
+        if vertex not in {sigma for _, sigma, _ in profile}:
+            trial(vertex)
+        best, _, weak, at_limit = _blur_result(profile, None)
+        self.sigma, self.usable = best[1], not (weak or at_limit)
+        self.library.blur(self.sigma)
 
     def measure(self, name):
-        cd = self.solve(self.full_ids, 6 if name == "model" else 1, False)[:, 1]
-        valid = np.isfinite(cd) & ~np.repeat(self.exclude, list(map(len, self.ids)))
-        return cd[valid]
+        """One size per usable opening, NaN where the fit or the page's blur fails."""
+        size = self.solve(self.ids, 6 if name == "model" else 1, False)[:, 1]
+        return size if self.usable else np.full(len(size), np.nan, dtype=size.dtype)
 
 
 def measure_group(tiles, template, shifts, psf, run, cp):
+    """Measure the openings of one page's tiles that matched one reference.
+
+    Returns {method: (mean per tile, valid openings per tile)} and, when the
+    aperture fits ran, the blur they used as (sigma x, sigma y, usable).
+    """
     sites = Sites.matched(tiles, template.region, shifts, cp)
-    attempted = len(sites.centers)
+    attempted, count = len(sites.centers), len(tiles)
     names = [m for m in ("model", "differential") if m in run.selected]
+    per_tile, blur = {}, None
     if names or "contour" in run.selected:
         with run.time("contour"):
             contours = sites.contours(cp)
         if "contour" in run.selected:
             widths = contours[:, 0]
+            per_tile["contour"] = tile_means(widths, sites.tile_id, count)
             run.record("contour", widths[np.isfinite(widths)], attempted)
     if "flux" in run.selected:
         with run.time("flux"):
             signal = sites.flux(cp)
+        per_tile["flux"] = tile_means(signal, sites.tile_id, count)
         run.record("flux", signal[np.isfinite(signal)], attempted)
-    if not names:
-        return
     for name in names:
         run.record(name, [], attempted)
-    if template.region.shape == "ambiguous":
-        return
+    if (
+        not names
+        or template.region.shape == "ambiguous"
+        or not np.isfinite(contours[:, 0]).any()
+    ):
+        return per_tile, blur
     with run.time("fit_setup"):
-        groups = _fit_tiles(sites, contours)
-    for group in groups.values():
-        # Bound the largest possible PSF library plus its filter workspace.
-        planes = 81 if template.region.shape == "ellipse" else 9
-        max_size = max(max(t.median) for t in group) * 1.72
-        max_sigma = max(psf) if psf is not None else 1.91
-        side = 10 * int(np.ceil(0.72 * max(max_size, 2.5) + 4.5 * max_sigma + 2)) + 1
-        limit = max(1, min(64, 2**25 // (side * side * planes)))
-        for start in range(0, len(group), limit):
-            with run.time("fit_setup"):
-                fits = TileFits(
-                    sites.tiles, group[start : start + limit], template.region, cp
-                )
-                fits.prepare(psf)
-            for name in names:
-                with run.time(name):
-                    values = fits.measure(name)
-                run.record(name, values, 0)
-            del fits
+        fits = PageFits(sites, contours, template.neighbors, cp)
+        if len(fits.use):
+            fits.prepare(psf)
+            blur = (*fits.sigma, fits.usable)
+    if not len(fits.use):
+        return per_tile, blur
+    for name in names:
+        with run.time(name):
+            values = fits.measure(name)
+        per_tile[name] = tile_means(values, sites.tile_id[fits.use], count)
+        run.record(name, values[np.isfinite(values)], 0)
+    return per_tile, blur

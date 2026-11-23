@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CD per tile</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --series-1: #2a78d6; --series-2: #eb6834;
+  --low: #2a78d6; --mid: #f0efec; --high: #e34948; --wash: rgba(42,120,214,0.10);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5; --series-2: #d95926;
+    --low: #3987e5; --mid: #383835; --high: #e66767; --wash: rgba(57,135,229,0.16);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1240px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 24px; font-weight: 600; margin: 0 0 4px; overflow-wrap: anywhere; }
+h2 { font-size: 18px; font-weight: 600; margin: 0; }
+p { margin: 0; }
+.lead { color: var(--ink-2); font-size: 16px; }
+.note { color: var(--ink-2); margin-top: 6px; max-width: 78ch; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 20px; margin-top: 16px; }
+.head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; justify-content: space-between; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; color: var(--ink-2); }
+select, button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 5px 10px; }
+button { cursor: pointer; }
+button:hover, select:hover { border-color: var(--muted); }
+:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+th { text-align: left; font-weight: 600; color: var(--ink-2); font-size: 14px; padding: 6px 10px;
+  border-bottom: 1px solid var(--axis); white-space: nowrap; }
+td { padding: 9px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--wash); }
+tbody tr[aria-selected="true"] { background: var(--wash); box-shadow: inset 3px 0 0 var(--series-1); }
+.pick { border: 0; background: none; padding: 0; font-weight: 600; text-align: left; }
+.about { color: var(--ink-2); font-size: 14px; display: block; }
+.meter { display: block; height: 6px; border-radius: 3px; background: var(--series-1); margin: 6px 0 0 auto; }
+.small { color: var(--ink-2); font-size: 14px; display: block; }
+.scroll { overflow-x: auto; }
+canvas { display: block; width: 100%; touch-action: none; }
+#strip { cursor: crosshair; margin-top: 10px; }
+.legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin-top: 10px; color: var(--ink-2); font-size: 14px; }
+.ramp { width: 180px; height: 12px; border-radius: 3px; display: inline-block; vertical-align: middle; margin: 0 8px; }
+.swatch { width: 14px; height: 12px; border-radius: 3px; display: inline-block; vertical-align: middle;
+  margin-right: 6px; border: 1px solid var(--axis); background: var(--surface); }
+.key { width: 18px; height: 0; border-top: 2px solid; display: inline-block; vertical-align: middle; margin-right: 6px; }
+.multiples { display: flex; flex-wrap: wrap; gap: 18px 22px; margin-top: 12px; }
+.multiples figure { margin: 0; }
+.multiples figcaption { font-weight: 600; }
+.multiples canvas { width: auto; margin-top: 6px; cursor: crosshair; }
+.multiples figure[data-on="true"] figcaption { box-shadow: inset 0 -2px 0 var(--series-1); display: inline-block; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+.pair .card { margin-top: 16px; min-width: 0; }
+details { margin-top: 14px; }
+summary { cursor: pointer; color: var(--ink-2); }
+details table { width: auto; }
+details td, details th { padding: 3px 8px; font-size: 14px; text-align: right; font-variant-numeric: tabular-nums; }
+#tip { position: fixed; z-index: 5; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--axis); border-radius: 8px; padding: 8px 10px; font-size: 14px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18); max-width: 420px; }
+#tip b { font-weight: 600; white-space: nowrap; }
+#tip .where { color: var(--ink-2); margin-bottom: 4px; }
+#tip .line { display: flex; justify-content: space-between; gap: 14px; }
+#tip .line span:last-child { color: var(--ink-2); }
+#tip .line.on span:last-child { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title"></h1>
+    <p class="lead" id="summary"></p>
+    <div class="controls" id="scope" hidden style="margin-top:12px">
+      <label>Hole array <select id="lattice"></select></label>
+      <span id="scope-note"></span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Methods</h2>
+    <p class="note">Pick a row to show that method on the map below. Time is for the whole file.</p>
+    <div class="scroll">
+      <table id="methods">
+        <thead><tr>
+          <th>Method</th><th class="num">Time</th><th class="num">Tiles with a value</th>
+          <th class="num">Typical value</th><th class="num">Spread across tiles</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="note" id="table-note"></p>
+  </section>
+
+  <section class="card">
+    <div class="head">
+      <h2 id="strip-title"></h2>
+      <div class="controls">
+        <label>Colour range <select id="range"></select></label>
+        <button id="whole" type="button">Show whole file</button>
+      </div>
+    </div>
+    <p class="note" id="strip-note"></p>
+    <div class="legend" id="strip-legend"></div>
+    <canvas id="strip" tabindex="0" aria-label="Map of every tile in the file. Arrow keys move the selected page."></canvas>
+    <p class="note">Pages run left to right in file order, each turned on its side: a page's top edge is at its left, and its tile columns run top to bottom. Wheel to zoom, drag to move, click a page to see it below.</p>
+  </section>
+
+  <section class="card">
+    <div class="head">
+      <h2 id="page-title"></h2>
+      <div class="controls">
+        <button id="prev" type="button" aria-label="Previous page">&larr; Previous</button>
+        <button id="next" type="button" aria-label="Next page">Next &rarr;</button>
+      </div>
+    </div>
+    <p class="note" id="page-note"></p>
+    <div class="multiples" id="multiples"></div>
+    <details>
+      <summary id="numbers-title"></summary>
+      <div class="scroll"><table id="numbers"></table></div>
+    </details>
+  </section>
+
+  <div class="pair">
+    <section class="card">
+      <h2 id="hist-title"></h2>
+      <p class="note" id="hist-note"></p>
+      <canvas id="hist" style="margin-top:10px"></canvas>
+    </section>
+    <section class="card" id="blur-card">
+      <h2>Blur found on each page</h2>
+      <p class="note" id="blur-note"></p>
+      <div class="legend" id="blur-legend"></div>
+      <canvas id="blur" style="margin-top:6px"></canvas>
+    </section>
+  </div>
+</main>
+<div id="tip" hidden></div>
+
+<script>const DATA = /*DATA*/null;</script>
+<script>
+(function () {
+"use strict";
+const D = DATA;
+const $ = (id) => document.getElementById(id);
+const token = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const el = (tag, text, cls) => {
+  const node = document.createElement(tag);
+  if (text != null) node.textContent = text;
+  if (cls) node.className = cls;
+  return node;
+};
+
+function decode(text, Type) {
+  const raw = atob(text), bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  return new Type(bytes.buffer);
+}
+
+const P = D.pages, R = D.rows, C = D.columns, L = P * R, T = R * C;
+const reference = decode(D.reference, Int8Array);
+const methods = D.methods.map((m) => Object.assign({}, m, {
+  all: decode(m.values, Float32Array),
+  n: m.openings ? decode(m.openings, Int32Array) : null,
+}));
+const blur = D.blur ? decode(D.blur.sigma, Float32Array) : null;
+
+const middle = (sorted) => sorted.length ? (sorted[(sorted.length - 1) >> 1] + sorted[sorted.length >> 1]) / 2 : NaN;
+function summarize(m) {
+  const kept = m.v.filter(Number.isFinite).sort();
+  m.count = kept.length;
+  m.median = middle(kept);
+  m.low = kept[0]; m.high = kept[kept.length - 1];
+  m.spread = 1.4826 * middle(kept.map((x) => Math.abs(x - m.median)).sort());
+  m.kept = kept;
+  m.pageMedian = new Float64Array(P);
+  for (let p = 0; p < P; p++) m.pageMedian[p] = middle(m.v.subarray(p * T, (p + 1) * T).filter(Number.isFinite).sort());
+}
+// Running totals along the file for every tile column, so any zoom level is an average.
+function totals(m) {
+  if (m.sum) return;
+  m.sum = new Float64Array((L + 1) * C);
+  m.cnt = new Int32Array((L + 1) * C);
+  for (let i = 0; i < L; i++) for (let c = 0; c < C; c++) {
+    const x = m.v[i * C + c], ok = Number.isFinite(x);
+    m.sum[(i + 1) * C + c] = m.sum[i * C + c] + (ok ? x : 0);
+    m.cnt[(i + 1) * C + c] = m.cnt[i * C + c] + (ok ? 1 : 0);
+  }
+}
+// Each hole array is read on its own: a tile is compared with tiles of the same array.
+let lattice = D.lattices.reduce((best, item, k) => item.tiles > D.lattices[best].tiles ? k : best, 0);
+function scope(k) {
+  lattice = k;
+  for (const m of methods) {
+    m.v = D.lattices.length > 1 ? m.all.map((x, i) => reference[i] === k ? x : NaN) : m.all;
+    m.sum = null;
+    summarize(m);
+  }
+}
+scope(lattice);
+
+const fmt = (x) => !Number.isFinite(x) ? "none" : Math.abs(x) >= 100 ? x.toFixed(1) : Math.abs(x) >= 10 ? x.toFixed(2) : x.toFixed(3);
+const whole = (x) => x.toLocaleString("en-US");
+const seconds = (s) => s >= 90 ? Math.floor(s / 60) + " min " + Math.round(s % 60) + " s" : s >= 10 ? s.toFixed(0) + " s" : s >= 1 ? s.toFixed(1) + " s" : s >= 0.1 ? s.toFixed(2) + " s" : Math.max(1, Math.round(1000 * s)) + " ms";
+const percent = (x) => (Math.abs(x) >= 10 ? x.toFixed(0) : Math.abs(x) >= 1 ? x.toFixed(1) : x.toFixed(2)) + "%";
+function nice(x) {
+  const e = Math.pow(10, Math.floor(Math.log10(x))), f = x / e;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
+}
+function ticks(lo, hi, wanted) {
+  if (!(hi > lo)) return [lo];
+  const raw = (hi - lo) / wanted, e = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / e;
+  const step = (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * e, out = [];
+  for (let t = Math.ceil(lo / step) * step; t <= hi + step * 1e-9; t += step) out.push(Math.abs(t) < step * 1e-9 ? 0 : t);
+  return out;
+}
+const tickText = (t, step) => step >= 1 ? whole(Math.round(t)) : t.toFixed(Math.min(4, Math.max(0, -Math.floor(Math.log10(step)))));
+
+// ---- state
+const state = { method: methods.find((m) => m.unit === "px" && m.count) || methods[0], page: 0, range: "auto", x0: 0, x1: L, hover: null };
+
+// ---- colour: two arms from a neutral middle, mixed in OKLab
+function toLab(hex) {
+  const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((u) => u <= 0.04045 ? u / 12.92 : Math.pow((u + 0.055) / 1.055, 2.4));
+  const l = Math.cbrt(0.4122214708 * c[0] + 0.5363325363 * c[1] + 0.0514459929 * c[2]);
+  const m = Math.cbrt(0.2119034982 * c[0] + 0.6806995451 * c[1] + 0.1073969566 * c[2]);
+  const s = Math.cbrt(0.0883024619 * c[0] + 0.2817188376 * c[1] + 0.6299787005 * c[2]);
+  return [0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s, 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s, 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s];
+}
+function toRgb(lab) {
+  const l = Math.pow(lab[0] + 0.3963377774 * lab[1] + 0.2158037573 * lab[2], 3);
+  const m = Math.pow(lab[0] - 0.1055613458 * lab[1] - 0.0638541728 * lab[2], 3);
+  const s = Math.pow(lab[0] - 0.0894841775 * lab[1] - 1.291485548 * lab[2], 3);
+  return [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s, -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s]
+    .map((u) => Math.round(255 * Math.min(1, Math.max(0, u <= 0.0031308 ? 12.92 * u : 1.055 * Math.pow(u, 1 / 2.4) - 0.055))));
+}
+let ramp = [];
+function buildRamp() {
+  const low = toLab(token("--low")), mid = toLab(token("--mid")), high = toLab(token("--high"));
+  ramp = [];
+  for (let k = 0; k < 256; k++) {
+    const t = k / 127.5 - 1, end = t < 0 ? low : high, w = Math.abs(t);
+    ramp.push(toRgb(mid.map((u, i) => u + (end[i] - u) * w)));
+  }
+}
+function rangeOf(m) {
+  if (state.range !== "auto") return +state.range;
+  const pct = 300 * m.spread / Math.abs(m.median);
+  return Number.isFinite(pct) && pct > 0 ? nice(pct) : 1;
+}
+function shade(m, x, range) {
+  const t = (x - m.median) / Math.abs(m.median) * 100 / range;
+  return ramp[Math.round((Math.min(1, Math.max(-1, t)) + 1) * 127.5)];
+}
+const rgb = (c) => "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+
+function fit(canvas, height) {
+  const width = canvas.clientWidth || canvas.parentElement.clientWidth, ratio = window.devicePixelRatio || 1;
+  canvas.style.height = height + "px";
+  canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.font = "13px system-ui, -apple-system, 'Segoe UI', sans-serif";
+  return { ctx, width, height, ratio };
+}
+
+// ---- tooltip
+const tip = $("tip");
+function showTip(event, where, lines) {
+  tip.replaceChildren(el("div", where, "where"));
+  for (const [value, label, on] of lines) {
+    const row = el("div", null, "line" + (on ? " on" : ""));
+    row.append(el("b", value), el("span", label));
+    tip.append(row);
+  }
+  tip.hidden = false;
+  const box = tip.getBoundingClientRect();
+  let x = event.clientX + 16, y = event.clientY + 16;
+  if (x + box.width > window.innerWidth - 8) x = event.clientX - box.width - 16;
+  if (y + box.height > window.innerHeight - 8) y = event.clientY - box.height - 16;
+  tip.style.left = Math.max(8, x) + "px"; tip.style.top = Math.max(8, y) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+function place(page, row, column) {
+  const array = reference[(page * R + row) * C + column];
+  return "Page " + D.page_numbers[page] + ", tile row " + (row + 1) + ", column " + (column + 1)
+    + (D.lattices.length > 1 && array >= 0 ? ", hole array " + (array + 1) : "");
+}
+function tileLines(index) {
+  return methods.map((m) => {
+    const x = m.all[index];
+    const count = m.n && Number.isFinite(x) ? ", " + whole(m.n[index]) + " openings" : "";
+    return [Number.isFinite(x) ? fmt(x) + " " + m.unit : "no value", m.title + count, m === state.method];
+  });
+}
+
+// ---- methods table
+function buildTable() {
+  const body = $("methods").tBodies[0], longest = Math.max.apply(null, methods.map((m) => m.seconds));
+  for (const m of methods) {
+    const row = body.insertRow();
+    const name = row.insertCell();
+    const pick = el("button", m.title, "pick");
+    pick.type = "button";
+    name.append(pick, el("span", m.about, "about"));
+    const time = row.insertCell(); time.className = "num";
+    time.append(seconds(m.seconds));
+    const bar = el("span", null, "meter");
+    bar.style.width = Math.max(2, 90 * m.seconds / longest) + "px";
+    time.append(bar);
+    m.cells = [row.insertCell(), row.insertCell(), row.insertCell()];
+    for (const cell of m.cells) cell.className = "num";
+    row.addEventListener("click", () => choose(m));
+    m.row = row;
+  }
+  fillTable();
+  const fits = methods.filter((m) => m.name === "model" || m.name === "differential").map((m) => m.title.toLowerCase());
+  $("table-note").textContent = "Typical value is the median over tiles. Spread is how much tiles differ from it (robust standard deviation)."
+    + (fits.length ? " The time of the " + fits.join(" and the ") + " includes " + seconds(D.shared_fit_seconds) + " of contour and blur work" + (fits.length > 1 ? " they share." : ".") : "");
+}
+
+function fillTable() {
+  const tiles = D.lattices.length > 1 ? D.lattices[lattice].tiles : D.measured_tiles;
+  for (const m of methods) {
+    const [got, typical, spread] = m.cells;
+    got.replaceChildren(whole(m.count), el("span", tiles ? percent(100 * m.count / tiles) + (D.lattices.length > 1 ? " of this array" : " of measured") : "", "small"));
+    typical.textContent = m.count ? fmt(m.median) + " " + m.unit : "none";
+    if (m.count) spread.replaceChildren(fmt(m.spread) + " " + m.unit, el("span", percent(100 * m.spread / Math.abs(m.median)) + " of typical", "small"));
+    else spread.textContent = "none";
+  }
+}
+
+// ---- the strip: every tile of the file, with the page medians under it
+const strip = $("strip");
+const box = { left: 62, right: 16, top: 6, mapH: Math.min(224, Math.max(120, C * 14)), gap: 18, lineH: 120, axisH: 30 };
+function stripGeometry() {
+  const frame = fit(strip, box.top + box.mapH + box.gap + box.lineH + box.axisH);
+  frame.plotW = frame.width - box.left - box.right;
+  frame.lineTop = box.top + box.mapH + box.gap;
+  return frame;
+}
+function drawStrip() {
+  const m = state.method, range = rangeOf(m), g = stripGeometry(), ctx = g.ctx;
+  totals(m);
+  ctx.clearRect(0, 0, g.width, g.height);
+  const span = state.x1 - state.x0;
+  // the map, one device pixel column at a time
+  const w = Math.max(1, Math.round(g.plotW * g.ratio));
+  const image = new ImageData(w, C);
+  for (let x = 0; x < w; x++) {
+    const a = Math.min(L - 1, Math.max(0, Math.floor(state.x0 + span * x / w)));
+    const b = Math.min(L, Math.max(a + 1, Math.ceil(state.x0 + span * (x + 1) / w)));
+    for (let c = 0; c < C; c++) {
+      const count = m.cnt[b * C + c] - m.cnt[a * C + c];
+      if (!count) continue;
+      const colour = shade(m, (m.sum[b * C + c] - m.sum[a * C + c]) / count, range), at = 4 * (c * w + x);
+      image.data[at] = colour[0]; image.data[at + 1] = colour[1]; image.data[at + 2] = colour[2]; image.data[at + 3] = 255;
+    }
+  }
+  const off = document.createElement("canvas");
+  off.width = w; off.height = C;
+  off.getContext("2d").putImageData(image, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, 0, 0, w, C, box.left, box.top, g.plotW, box.mapH);
+  const cell = g.plotW / span, surface = token("--surface");
+  const xOf = (i) => box.left + (i - state.x0) * cell;
+  ctx.fillStyle = surface;
+  if (cell >= 6) {
+    for (let i = Math.ceil(state.x0); i <= state.x1; i++) ctx.fillRect(Math.round(xOf(i)) - 0.5, box.top, 1, box.mapH);
+    for (let c = 1; c < C; c++) ctx.fillRect(box.left, Math.round(box.top + c * box.mapH / C) - 0.5, g.plotW, 1);
+  }
+  if (cell * R >= 24) for (let p = Math.ceil(state.x0 / R); p * R <= state.x1; p++) ctx.fillRect(Math.round(xOf(p * R)) - 1, box.top, 2, box.mapH);
+  // left labels
+  ctx.fillStyle = token("--muted"); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  ctx.fillText("col 1", box.left - 8, box.top + box.mapH / C / 2);
+  if (C > 1) ctx.fillText("col " + C, box.left - 8, box.top + box.mapH - box.mapH / C / 2);
+  // page medians
+  const p0 = Math.max(0, Math.floor(state.x0 / R)), p1 = Math.min(P - 1, Math.ceil(state.x1 / R) - 1);
+  let lo = Infinity, hi = -Infinity;
+  for (let p = p0; p <= p1; p++) { const y = m.pageMedian[p]; if (Number.isFinite(y)) { lo = Math.min(lo, y); hi = Math.max(hi, y); } }
+  if (!(hi >= lo)) { lo = 0; hi = 1; }
+  const pad = Math.max((hi - lo) * 0.12, Math.abs(hi) * 1e-4, 1e-9);
+  lo -= pad; hi += pad;
+  const yOf = (y) => g.lineTop + box.lineH * (1 - (y - lo) / (hi - lo));
+  const yTicks = ticks(lo, hi, 3), yStep = yTicks.length > 1 ? yTicks[1] - yTicks[0] : 1;
+  ctx.strokeStyle = token("--grid"); ctx.lineWidth = 1;
+  for (const t of yTicks) {
+    ctx.beginPath(); ctx.moveTo(box.left, Math.round(yOf(t)) + 0.5); ctx.lineTo(box.left + g.plotW, Math.round(yOf(t)) + 0.5); ctx.stroke();
+    ctx.fillText(tickText(t, yStep), box.left - 8, yOf(t));
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.rect(box.left, g.lineTop - 4, g.plotW, box.lineH + 8); ctx.clip();
+  ctx.strokeStyle = token("--series-1"); ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.beginPath();
+  let open = false;
+  for (let p = Math.max(0, p0 - 1); p <= Math.min(P - 1, p1 + 1); p++) {
+    const y = m.pageMedian[p];
+    if (!Number.isFinite(y)) { open = false; continue; }
+    const x = xOf((p + 0.5) * R);
+    if (open) ctx.lineTo(x, yOf(y)); else ctx.moveTo(x, yOf(y));
+    open = true;
+  }
+  ctx.stroke();
+  if (cell * R >= 14) {
+    ctx.fillStyle = token("--series-1");
+    for (let p = p0; p <= p1; p++) if (Number.isFinite(m.pageMedian[p])) { ctx.beginPath(); ctx.arc(xOf((p + 0.5) * R), yOf(m.pageMedian[p]), 4, 0, 7); ctx.fill(); }
+  }
+  ctx.restore();
+  // page axis
+  ctx.strokeStyle = token("--axis");
+  ctx.beginPath(); ctx.moveTo(box.left, g.lineTop + box.lineH + 0.5); ctx.lineTo(box.left + g.plotW, g.lineTop + box.lineH + 0.5); ctx.stroke();
+  ctx.fillStyle = token("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "top";
+  const pageStep = Math.max(1, nice((p1 - p0 + 1) / Math.max(2, Math.floor(g.plotW / 90))));
+  for (let p = Math.ceil(p0 / pageStep) * pageStep; p <= p1; p += pageStep) {
+    const x = xOf((p + 0.5) * R);
+    if (x >= box.left && x <= box.left + g.plotW) ctx.fillText(String(D.page_numbers[p]), x, g.lineTop + box.lineH + 7);
+  }
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  ctx.fillText("Page", box.left - 8, g.lineTop + box.lineH + 14);
+  // selected page and hover
+  const mark = (p, colour, width) => {
+    const a = Math.max(box.left, xOf(p * R)), b = Math.min(box.left + g.plotW, xOf((p + 1) * R));
+    if (b <= a) return;
+    ctx.strokeStyle = colour; ctx.lineWidth = width;
+    ctx.strokeRect(a + width / 2, box.top + width / 2, Math.max(1, b - a - width), box.mapH - width);
+  };
+  mark(state.page, token("--ink"), 2);
+  if (state.hover) {
+    const x = Math.round(xOf(state.hover.i + 0.5)) + 0.5;
+    ctx.strokeStyle = token("--ink-2"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, box.top); ctx.lineTo(x, g.lineTop + box.lineH); ctx.stroke();
+    if (state.hover.c != null && cell >= 4) {
+      ctx.strokeStyle = token("--ink"); ctx.lineWidth = 2;
+      ctx.strokeRect(xOf(state.hover.i), box.top + state.hover.c * box.mapH / C, cell, box.mapH / C);
+    }
+  }
+  strip.geometry = g;
+}
+function stripAt(event) {
+  const g = strip.geometry, rect = strip.getBoundingClientRect();
+  const x = event.clientX - rect.left, y = event.clientY - rect.top;
+  if (!g || x < box.left || x > box.left + g.plotW) return null;
+  const i = Math.min(L - 1, Math.max(0, Math.floor(state.x0 + (x - box.left) / g.plotW * (state.x1 - state.x0))));
+  const inMap = y >= box.top && y < box.top + box.mapH;
+  return { i, c: inMap ? Math.min(C - 1, Math.floor((y - box.top) / box.mapH * C)) : null, fraction: (x - box.left) / g.plotW };
+}
+function view(x0, x1) {
+  const span = Math.min(L, Math.max(Math.min(L, 8), x1 - x0));
+  state.x0 = Math.min(L - span, Math.max(0, x0)); state.x1 = state.x0 + span;
+  drawStrip();
+}
+let drag = null;
+strip.addEventListener("pointerdown", (event) => { drag = { x: event.clientX, x0: state.x0, x1: state.x1, moved: false }; strip.setPointerCapture(event.pointerId); });
+strip.addEventListener("pointermove", (event) => {
+  if (drag) {
+    const dx = event.clientX - drag.x;
+    if (Math.abs(dx) > 3) drag.moved = true;
+    if (drag.moved) { const shift = -dx / strip.geometry.plotW * (drag.x1 - drag.x0); hideTip(); state.hover = null; view(drag.x0 + shift, drag.x1 + shift); return; }
+  }
+  const at = stripAt(event);
+  state.hover = at; drawStrip();
+  if (!at) return hideTip();
+  const page = Math.floor(at.i / R), row = at.i % R;
+  if (at.c != null) showTip(event, place(page, row, at.c), tileLines(at.i * C + at.c));
+  else showTip(event, "Page " + D.page_numbers[page] + ", median of its tiles", methods.map((m) => [Number.isFinite(m.pageMedian[page]) ? fmt(m.pageMedian[page]) + " " + m.unit : "no value", m.title, m === state.method]));
+});
+strip.addEventListener("pointerup", (event) => {
+  const at = stripAt(event);
+  if (drag && !drag.moved && at) selectPage(Math.floor(at.i / R));
+  drag = null;
+});
+strip.addEventListener("pointerleave", () => { state.hover = null; hideTip(); drawStrip(); });
+strip.addEventListener("wheel", (event) => {
+  const at = stripAt(event);
+  if (!at) return;
+  event.preventDefault();
+  const span = state.x1 - state.x0, next = Math.min(L, Math.max(Math.min(L, 8), span * (event.deltaY > 0 ? 1.25 : 0.8)));
+  const anchor = state.x0 + at.fraction * span;
+  view(anchor - at.fraction * next, anchor - at.fraction * next + next);
+}, { passive: false });
+strip.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowLeft") selectPage(state.page - 1);
+  else if (event.key === "ArrowRight") selectPage(state.page + 1);
+  else return;
+  event.preventDefault();
+});
+$("whole").addEventListener("click", () => view(0, L));
+
+// ---- one page, every method
+const CELL = Math.max(10, Math.min(22, Math.floor(200 / C)));
+function buildMultiples() {
+  const host = $("multiples");
+  for (const m of methods) {
+    const figure = el("figure");
+    m.caption = el("figcaption", m.title);
+    m.pageLine = el("div", "", "small");
+    m.grid = document.createElement("canvas");
+    m.grid.style.width = C * CELL + "px";
+    figure.append(m.caption, m.pageLine, m.grid);
+    host.append(figure);
+    m.figure = figure;
+    m.grid.addEventListener("pointermove", (event) => {
+      const rect = m.grid.getBoundingClientRect();
+      const c = Math.min(C - 1, Math.max(0, Math.floor((event.clientX - rect.left) / CELL)));
+      const r = Math.min(R - 1, Math.max(0, Math.floor((event.clientY - rect.top) / CELL)));
+      m.over = [r, c]; drawPage();
+      showTip(event, place(state.page, r, c), tileLines((state.page * R + r) * C + c));
+    });
+    m.grid.addEventListener("pointerleave", () => { m.over = null; hideTip(); drawPage(); });
+    m.grid.addEventListener("click", () => choose(m));
+  }
+}
+function drawPage() {
+  const p = state.page, surface = token("--surface"), ink = token("--ink");
+  $("page-title").textContent = "Page " + D.page_numbers[p] + " of the file, all methods";
+  let note = "Each square is one tile of " + D.tile_size + " × " + D.tile_size + " pixels, coloured against its own method's typical value. Empty squares have no value.";
+  if (blur && Number.isFinite(blur[2 * p])) note += " Blur found on this page: " + blur[2 * p].toFixed(2) + " × " + blur[2 * p + 1].toFixed(2) + " px" + (D.blur.unusable[p] ? ", not usable: the search could not pin it down, so the two aperture fits give no value here." : ".");
+  $("page-note").textContent = note;
+  for (const m of methods) {
+    const g = fit(m.grid, R * CELL), ctx = g.ctx, range = rangeOf(m);
+    let found = 0;
+    ctx.clearRect(0, 0, g.width, g.height);
+    for (let r = 0; r < R; r++) for (let c = 0; c < C; c++) {
+      const x = m.v[(p * R + r) * C + c];
+      if (Number.isFinite(x)) { found++; ctx.fillStyle = rgb(shade(m, x, range)); ctx.fillRect(c * CELL + 1, r * CELL + 1, CELL - 2, CELL - 2); }
+      else { ctx.strokeStyle = token("--grid"); ctx.lineWidth = 1; ctx.strokeRect(c * CELL + 1.5, r * CELL + 1.5, CELL - 3, CELL - 3); }
+    }
+    if (m.over) { ctx.strokeStyle = ink; ctx.lineWidth = 2; ctx.strokeRect(m.over[1] * CELL + 1, m.over[0] * CELL + 1, CELL - 2, CELL - 2); }
+    m.pageLine.textContent = found ? fmt(m.pageMedian[p]) + " " + m.unit + ", " + found + " tiles" : "no values on this page";
+    m.figure.dataset.on = String(m === state.method);
+  }
+  // the selected method's numbers for this page
+  const m = state.method, table = $("numbers");
+  $("numbers-title").textContent = "Numbers for this page: " + m.title + " (" + m.unit + ")";
+  table.replaceChildren();
+  const head = table.insertRow();
+  head.append(el("th", ""));
+  for (let c = 0; c < C; c++) head.append(el("th", "col " + (c + 1)));
+  for (let r = 0; r < R; r++) {
+    const row = table.insertRow();
+    row.append(el("th", "row " + (r + 1)));
+    for (let c = 0; c < C; c++) { const x = m.v[(p * R + r) * C + c]; row.insertCell().textContent = Number.isFinite(x) ? fmt(x) : ""; }
+  }
+}
+function selectPage(p) {
+  state.page = Math.min(P - 1, Math.max(0, p));
+  drawPage(); drawStrip();
+}
+$("prev").addEventListener("click", () => selectPage(state.page - 1));
+$("next").addEventListener("click", () => selectPage(state.page + 1));
+
+// ---- how the tile values spread
+const hist = $("hist");
+function drawHist() {
+  const m = state.method, g = fit(hist, 230), ctx = g.ctx;
+  $("hist-title").textContent = m.title + ": how tile values spread";
+  ctx.clearRect(0, 0, g.width, g.height);
+  hist.bins = null;
+  if (!m.count) { $("hist-note").textContent = "No tile has a value for this method."; return; }
+  const reach = Math.max(5 * m.spread, Math.abs(m.median) * 1e-6);
+  let lo = Math.max(m.low, m.median - reach), hi = Math.min(m.high, m.median + reach);
+  if (!(hi > lo)) { lo = m.median - reach; hi = m.median + reach; }
+  const left = 62, right = 16, top = 10, bottom = 36, plotW = g.width - left - right, plotH = g.height - top - bottom;
+  const count = Math.max(8, Math.min(48, Math.floor(plotW / 12))), bins = new Array(count).fill(0);
+  let outside = 0;
+  for (const x of m.kept) { if (x < lo || x > hi) { outside++; continue; } bins[Math.min(count - 1, Math.floor((x - lo) / (hi - lo) * count))]++; }
+  $("hist-note").textContent = whole(m.count) + " tiles, in " + m.unit + "." + (outside ? " " + whole(outside) + " lie outside the range shown." : "");
+  const most = Math.max.apply(null, bins), yTicks = ticks(0, most, 3), slot = plotW / count;
+  ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.lineWidth = 1;
+  for (const t of yTicks) {
+    const y = Math.round(top + plotH * (1 - t / most)) + 0.5;
+    ctx.strokeStyle = t ? token("--grid") : token("--axis");
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + plotW, y); ctx.stroke();
+    ctx.fillStyle = token("--muted"); ctx.fillText(whole(Math.round(t)), left - 8, y);
+  }
+  ctx.fillStyle = token("--series-1");
+  bins.forEach((n, k) => {
+    if (!n) return;
+    const h = Math.max(1, plotH * n / most), x = left + k * slot + 1, w = Math.max(1, slot - 2), y = top + plotH - h, r = Math.min(3, w / 2, h);
+    ctx.beginPath();
+    ctx.moveTo(x, y + h); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r); ctx.lineTo(x + w, y + h); ctx.fill();
+  });
+  if (hist.over != null && bins[hist.over]) {
+    ctx.strokeStyle = token("--ink"); ctx.lineWidth = 2;
+    const h = Math.max(1, plotH * bins[hist.over] / most);
+    ctx.strokeRect(left + hist.over * slot + 1, top + plotH - h, Math.max(1, slot - 2), h);
+  }
+  const xTicks = ticks(lo, hi, Math.max(2, Math.floor(plotW / 110))), xStep = xTicks.length > 1 ? xTicks[1] - xTicks[0] : 1;
+  ctx.fillStyle = token("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const t of xTicks) ctx.fillText(tickText(t, xStep), left + (t - lo) / (hi - lo) * plotW, top + plotH + 8);
+  hist.bins = { bins, lo, hi, left, slot, count };
+}
+hist.addEventListener("pointermove", (event) => {
+  const b = hist.bins;
+  if (!b) return;
+  const k = Math.floor((event.clientX - hist.getBoundingClientRect().left - b.left) / b.slot);
+  if (k < 0 || k >= b.count) { hist.over = null; hideTip(); drawHist(); return; }
+  hist.over = k; drawHist();
+  const width = (b.hi - b.lo) / b.count, m = state.method;
+  showTip(event, fmt(b.lo + k * width) + " to " + fmt(b.lo + (k + 1) * width) + " " + m.unit, [[whole(b.bins[k]), "tiles", true]]);
+});
+hist.addEventListener("pointerleave", () => { hist.over = null; hideTip(); drawHist(); });
+
+// ---- blur found on each page
+const blurCanvas = $("blur");
+const blurSeries = [["Across the page (x)", "--series-1", 0], ["Along the page (y)", "--series-2", 1]];
+function drawBlur() {
+  if (!blur) return;
+  const g = fit(blurCanvas, 230), ctx = g.ctx;
+  ctx.clearRect(0, 0, g.width, g.height);
+  const left = 62, right = 16, top = 10, bottom = 36, plotW = g.width - left - right, plotH = g.height - top - bottom;
+  let lo = Infinity, hi = -Infinity;
+  for (const x of blur) if (Number.isFinite(x)) { lo = Math.min(lo, x); hi = Math.max(hi, x); }
+  if (!(hi >= lo)) return;
+  const pad = Math.max(0.05, (hi - lo) * 0.15);
+  lo = Math.max(0, lo - pad); hi += pad;
+  const xOf = (p) => left + (P > 1 ? p / (P - 1) : 0.5) * plotW, yOf = (y) => top + plotH * (1 - (y - lo) / (hi - lo));
+  const yTicks = ticks(lo, hi, 4), yStep = yTicks.length > 1 ? yTicks[1] - yTicks[0] : 1;
+  ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.lineWidth = 1;
+  for (const t of yTicks) {
+    ctx.strokeStyle = token("--grid");
+    ctx.beginPath(); ctx.moveTo(left, Math.round(yOf(t)) + 0.5); ctx.lineTo(left + plotW, Math.round(yOf(t)) + 0.5); ctx.stroke();
+    ctx.fillStyle = token("--muted"); ctx.fillText(tickText(t, yStep), left - 8, yOf(t));
+  }
+  ctx.strokeStyle = token("--axis");
+  ctx.beginPath(); ctx.moveTo(left, top + plotH + 0.5); ctx.lineTo(left + plotW, top + plotH + 0.5); ctx.stroke();
+  for (const [, colour, axis] of blurSeries) {
+    ctx.strokeStyle = token(colour); ctx.fillStyle = token(colour); ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath();
+    let open = false, last = null;
+    for (let p = 0; p < P; p++) {
+      const y = blur[2 * p + axis];
+      if (!Number.isFinite(y)) { open = false; continue; }
+      if (open) ctx.lineTo(xOf(p), yOf(y)); else ctx.moveTo(xOf(p), yOf(y));
+      open = true; last = [xOf(p), yOf(y)];
+    }
+    ctx.stroke();
+    if (last && P <= 60) for (let p = 0; p < P; p++) if (Number.isFinite(blur[2 * p + axis])) { ctx.beginPath(); ctx.arc(xOf(p), yOf(blur[2 * p + axis]), 4, 0, 7); ctx.fill(); }
+  }
+  ctx.fillStyle = token("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "top";
+  const pageStep = Math.max(1, nice(P / Math.max(2, Math.floor(plotW / 90))));
+  for (let p = 0; p < P; p += pageStep) ctx.fillText(String(D.page_numbers[p]), xOf(p), top + plotH + 8);
+  ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillText("Page", left - 8, top + plotH + 15);
+  if (blurCanvas.over != null) {
+    const x = Math.round(xOf(blurCanvas.over)) + 0.5;
+    ctx.strokeStyle = token("--ink-2"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + plotH); ctx.stroke();
+  }
+  blurCanvas.frame = { left, plotW };
+}
+blurCanvas.addEventListener("pointermove", (event) => {
+  const f = blurCanvas.frame;
+  if (!f) return;
+  const p = Math.min(P - 1, Math.max(0, Math.round((event.clientX - blurCanvas.getBoundingClientRect().left - f.left) / f.plotW * (P - 1))));
+  blurCanvas.over = p; drawBlur();
+  showTip(event, "Page " + D.page_numbers[p] + (D.blur.unusable[p] ? ", not usable" : ""), blurSeries.map(([label, , axis]) => [Number.isFinite(blur[2 * p + axis]) ? blur[2 * p + axis].toFixed(2) + " px" : "no fit", label, false]));
+});
+blurCanvas.addEventListener("pointerleave", () => { blurCanvas.over = null; hideTip(); drawBlur(); });
+blurCanvas.addEventListener("click", () => { if (blurCanvas.over != null) selectPage(blurCanvas.over); });
+
+// ---- wiring
+function legend() {
+  const m = state.method, range = rangeOf(m), host = $("strip-legend");
+  const bar = el("span", null, "ramp");
+  bar.style.background = "linear-gradient(90deg," + [0, 32, 64, 96, 127, 159, 191, 223, 255].map((k) => rgb(ramp[k])).join(",") + ")";
+  const scale = el("span");
+  scale.append(percent(range) + " smaller", bar, percent(range) + " larger");
+  const none = el("span");
+  none.append(el("span", null, "swatch"), "No value");
+  host.replaceChildren(scale, el("span", "Middle of the scale: " + fmt(m.median) + " " + m.unit), none);
+}
+function choose(m) {
+  state.method = m;
+  for (const other of methods) other.row.setAttribute("aria-selected", String(other === m));
+  $("strip-title").textContent = m.title + " on every tile of the file";
+  $("strip-note").textContent = m.count
+    ? "Colour shows how far a tile is from this method's typical value. The line under the map is the median of each page, in " + m.unit + "."
+    : "This method gave no value on any tile.";
+  legend(); drawStrip(); drawPage(); drawHist();
+}
+function redraw() { buildRamp(); legend(); drawStrip(); drawPage(); drawHist(); drawBlur(); }
+
+$("title").textContent = "CD per tile: " + D.file;
+$("summary").textContent = whole(P) + (P === 1 ? " page" : " pages") + ", " + whole(D.accepted_tiles) + " of " + whole(D.tested_tiles) + " tiles matched the reference"
+  + (D.measured_tiles < D.accepted_tiles ? ", " + whole(D.measured_tiles) + " of them measured" : "")
+  + ". " + D.gpu + ", " + seconds(D.total_seconds) + " in total.";
+const select = $("range");
+for (const [value, label] of [["auto", "Automatic"], ["0.2", "±0.2%"], ["0.5", "±0.5%"], ["1", "±1%"], ["2", "±2%"], ["5", "±5%"], ["10", "±10%"], ["20", "±20%"]]) {
+  const option = el("option", label); option.value = value; select.append(option);
+}
+select.addEventListener("change", () => { state.range = select.value; legend(); drawStrip(); drawPage(); });
+if (D.lattices.length > 1) {
+  const pick = $("lattice");
+  D.lattices.forEach((item, k) => {
+    const option = el("option", "Array " + (k + 1) + ": " + item.shape + ", pitch " + item.pitch.toFixed(1) + " px, " + whole(item.tiles) + " tiles");
+    option.value = k; pick.append(option);
+  });
+  pick.value = lattice;
+  $("scope-note").textContent = "The reference holds " + D.lattices.length + " hole arrays. The table, the maps and the spread below show one at a time.";
+  $("scope").hidden = false;
+  pick.addEventListener("change", () => { scope(+pick.value); fillTable(); choose(state.method); });
+}
+if (blur) {
+  $("blur-note").textContent = D.blur.source === "supplied"
+    ? "The aperture model and the differential fit used the blur given on the command line."
+    : "The aperture model and the differential fit compare each opening with a blurred template. Nothing is supplied: the blur is found on each page from that page's own openings. A steady line means the pages agree."
+      + (D.blur.unusable_page_fits ? " On " + whole(D.blur.unusable_page_fits) + " pages the search could not pin the blur down, and the two aperture fits give no value there." : "");
+  const host = $("blur-legend");
+  for (const [label, colour] of blurSeries) {
+    const item = el("span"), key = el("span", null, "key");
+    key.style.borderTopColor = token(colour);
+    item.append(key, label + ", px");
+    host.append(item);
+  }
+} else $("blur-card").hidden = true;
+buildRamp(); buildTable(); buildMultiples();
+choose(state.method);
+drawBlur();
+let pending = 0;
+window.addEventListener("resize", () => { cancelAnimationFrame(pending); pending = requestAnimationFrame(redraw); });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  redraw();
+  document.querySelectorAll("#blur-legend .key").forEach((key, k) => { key.style.borderTopColor = token(blurSeries[k][1]); });
+});
+})();
+</script>
+</body>
+</html>

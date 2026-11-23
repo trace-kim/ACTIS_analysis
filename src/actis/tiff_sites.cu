@@ -342,19 +342,12 @@ __device__ bool well_conditioned(float corr[6][6], int n) {
 extern "C" __global__ void __launch_bounds__(ACTIS_FIT_THREADS)
     fit_apertures(const float *tiles, int side, const double *centers, const float *seeds,
                   const int *near, const int *owner, const int *use, int half, const float *tables,
-                  const float *bounds, const int *radii, int radius, int nh, int steps, int profile,
-                  float *result) {
+                  const float *bounds, int radius, int nh, int steps, int profile, float *result) {
     int job = blockIdx.x, site = use[job], tile = owner[site], t = threadIdx.x;
     int stamp = 2 * half + 1, npix = stamp * stamp, n = 10 * radius + 1, dim = nh == 1 ? 5 : 6;
-    const float *b = bounds + tile * 4;
-    Aperture lib = {tables + (long long)tile * 9 * nh * n * n,
-                    n,
-                    nh,
-                    radius,
-                    b[0],
-                    (b[1] - b[0]) / 8,
-                    b[2],
-                    (b[3] - b[2]) / 8};
+    // Every tile of the page shares one template library and its size range.
+    const float *b = bounds;
+    Aperture lib = {tables, n, nh, radius, b[0], (b[1] - b[0]) / 8, b[2], (b[3] - b[2]) / 8};
     int px = t % stamp - half, py = t / stamp - half;
     double cx = centers[2 * site], cy = centers[2 * site + 1];
     int ix = __double2int_rn(cx), iy = __double2int_rn(cy);
@@ -369,7 +362,7 @@ extern "C" __global__ void __launch_bounds__(ACTIS_FIT_THREADS)
             if (adj < 0)
                 continue;
             double dx = centers[2 * adj] - cx, dy = centers[2 * adj + 1] - cy;
-            if (fmax(fabs(dx), fabs(dy)) >= radii[tile] + half)
+            if (fmax(fabs(dx), fabs(dy)) >= radius + half)
                 continue;
             float gain = clipf(seeds[3 * adj + 2] / seeds[3 * site + 2], 0, 4);
             tail += gain *

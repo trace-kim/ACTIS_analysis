@@ -2,22 +2,13 @@
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from itertools import repeat
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from .discovery import Region, discover
-from .harmonics import _frequencies, measure_orders
-
-
-def _harmonic_cds(region, freq, amplitudes, floors):
-    values = []
-    for amplitude, floor in zip(amplitudes, floors):
-        row = measure_orders(
-            amplitude, floor, freq, region, {"status": "insufficient_orders"}
-        )
-        values.append(row.get("cd_px", np.nan))
-    return values
+from .harmonics import _frequencies
+from .tiff_harmonics import matched_cds
 
 
 @dataclass
@@ -29,6 +20,7 @@ class ReferenceTile:
     window: object
     dft_x: object
     dft_y: object
+    neighbors: np.ndarray
 
     def geometry(self, shift):
         """Transfer native reference seeds and lattice phase to the matched tile."""
@@ -54,7 +46,18 @@ class ReferenceTile:
         noise = max(1e-12, float(np.median(np.minimum(abs(side1), abs(side2)))))
         return amplitude * np.exp(2j * np.pi * (freq @ anchor)), noise
 
-    def harmonic_cds(self, tiles, shifts, pool, workers):
+    def anchored_orders(self, tiles, shifts, freq):
+        """Each tile's complex lattice orders at its own lattice phase, and its noise floor."""
+        means = (tiles * self.window).sum(axis=(1, 2), keepdims=True, dtype=np.float64)
+        weighted = ((tiles - means) * self.window).astype(self.dft_y.dtype)
+        orders = ((self.dft_y @ weighted) * self.dft_x).sum(axis=2).get()
+        amp, off1, off2 = np.split(orders, 3, axis=1)
+        floors = np.maximum(1e-12, np.median(np.minimum(abs(off1), abs(off2)), axis=1))
+        anchors = self.region.diagnostics["anchor_xy"] + shifts
+        return amp * np.exp(2j * np.pi * (anchors @ freq.T)), floors
+
+    def harmonic_cds(self, tiles, shifts, cp):
+        """One lattice-harmonic CD per matched tile, with NaN for rejected tiles."""
         side = tiles.shape[-1]
         freq = _frequencies(self.region.basis)
         centers = self.region.centers + shifts[:, None, :]
@@ -65,24 +68,8 @@ class ReferenceTile:
         cds = np.full(len(tiles), np.nan)
         if len(freq) < 5 or side < 5 * self.region.pitch or not enough.any():
             return cds
-        means = (tiles * self.window).sum(axis=(1, 2), keepdims=True, dtype=np.float64)
-        weighted = ((tiles - means) * self.window).astype(self.dft_y.dtype)
-        orders = ((self.dft_y @ weighted) * self.dft_x).sum(axis=2).get()[enough]
-        amp, off1, off2 = np.split(orders, 3, axis=1)
-        floors = np.maximum(1e-12, np.median(np.minimum(abs(off1), abs(off2)), axis=1))
-        anchors = self.region.diagnostics["anchor_xy"] + shifts[enough]
-        amp *= np.exp(2j * np.pi * (anchors @ freq.T))
-        if pool is None or len(amp) < workers:
-            cds[enough] = _harmonic_cds(self.region, freq, amp, floors)
-        else:
-            jobs = pool.map(
-                _harmonic_cds,
-                repeat(self.region),
-                repeat(freq),
-                np.array_split(amp, workers),
-                np.array_split(floors, workers),
-            )
-            cds[enough] = np.concatenate(list(jobs))
+        amp, floors = self.anchored_orders(tiles, shifts, freq)
+        cds[enough] = matched_cds(amp[enough], floors[enough], freq, self.region, cp)
         return cds
 
 
@@ -123,6 +110,14 @@ def prepare_reference(image, side, shape, cp):
         )
         axis = np.arange(side)
         tx, ty = [cp.asarray(np.exp(-2j * np.pi * f[:, None] * axis)) for f in probes.T]
+        # The eight nearest lattice sites of each seed, the same for every tile.
+        # Lattices with fewer seeds pad with an index past the last seed.
+        near = cKDTree(local.centers).query(
+            local.centers, k=min(9, len(local.centers))
+        )[1]
+        near = near.reshape(len(local.centers), -1)[:, 1:]
+        neighbors = np.full((len(local.centers), 8), len(local.centers))
+        neighbors[:, : near.shape[1]] = near
         templates.append(
             ReferenceTile(
                 local,
@@ -132,6 +127,7 @@ def prepare_reference(image, side, shape, cp):
                 weights,
                 tx,
                 ty,
+                neighbors,
             )
         )
     if not templates:

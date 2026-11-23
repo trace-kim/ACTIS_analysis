@@ -177,25 +177,93 @@ The default run screens **every page** and measures **all seven methods on every
 python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --all-pages --all-tiles --json full-timing.json
 ~~~
 
-In the JSON report, `total_seconds` includes reference preparation, reading, screening and measurement. For the full run, `pages` equals `total_pages` and `measured_tiles` equals `accepted_tiles`. Only the explicit options `--sample-pages N` and `--max-pages N` limit the pages screened.
+### What a run leaves behind
 
-A full run on a local RTX 4060 Ti (16 GB) and Ryzen 5 7500F took 4 min 48 s from command launch to exit. The 2.89 GB uncompressed synthetic TIFF contained 1,024 grayscale 8-bit pages of 2,048 × 1,376 pixels. The first page supplied the square-hole reference. The other pages included independent noise. All seven methods ran on all 129,007 accepted tiles out of 163,840 screened. The aperture fits profiled blur on each tile.
+The console prints one row per method: time, valid and attempted counts, and the mean. The run also writes three files.
 
-Once you have chosen a method, use `--method` with `--all-tiles` to measure every accepted tile on every page. This example runs pooled aperture moments in batches on the GPU and reports the full scan time.
+| File | Contents |
+|---|---|
+| `timing.json` | Times per method and per stage, counts, the blur found on the pages and the settings of the run. `total_seconds` includes reference preparation, reading, screening and measurement. |
+| `timing.cd-map.npz` | Every tile's value. One array per method, shaped (page, tile row, tile column), with NaN where a tile was not accepted or the method gave no valid value. |
+| `timing.cd-map.html` | The map of those values, one self-contained page. It opens in the browser when the run ends. |
 
-~~~sh
-python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --method pooled --all-tiles --json pooled.json
+Without `--json` the two map files take the TIFF's name and go to the current folder. `--map results/scan.html` chooses another place, `--no-map` skips both files, and `--no-open` leaves the browser closed. A run whose output is redirected to a file does not open the browser either.
+
+A tile's value is the tile mean brightness for `raw`, one fitted size for `harmonic` and `pooled`, and the mean over the tile's valid openings for `contour`, `model`, `differential` and `flux`. For those four the file also holds `<method>_openings`, the number of valid openings behind each mean. `reference` gives the matched reference lattice of each tile (-1 for none), `page_index` the zero-based TIFF page of each row, and `blur_sigma_px` and `blur_usable` the blur of each page and reference lattice.
+
+~~~python
+import numpy as np
+
+tiles = np.load("timing.cd-map.npz")
+contour_px = tiles["contour"]  # (page, tile row, tile column)
+page_medians = np.nanmedian(contour_px.reshape(len(contour_px), -1), axis=1)
 ~~~
 
-The other choices are `raw`, `contour`, `flux`, `harmonic`, `model` and `differential`. The CUDA path batches independent radial contours, flux apertures, and model and differential fits across tiles for pitches up to 27 pixels. Each tile keeps its own contour seeds, blur search and validity tests. Larger pitches use the original per-tile estimators. The command distributes the harmonic least-squares fits across up to eight CPU processes.
+The map has four parts.
 
-The console identifies the CUDA device and reports the current stage every 15 seconds, including during reference preparation and individual fits. With `--json timing.json`, the benchmark writes ongoing results to `timing.partial.json` at completed pages or tiles and replaces them with the final `timing.json` on success. An interrupted run retains its most recent partial report. Use a new output name for a new run.
+- **Methods.** Time, tiles with a value, typical value and tile-to-tile spread of all seven methods in one table. Selecting a row shows that method everywhere else.
+- **Every tile of the file.** The pages laid end to end, coloured by how far each tile is from the method's typical value, above a line of page medians. The wheel zooms, dragging moves, and pointing at a tile gives its value in all seven methods.
+- **One page, all methods.** The page that was clicked, as seven small grids, with its numbers in a table on request.
+- **How tile values spread**, and **the blur found on each page**.
 
-An explicit `--sample-tiles N` selects a reproducible uniform sample of accepted tiles. For a tile sample, the console and JSON give an estimated time to run each method on every accepted tile on the screened pages. The combined `estimated_all_tiles_method_seconds` counts shared fit setup once. Reference preparation, TIFF reads and tile selection have separate timings. With either page limit, counts and projections cover only the pages screened.
+When the reference holds several hole arrays, a selector at the top shows one array at a time, so a tile is compared with tiles of its own array. `reference_shapes` and `reference_pitch_px` in the JSON list them.
 
-The selector takes one exemplar from each detected reference lattice and tests every complete scan tile against those exemplars, independent of page position. A batched GPU FFT estimates translation. All four quadrants of the overlapping pixels must then match at the same shift. The score is the lowest quadrant correlation after local gain and offset normalization. A blank or striped quadrant can therefore disqualify a tile whose overall correlation is high. This tests for hole arrays represented in the reference. Inspect labeled examples from the instrument when choosing `--min-corr` (default 0.80). The default tile side is 128 pixels. Choose an even `--tile-size` spanning at least five hole pitches. The output counts pixels skipped in incomplete edge tiles.
+### Speed
 
-The script prefetches the next TIFF page while processing bounded tile batches on one CUDA device. It reports scan wall time, pages per second, warm-up, decode, selection, and times and valid counts for all seven methods. Raw, harmonic and pooled counts refer to tiles. Contour, flux, model and differential counts refer to sites. GPU work is synchronized at timing boundaries. TIFF decoding, reference discovery, record assembly and the harmonic nonlinear fit use the CPU. Both aperture fits share contour seeds and blur profiling. Their individual times include that shared work, and the JSON also gives exclusive times. If the effective blur is independently calibrated, `--psf-sigma-px X Y` skips profiling. Use `--shape` only when the reference hole shape is known.
+A full run on a local RTX 4060 Ti (16 GB) and Ryzen 5 7500F took 2 min 20 s from command launch to exit. The 4.2 GB uncompressed synthetic TIFF had 1,500 grayscale 8-bit pages of 2,048 rows by 1,376 columns, the size of a production board stack. All seven methods ran on all 232,040 accepted tiles out of 240,000 screened, which hold 59.4 million openings. The seconds below count each stage once.
+
+| Stage | Seconds |
+|---|---|
+| Read and decode | 1.8 |
+| Screen tiles against the reference | 6.9 |
+| Raw brightness | 0.3 |
+| Contours | 19.9 |
+| Blur search and fit preparation, shared by the two aperture fits | 28.3 |
+| Aperture model fits | 16.5 |
+| Differential fits | 7.0 |
+| Integrated intensity | 6.7 |
+| Lattice harmonics | 18.1 |
+| Pooled moments | 27.2 |
+
+Once you have chosen a method, use `--method` to measure it alone on every accepted tile. The other choices are `raw`, `contour`, `flux`, `harmonic`, `model` and `differential`.
+
+~~~sh
+python scripts/benchmark_tiff.py scan.tiff --reference holes.tiff --method pooled --json pooled.json
+~~~
+
+The benchmark uses one CUDA device, chosen with `--device`. On a workstation with several, start one run per device on different files.
+
+### How the methods run
+
+The script prefetches the next TIFF page while it measures the current one. A page's complete tiles are screened together, and its accepted tiles are then measured together by every method. GPU work is synchronized at timing boundaries. TIFF decoding, reference discovery and the bookkeeping of results use the CPU.
+
+Radial contours, flux apertures and the two aperture fits run as CUDA kernels over all openings of a page, for pitches up to 27 pixels. Larger pitches use the original per-tile estimators. Every opening keeps its own contour seed, position, fitted size and validity tests. The lattice-harmonic fit also runs on the GPU for all tiles of a page at once. It solves the same bounded least-squares problem from the same three starts as the CPU reference in `actis.harmonics`, and the tests hold the two to the same accepted tiles and sizes.
+
+### Blur
+
+The aperture model and the differential fit compare each opening with a blurred template of a known shape, so they need the blur of the optics. The other five methods do not take a blur. No blur has to be supplied. On each page the benchmark tries a short list of blur settings on up to ten openings from every accepted tile and keeps the setting whose templates reproduce those pixels best. Every tile of the page is then fitted with it. The console, the JSON and the map report what was found. A page whose best settings disagree about the size, or whose blur lies at the end of the search range, gives no aperture-fit values. `--psf-sigma-px X Y` replaces the search with a fixed blur.
+
+The fitted size depends on the blur the fit assumes, and the search lands on a small set of values. The synthetic stack above shows the effect. Its mask is the same on every page, and its blur rises in two steps of about 0.1 px, after page 500 and after page 1000.
+
+| Method | Change of page median at the first step | At the second step |
+|---|---|---|
+| Contour | -0.3% | +0.2% |
+| Aperture model | +0.3% | -2.8% |
+| Differential fit | +0.3% | -2.5% |
+| Lattice harmonics | -0.6% | -0.9% |
+| Pooled moments | -0.8% | -0.7% |
+
+The blur search returned 0.85 by 1.01 px on both sides of the first step (true 0.78 by 0.96, then 0.88 by 1.04) and 1.09 by 1.25 px after the second (true 1.00 by 1.14). This is one synthetic stack with a Gaussian blur. On real pages, read the blur chart of the map beside the page medians of the two aperture fits: a jump in both at the same page is the blur search, not the mask.
+
+### Sampling
+
+The console identifies the CUDA device and reports the current stage every 15 seconds, including during reference preparation. With `--json timing.json`, the benchmark writes ongoing results to `timing.partial.json` at completed pages and replaces them with the final `timing.json` on success. An interrupted run retains its most recent partial report. Use a new output name for a new run.
+
+Only the explicit options `--sample-pages N` and `--max-pages N` limit the pages screened. An explicit `--sample-tiles N` selects a reproducible uniform sample of accepted tiles. The sampled tiles of a page are measured together and share that page's blur. For a tile sample, the console and JSON give an estimated time to run each method on every accepted tile on the screened pages. The combined `estimated_all_tiles_method_seconds` counts shared fit setup once. Reference preparation, TIFF reads and tile selection have separate timings. With either page limit, counts and projections cover only the pages screened.
+
+### How tiles are chosen
+
+The selector takes one exemplar from each detected reference lattice and tests every complete scan tile against those exemplars, independent of page position. A batched GPU FFT estimates translation. All four quadrants of the overlapping pixels must then match at the same shift. The score is the lowest quadrant correlation after local gain and offset normalization. A blank or striped quadrant can therefore disqualify a tile whose overall correlation is high. This tests for hole arrays represented in the reference. Inspect labeled examples from the instrument when choosing `--min-corr` (default 0.80). The default tile side is 128 pixels. Choose an even `--tile-size` spanning at least five hole pitches. The output counts pixels skipped in incomplete edge tiles. Use `--shape` only when the reference hole shape is known. The JSON lists the shape found for each reference lattice in `reference_shapes`. With the shape `ambiguous`, the two aperture fits and the lattice harmonics give no sizes.
 
 ## Throughput and production boundary
 

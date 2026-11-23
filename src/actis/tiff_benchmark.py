@@ -3,11 +3,12 @@
 import argparse
 import json
 import os
+import sys
+import webbrowser
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
-from itertools import islice
-from multiprocessing import get_context
+from itertools import groupby, islice
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Event, Thread
@@ -20,10 +21,12 @@ from . import tiff_sites
 from .estimators import METHOD_NAMES, _contours, _flux, _model_methods
 from .fit import array_backend
 from .pooled import pooled_matched_cds
+from .tiff_map import write_map
 from .tiff_tiles import prepare_reference, select_tiles
 
 METHODS = ("raw", *METHOD_NAMES, "harmonic", "pooled")
 FITS = ("model", "differential")
+UNITS = {"raw": "DN", "flux": "DN px^2"}
 
 
 class Progress:
@@ -88,11 +91,10 @@ class TileSample:
 
 
 class Run:
-    def __init__(self, cp, progress, methods, pool=None, workers=1):
+    def __init__(self, cp, progress, methods):
         self.stream = cp.cuda.get_current_stream()
         self.progress = progress
         self.selected = methods
-        self.pool, self.workers = pool, workers
         self.seconds = Counter()
         self.valid = Counter()
         self.attempted = Counter()
@@ -124,12 +126,74 @@ class Run:
                 "exclusive_seconds": self.seconds[name],
                 "attempted": self.attempted[name],
                 "valid": self.valid[name],
-                "unit": {"raw": "DN", "flux": "DN px^2"}.get(name, "px"),
+                "unit": UNITS.get(name, "px"),
                 "mean": self.sums[name] / self.valid[name]
                 if self.valid[name]
                 else None,
             }
         return rows
+
+
+class TileMaps:
+    """Every method's value for every tile of the file, kept in page order."""
+
+    def __init__(self, methods=METHODS):
+        self.methods = tuple(methods)
+        self.page_index = []
+        self.grids = []
+        self.values = []
+        self.openings = []
+        self.reference = []
+        self.blur = []
+
+    def add_page(self, page_index, rows, columns):
+        """Start an empty page and return its position in the scan."""
+        size = rows * columns
+        self.page_index.append(page_index)
+        self.grids.append((rows, columns))
+        self.values.append(
+            {m: np.full(size, np.nan, dtype=np.float32) for m in self.methods}
+        )
+        self.openings.append(
+            {
+                m: np.zeros(size, dtype=np.int32)
+                for m in self.methods
+                if m in METHOD_NAMES
+            }
+        )
+        self.reference.append(np.full(size, -1, dtype=np.int8))
+        return len(self.grids) - 1
+
+    def arrays(self):
+        """Stack the pages as (page, tile row, tile column). Smaller pages are padded."""
+        rows = max((g[0] for g in self.grids), default=0)
+        columns = max((g[1] for g in self.grids), default=0)
+
+        def stack(parts, fill, dtype):
+            out = np.full((len(parts), rows, columns), fill, dtype=dtype)
+            for page, (part, (r, c)) in enumerate(zip(parts, self.grids)):
+                out[page, :r, :c] = part.reshape(r, c)
+            return out
+
+        data = {
+            m: stack([page[m] for page in self.values], np.nan, np.float32)
+            for m in self.methods
+        }
+        for m in self.methods:
+            if m in METHOD_NAMES:
+                data[f"{m}_openings"] = stack(
+                    [page[m] for page in self.openings], 0, np.int32
+                )
+        data["reference"] = stack(self.reference, -1, np.int8)
+        data["page_index"] = np.asarray(self.page_index, dtype=np.int64)
+        references = 1 + max((entry[1] for entry in self.blur), default=0)
+        sigma = np.full((len(self.grids), references, 2), np.nan, dtype=np.float32)
+        usable = np.zeros((len(self.grids), references), dtype=bool)
+        for position, reference, sigma_x, sigma_y, ok in self.blur:
+            sigma[position, reference] = sigma_x, sigma_y
+            usable[position, reference] = ok
+        data["blur_sigma_px"], data["blur_usable"] = sigma, usable
+        return data
 
 
 def _read_page(page):
@@ -150,9 +214,8 @@ def _read_page(page):
     return data
 
 
-def _raw_means(tiles, matches, cp):
-    ids = cp.asarray(matches[:, 0], dtype=cp.int32)
-    return tiles[ids].mean(axis=(1, 2), dtype=cp.float64).get()
+def _raw_means(tiles, cp):
+    return tiles.mean(axis=(1, 2), dtype=cp.float64).get()
 
 
 def _decoded_pages(stack, max_pages=None, page_indices=None):
@@ -202,35 +265,18 @@ def _reference(path, index, tifffile):
             ) from None
 
 
-def _batch_values(tiles, matches, templates, run, cp):
-    """One value per match for methods that can measure many tiles at once."""
-    values = {}
-    if "raw" in run.selected:
-        with run.time("raw"):
-            values["raw"] = _raw_means(tiles, matches, cp)
-    for name in ("pooled", "harmonic"):
-        if name not in run.selected:
-            continue
-        with run.time(name):
-            cds = np.full(len(matches), np.nan)
-            for ref_id in np.unique(matches[:, 1].astype(int)):
-                group = matches[:, 1] == ref_id
-                indices = cp.asarray(matches[group, 0], dtype=cp.int32)
-                subset, shifts = tiles[indices], matches[group, 2:]
-                template = templates[ref_id]
-                cds[group] = (
-                    pooled_matched_cds(subset, template.region, shifts, cp)
-                    if name == "pooled"
-                    else template.harmonic_cds(subset, shifts, run.pool, run.workers)
-                )
-            values[name] = cds
-    return values
-
-
 def _measure_native_sites(tile, region, psf, run, cp):
+    """The general per-tile estimators. Returns {method: (tile mean, valid openings)}."""
     side = tile.shape[0]
     args = (region.centers, region.pitch, region.shape)
     fit_names = tuple(name for name in FITS if name in run.selected)
+    per_tile = {}
+
+    def record(name, rows, field="cd_px"):
+        values = [r[field] for r in rows if r["valid"]]
+        per_tile[name] = (np.mean(values) if values else np.nan, len(values))
+        run.record(name, values, len(rows))
+
     if "contour" in run.selected or fit_names:
         with run.time("contour"):
             image = tile.astype(cp.float32, copy=False)
@@ -238,13 +284,11 @@ def _measure_native_sites(tile, region, psf, run, cp):
                 image, *args, region.angle, threshold_diagnostics=True, xp=cp
             )
         if "contour" in run.selected:
-            run.record(
-                "contour", [r["cd_px"] for r in contours if r["valid"]], len(contours)
-            )
+            record("contour", contours)
     if "flux" in run.selected:
         with run.time("flux"):
             flux = _flux(tile, *args, contours=None, bright=None, dark=None, xp=cp)
-        run.record("flux", [r["flux_dn_px2"] for r in flux if r["valid"]], len(flux))
+        record("flux", flux, "flux_dn_px2")
     if fit_names:
         # Both fits share the contour seeds and blur profile.
         fit_seconds = Counter()
@@ -263,7 +307,66 @@ def _measure_native_sites(tile, region, psf, run, cp):
         run.seconds["fit_setup"] -= sum(fit_seconds.values())
         run.seconds.update(fit_seconds)
         for name, rows in fits.items():
-            run.record(name, [r["cd_px"] for r in rows if r["valid"]], len(rows))
+            record(name, rows)
+    return per_tile
+
+
+def _measure_page(tiles, matches, templates, psf, run, cp):
+    """Run the selected methods on the accepted tiles of one page.
+
+    Returns one value per tile for each method, the valid openings per tile for
+    the per-opening methods, and the blur the aperture fits used per reference.
+    """
+    count = len(matches)
+    references = matches[:, 1].astype(int)
+    values, openings, blurs = {}, {}, []
+
+    def column(name, store=values, fill=np.nan):
+        if name not in store:
+            store[name] = np.full(count, fill)
+        return store[name]
+
+    if "raw" in run.selected:
+        with run.time("raw"):
+            values["raw"] = _raw_means(tiles, cp)
+    per_opening = any(name in run.selected for name in METHOD_NAMES)
+    for reference in np.unique(references):
+        group = np.flatnonzero(references == reference)
+        template = templates[reference]
+        subset = tiles if len(group) == count else tiles[cp.asarray(group)]
+        shifts = matches[group, 2:]
+        if "pooled" in run.selected:
+            with run.time("pooled"):
+                column("pooled")[group] = pooled_matched_cds(
+                    subset, template.region, shifts, cp
+                )
+        if "harmonic" in run.selected:
+            with run.time("harmonic"):
+                column("harmonic")[group] = template.harmonic_cds(subset, shifts, cp)
+        if not per_opening:
+            continue
+        if tiff_sites.supported(template.region):
+            per_tile, blur = tiff_sites.measure_group(
+                subset, template, shifts, psf, run, cp
+            )
+            if blur is not None:
+                blurs.append((int(reference), *blur))
+        else:
+            rows = [
+                _measure_native_sites(tile, template.geometry(shift), psf, run, cp)
+                for tile, shift in zip(subset, shifts)
+            ]
+            per_tile = {
+                name: tuple(np.array([row[name][i] for row in rows]) for i in (0, 1))
+                for name in rows[0]
+            }
+        for name, (mean, valid) in per_tile.items():
+            column(name)[group] = mean
+            column(name, openings, 0)[group] = valid
+    for name in ("raw", "pooled", "harmonic"):
+        if name in values:
+            run.record(name, values[name][np.isfinite(values[name])], count)
+    return values, openings, blurs
 
 
 def benchmark(
@@ -282,8 +385,12 @@ def benchmark(
     checkpoint=None,
     method=None,
     sample_pages=None,
-    harmonic_workers=1,
+    maps=None,
 ):
+    """Screen the pages of one TIFF and time the methods on its accepted tiles.
+
+    Pass a TileMaps as `maps` to receive every tile's value for every method.
+    """
     try:
         import tifffile
     except ImportError:
@@ -315,6 +422,8 @@ def benchmark(
         psf = tuple(psf)
     total_start = perf_counter()
     ref_path = Path(reference or path)
+    maps = TileMaps() if maps is None else maps
+    maps.methods = selected
     with ExitStack() as resources:
         live = resources.enter_context(Progress(progress))
         cp = array_backend("cuda")
@@ -338,17 +447,9 @@ def benchmark(
             page_indices = (
                 np.random.default_rng(0).integers(edges[:-1], edges[1:]).tolist()
             )
-        workers = harmonic_workers
-        pool = None
-        if "harmonic" in selected and sample_tiles is None and workers > 1:
-            # Workers fit spectra on the CPU. Never fork the CUDA context.
-            pool = resources.enter_context(
-                ProcessPoolExecutor(
-                    max_workers=workers, mp_context=get_context("spawn")
-                )
-            )
-        run = Run(cp, live, selected, pool, workers)
-        batch_size = max(1, min(64, 2**20 // tile_size**2))
+        run = Run(cp, live, selected)
+        # A page's tiles are screened in bounded chunks. A board page fits in one.
+        chunk = max(1, min(1024, 2**23 // tile_size**2))
         with run.time("reference_and_warmup"):
             ref = _reference(ref_path, reference_page, tifffile)
             live.stage = f"discovering reference lattices on CPU ({ref.shape[1]} x {ref.shape[0]})"
@@ -360,7 +461,7 @@ def benchmark(
                     "First target page must be grayscale and fit at least one complete tile"
                 )
             warm_count = min(
-                batch_size,
+                chunk,
                 (first.shape[0] // tile_size) * (first.shape[1] // tile_size),
             )
             for number, template in enumerate(templates, 1):
@@ -381,16 +482,7 @@ def benchmark(
                     tile = cp.rint((pixels - pixels.min()) * scale).astype(first.dtype)
                     batch = cp.repeat(tile[None], warm_count, axis=0)
                 warm = Run(cp, live, selected)
-                _batch_values(batch[:1], matches[:1], [template], warm, cp)
-                if any(m in selected for m in METHOD_NAMES):
-                    if tiff_sites.supported(template.region):
-                        tiff_sites.measure_group(
-                            tile[None], template, np.zeros((1, 2)), psf, warm, cp
-                        )
-                    else:
-                        _measure_native_sites(
-                            tile, template.geometry(np.zeros(2)), psf, warm, cp
-                        )
+                _measure_page(batch[:1], matches[:1], [template], psf, warm, cp)
         sample = TileSample(sample_tiles) if sample_tiles is not None else None
         mode = (
             "all accepted tiles"
@@ -405,6 +497,7 @@ def benchmark(
         )
         live.tell()
         pages = tested = accepted = edge_pixels = measured = 0
+        position_of = {}
         scan_start = perf_counter()
         last_save = -np.inf
 
@@ -431,26 +524,19 @@ def benchmark(
                 )
                 last_save = now
 
-        def measure_batch(tiles, matches):
+        def measure(tiles, matches, position):
+            """Measure one page's accepted tiles and file each tile's value."""
             nonlocal measured
-            if not len(matches):
-                return
-            values = _batch_values(tiles, matches, templates, run, cp)
-            if any(name in selected for name in METHOD_NAMES):
-                for ref in np.unique(matches[:, 1].astype(int)):
-                    group = matches[matches[:, 1] == ref]
-                    template = templates[ref]
-                    if tiff_sites.supported(template.region):
-                        ids = cp.asarray(group[:, 0], dtype=cp.int32)
-                        tiff_sites.measure_group(
-                            tiles[ids], template, group[:, 2:], psf, run, cp
-                        )
-                    else:
-                        for idx, _, dx, dy in group:
-                            region = template.geometry(np.array([dx, dy]))
-                            _measure_native_sites(tiles[int(idx)], region, psf, run, cp)
+            values, openings, blurs = _measure_page(
+                tiles, matches, templates, psf, run, cp
+            )
+            where = matches[:, 0].astype(int)
+            maps.reference[position][where] = matches[:, 1]
             for name, column in values.items():
-                run.record(name, column[np.isfinite(column)], len(column))
+                maps.values[position][name][where] = column
+            for name, column in openings.items():
+                maps.openings[position][name][where] = column
+            maps.blur.extend((position, *blur) for blur in blurs)
             measured += len(matches)
             save_progress()
 
@@ -465,27 +551,40 @@ def benchmark(
                     f"Tile size {tile_size} exceeds the dimensions of page {page_index}: {w} x {h}"
                 )
             edge_pixels += h * w - nx * ny * tile_size**2
-            # This is a strided CPU view. Pack and upload only one batch of
-            # complete tiles, even if an individual TIFF page is very large.
+            position = position_of[page_index] = maps.add_page(page_index, ny, nx)
+            # This is a strided CPU view. Only complete tiles are packed and uploaded.
             tile_grid = (
                 data[: ny * tile_size, : nx * tile_size]
                 .reshape(ny, tile_size, nx, tile_size)
                 .transpose(0, 2, 1, 3)
             )
-            for start in range(0, ny * nx, batch_size):
+            kept, found = [], []
+            for start in range(0, ny * nx, chunk):
                 live.location = (
                     f"Selecting on page {page_index + 1}, tile {start + 1}/{ny * nx}"
                 )
                 with run.time("selection"):
-                    indices = np.arange(start, min(start + batch_size, ny * nx))
+                    indices = np.arange(start, min(start + chunk, ny * nx))
                     tiles = cp.asarray(tile_grid[indices // nx, indices % nx])
                     matches = select_tiles(tiles, templates, min_corr, cp)
-                tested += len(tiles)
+                    if sample is None and 0 < len(matches) < len(tiles):
+                        tiles = tiles[cp.asarray(matches[:, 0], dtype=cp.int32)]
+                tested += len(indices)
                 accepted += len(matches)
-                if sample is None:
-                    measure_batch(tiles, matches)
-                else:
+                if sample is not None:
                     sample.consider(data, page_index, start, matches, tile_size)
+                elif len(matches):
+                    # From here on a tile is known by its index on the page.
+                    matches[:, 0] += start
+                    kept.append(tiles)
+                    found.append(matches)
+            if found:
+                live.location = f"Measuring page {page_index + 1}"
+                measure(
+                    kept[0] if len(kept) == 1 else cp.concatenate(kept),
+                    np.concatenate(found),
+                    position,
+                )
             pages += 1
             live.location = f"Read {pages} pages, accepted {accepted}/{tested} tiles, measured {measured}"
             live.stage = "waiting for next TIFF page"
@@ -496,16 +595,14 @@ def benchmark(
             live.location = f"Scanned {pages} pages, measuring {len(sample.entries)} of {accepted} accepted tiles"
             live.stage = "uploading sample"
             live.tell()
-            # Preserve integer bit depth, including for saturation checks, and
-            # batch raw brightness on the same selected tiles as the other methods.
-            for dtype in sorted({entry[2].dtype for entry in sample.entries}, key=str):
-                group = [entry for entry in sample.entries if entry[2].dtype == dtype]
-                for start in range(0, len(group), batch_size):
-                    entries = group[start : start + batch_size]
-                    with run.time("sample_upload"):
-                        tiles = cp.asarray(np.stack([e[2] for e in entries]))
-                    matches = np.array([(i, *e[3:]) for i, e in enumerate(entries)])
-                    measure_batch(tiles, matches)
+            # Each page's sampled tiles are measured together, like a full page.
+            entries = sorted(sample.entries, key=lambda e: (position_of[e[0]], e[1]))
+            for page_index, group in groupby(entries, key=lambda e: e[0]):
+                group = list(group)
+                with run.time("sample_upload"):
+                    tiles = cp.asarray(np.stack([e[2] for e in group]))
+                matches = np.array([(e[1], *e[3:]) for e in group], dtype=float)
+                measure(tiles, matches, position_of[page_index])
         scan_seconds = perf_counter() - scan_start
     methods = run.methods()
     # Inclusive model and differential times both contain the same contour
@@ -520,6 +617,17 @@ def benchmark(
     ranked = sorted(
         (m for m in methods if methods[m]["valid"]), key=lambda m: methods[m]["seconds"]
     )
+    blur = None
+    if maps.blur:
+        sigma = np.array([entry[2:4] for entry in maps.blur], dtype=float)
+        blur = {
+            "source": "supplied" if psf is not None else "estimated on each page",
+            "page_fits": len(maps.blur),
+            "unusable_page_fits": sum(not entry[4] for entry in maps.blur),
+            "median_sigma_px": np.median(sigma, axis=0).tolist(),
+            "lowest_sigma_px": sigma.min(axis=0).tolist(),
+            "highest_sigma_px": sigma.max(axis=0).tolist(),
+        }
     return {
         "status": "complete",
         "input": str(path),
@@ -530,7 +638,9 @@ def benchmark(
         "tile_size": tile_size,
         "min_corr": min_corr,
         "reference_shapes": [t.region.shape for t in templates],
+        "reference_pitch_px": [float(t.region.pitch) for t in templates],
         "psf_sigma_px": psf,
+        "blur": blur,
         "pages": pages,
         "total_pages": pages
         if max_pages is None and page_indices is None
@@ -659,8 +769,32 @@ def main(argv=None):
         help="Known detector blur in pixels; skips per-tile blur profiling",
     )
     parser.add_argument("--json", type=Path, help="Also write a new timing JSON file")
+    parser.add_argument(
+        "--map",
+        type=Path,
+        help="Per-tile map to write. Default: beside --json, otherwise "
+        "<TIFF name>.cd-map.html in the current folder. The tile values are "
+        "saved beside it as .npz",
+        metavar="HTML",
+    )
+    parser.add_argument(
+        "--no-map", action="store_true", help="Do not write the map and tile values"
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the map in the browser after the run",
+    )
     args = parser.parse_args(argv)
     partial = PartialReport(args.json) if args.json else None
+    map_path = None
+    if not args.no_map:
+        map_path = args.map or (
+            args.json.with_suffix(".cd-map.html")
+            if args.json
+            else Path.cwd() / f"{args.tiff.stem}.cd-map.html"
+        )
+    maps = TileMaps()
     try:
         if args.json and (args.json.exists() or partial.path.exists()):
             raise ValueError(f"Choose a new JSON output path: {args.json}")
@@ -675,9 +809,7 @@ def main(argv=None):
             sample_tiles=args.sample_tiles,
             max_pages=args.max_pages,
             sample_pages=args.sample_pages,
-            harmonic_workers=min(
-                8, (getattr(os, "process_cpu_count", os.cpu_count)() or 1)
-            ),
+            maps=maps,
             checkpoint=partial.write if partial else None,
             shape=args.shape,
             psf=args.psf_sigma_px,
@@ -688,6 +820,13 @@ def main(argv=None):
                 json.dump(result, f, indent=2, allow_nan=False)
             if partial.created:
                 partial.path.unlink()
+        if map_path:
+            arrays = maps.arrays()
+            map_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                map_path.with_suffix(".npz"), tile_size=args.tile_size, **arrays
+            )
+            write_map(map_path, result, arrays)
     except (OSError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"TIFF benchmark: {exc}\n")
     coverage = f"{result['pages']} pages"
@@ -724,6 +863,17 @@ def main(argv=None):
             "Aperture fit times include contour work and "
             f"{stages.get('fit_setup', 0):.3f} s of shared setup."
         )
+    blur = result["blur"]
+    if blur and blur["source"] != "supplied":
+        low, mid, high = (
+            blur[f"{key}_sigma_px"] for key in ("lowest", "median", "highest")
+        )
+        print(
+            f"Blur found on each page from its own openings, {blur['page_fits']} times: "
+            f"median sigma {mid[0]:.2f} x {mid[1]:.2f} px "
+            f"(x {low[0]:.2f} to {high[0]:.2f}, y {low[1]:.2f} to {high[1]:.2f}). "
+            f"{blur['unusable_page_fits']} left out because the blur could not be pinned down."
+        )
     if estimate is not None:
         print(
             f"At the measured rate of {estimate / result['accepted_tiles']:.3f} s/tile, "
@@ -743,6 +893,12 @@ def main(argv=None):
         print("No valid measurements on the screened pages.")
         if result["total_pages"] and result["pages"] < result["total_pages"]:
             print("Use --all-pages to screen the entire stack.")
+    if map_path:
+        print(f"Tile values: {map_path.with_suffix('.npz')}")
+        print(f"Tile map: {map_path}")
+        # Open the map for a person at a terminal, not for a redirected batch run.
+        if not args.no_open and sys.stdout.isatty():
+            webbrowser.open(map_path.resolve().as_uri())
     return 0
 
 

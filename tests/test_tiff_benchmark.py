@@ -6,10 +6,18 @@ from scipy.ndimage import shift
 
 from actis.estimators import estimate_holes
 from actis.fit import array_backend
-from actis.harmonics import harmonic_tiles
+from actis.harmonics import _frequencies, harmonic_tiles, measure_orders
 from actis.pooled import pooled_matched_cds, pooled_tiles
 from actis.synthetic import render_repeats
-from actis.tiff_benchmark import METHODS, PartialReport, TileSample, benchmark, main
+from actis.tiff_benchmark import (
+    METHODS,
+    PartialReport,
+    TileMaps,
+    TileSample,
+    benchmark,
+    main,
+)
+from actis.tiff_harmonics import matched_cds
 from actis.tiff_tiles import prepare_reference, select_tiles
 
 
@@ -118,16 +126,160 @@ def test_batched_site_fits_match_independent_tiles(cuda, shape, pitch, cd_nm, ps
             super().record(name, values, attempted)
             self.values[name].extend(values)
 
+    # A page of one tile has that tile's own blur, like the native estimators.
     expected, actual = RecordedRun(), RecordedRun()
+    single = []
     for tile, delta in zip(tiles, shifts):
         _measure_native_sites(tile, template.geometry(delta), psf, expected, cuda)
-    tiff_sites.measure_group(tiles, template, shifts, psf, actual, cuda)
+        single.append(
+            tiff_sites.measure_group(
+                tile[None], template, delta[None], psf, actual, cuda
+            )
+        )
     for method in methods:
         assert actual.attempted[method] == expected.attempted[method]
         assert actual.valid[method] == expected.valid[method] > 0
         np.testing.assert_allclose(
             actual.values[method], expected.values[method], rtol=1e-4, err_msg=method
         )
+
+    # Measured together, the tiles share one blur and keep their own values.
+    page = RecordedRun()
+    per_tile, blur = tiff_sites.measure_group(tiles, template, shifts, psf, page, cuda)
+    assert blur[2] and (psf is None or blur[:2] == psf)
+    assert single[2][1] is None  # nothing to fit on the blank tile
+    for method in methods:
+        mean, openings = per_tile[method]
+        assert page.attempted[method] == expected.attempted[method]
+        assert openings.sum() == page.valid[method] > 0 and openings[2] == 0
+        assert np.isnan(mean[2])
+        alone = [values[method][0][0] for values, _ in single[:2]]
+        if method in ("contour", "flux"):
+            tolerance = 1e-9
+        else:
+            # The page shares its template sizes. Without a fixed blur it also
+            # shares the blur, and interpolating the moved tile blurred it more.
+            tolerance = 1e-3 if psf is not None else 0.08
+        np.testing.assert_allclose(mean[:2], alone, rtol=tolerance, err_msg=method)
+
+
+@pytest.mark.parametrize(
+    "shape,pitch,cd_nm",
+    [("square", 8, 86), ("circle", 12, 110), ("ellipse", 14, 130)],
+)
+def test_batched_harmonic_fit_matches_the_sequential_reference(
+    cuda, shape, pitch, cd_nm
+):
+    side = 128
+    images, _ = render_repeats(
+        shape=shape,
+        image_shape=(side, side),
+        pitch_px=pitch,
+        cd_nm=cd_nm,
+        angle_deg=5,
+        n_repeats=1,
+        nuisance=False,
+        supersample=4,
+    )
+    template = prepare_reference(images[0], side, shape, cuda)[0]
+    clean = images[0].astype(float)
+    rng = np.random.default_rng(11)
+    # From a clean tile to one where the tests must turn tiles away.
+    levels = (0, 100, 400, 1500, 4000, 9000, 20000, 60000)
+    tiles = np.stack([clean + rng.normal(0, level, clean.shape) for level in levels])
+    tiles = np.concatenate([tiles, np.zeros((1, side, side)), clean[None, ::-1]])
+    freq = _frequencies(template.region.basis)
+    amplitude, floors = template.anchored_orders(
+        cuda.asarray(tiles, dtype=cuda.float32), np.zeros((len(tiles), 2)), freq
+    )
+    expected = np.array(
+        [
+            measure_orders(
+                a, f, freq, template.region, {"status": "insufficient_orders"}
+            ).get("cd_px", np.nan)
+            for a, f in zip(amplitude, floors)
+        ]
+    )
+    actual = matched_cds(amplitude, floors, freq, template.region, cuda)
+    assert np.isfinite(expected[0]) and np.isnan(expected[-2])
+    assert np.isnan(expected).any() and np.isfinite(expected).sum() >= 3
+    np.testing.assert_array_equal(np.isfinite(actual), np.isfinite(expected))
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, equal_nan=True)
+    assert len(matched_cds(amplitude[:0], floors[:0], freq, template.region, cuda)) == 0
+
+
+def test_every_tile_value_is_kept_and_mapped(cuda, holes, tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    tile = (holes // 256).astype("u1")
+    blank = tile * 0
+    path = tmp_path / "scan.tif"
+    # Page shapes differ, and the holes sit at a different tile on each page.
+    pages = [
+        np.hstack([tile, blank, tile]),
+        np.vstack([np.hstack([blank, tile]), np.hstack([blank, blank])]),
+        np.hstack([blank, blank]),
+    ]
+    with tifffile.TiffWriter(path) as tif:
+        tif.write(np.stack([blank, tile]))
+        for page in pages:
+            tif.write(page)
+    maps = TileMaps()
+    result = benchmark(
+        path, reference_page=1, tile_size=96, shape="square", max_pages=None, maps=maps
+    )
+    data = maps.arrays()
+    # Two reference pages come first, then the three pages above.
+    assert data["reference"].shape == (5, 2, 3)
+    accepted = data["reference"] >= 0
+    expected = np.zeros((5, 2, 3), dtype=bool)
+    expected[1, 0, 0] = expected[2, 0, [0, 2]] = expected[3, 0, 1] = True
+    np.testing.assert_array_equal(accepted, expected)
+    assert result["accepted_tiles"] == result["measured_tiles"] == 4
+    for name in METHODS:
+        values = data[name]
+        assert values.shape == accepted.shape and values.dtype == np.float32
+        np.testing.assert_array_equal(np.isfinite(values), accepted, err_msg=name)
+        # Identical tiles give one value, and it is the one the summary reports.
+        np.testing.assert_allclose(
+            values[accepted], result["methods"][name]["mean"], rtol=1e-5, err_msg=name
+        )
+    for name in ("contour", "model", "differential", "flux"):
+        openings = data[f"{name}_openings"]
+        assert openings[accepted].min() > 0 and not openings[~accepted].any()
+        assert openings.sum() == result["methods"][name]["valid"]
+    # One blur search on every page that has accepted tiles, none elsewhere.
+    fitted = np.isfinite(data["blur_sigma_px"][:, 0, 0])
+    np.testing.assert_array_equal(fitted, accepted.any(axis=(1, 2)))
+    np.testing.assert_array_equal(data["blur_usable"][:, 0], fitted)
+    assert result["blur"]["page_fits"] == 3
+    assert result["blur"]["source"] == "estimated on each page"
+    np.testing.assert_array_equal(data["page_index"], np.arange(5))
+
+    target = tmp_path / "out" / "timing.json"
+    target.parent.mkdir()
+    arguments = [str(path), "--reference-page", "1", "--tile-size", "96"]
+    arguments += ["--shape", "square", "--json", str(target)]
+    assert main(arguments) == 0
+    saved = np.load(target.with_suffix(".cd-map.npz"))
+    assert saved["tile_size"] == 96
+    for name in (*METHODS, "reference", "blur_sigma_px", "contour_openings"):
+        np.testing.assert_array_equal(saved[name], data[name], err_msg=name)
+    page = target.with_suffix(".cd-map.html").read_text(encoding="utf-8")
+    assert "/*DATA*/" not in page and '"file": "scan.tif"' in page
+    payload = json.loads(page.split("const DATA = ", 1)[1].split(";</script>", 1)[0])
+    assert (payload["pages"], payload["rows"], payload["columns"]) == (5, 2, 3)
+    assert [m["name"] for m in payload["methods"]] == list(METHODS)
+    assert payload["page_numbers"] == [1, 2, 3, 4, 5]
+
+    quiet = tmp_path / "quiet.json"
+    assert main([*arguments[:-1], str(quiet), "--no-map"]) == 0
+    assert quiet.exists() and not quiet.with_suffix(".cd-map.html").exists()
+    chosen = tmp_path / "chosen" / "map.html"
+    assert main([*arguments[:-2], "--method", "pooled", "--map", str(chosen)]) == 0
+    assert chosen.exists() and set(np.load(chosen.with_suffix(".npz")).files) >= {
+        "pooled",
+        "reference",
+    }
 
 
 def test_streamed_gpu_methods_agree_with_native_estimators(cuda, holes, tmp_path):
