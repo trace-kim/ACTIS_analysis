@@ -370,7 +370,7 @@ class _Scene:
         off_y = (y - self.centers[indices, 1, None]).astype(np.float32)
         return obs, off_x, off_y
 
-    def fit(self, indices, library, steps):
+    def fit(self, indices, library, steps, *, profile_only=False):
         obs, off_x, off_y = self.samples(indices)
         neighbors = []
         halo = library.radius + np.max(abs(self.xx))
@@ -398,6 +398,7 @@ class _Scene:
             self.height[indices],
             neighbors,
             steps=steps,
+            profile_only=profile_only,
         )
 
 
@@ -497,8 +498,8 @@ def _model_methods(
         library = ApertureLibrary(shape, angle, width, height, sigma, xp)
         for key in keys:
             sample = _representative(bins[key])
-            _, _, w, _, rmse, _, _, _, _ = scene.fit(sample, library, steps=3)
-            profiles[key].append((float(np.median(rmse)), sigma, float(np.median(w))))
+            rmse, width_px = scene.fit(sample, library, steps=3, profile_only=True)
+            profiles[key].append((float(rmse), sigma, float(width_px)))
 
     if psf is None:
         for sigma in candidates:

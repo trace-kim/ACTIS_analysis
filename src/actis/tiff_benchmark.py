@@ -2,10 +2,14 @@
 
 import argparse
 import json
+import os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from itertools import islice
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import Event, Thread
 from time import perf_counter
 
 import numpy as np
@@ -19,11 +23,74 @@ from .tiff_tiles import prepare_reference, select_tiles
 
 METHODS = ("raw", *METHOD_NAMES, "harmonic", "pooled")
 FITS = ("model", "differential")
+DEFAULT_SAMPLE = 32
+
+
+class Progress:
+    """Emit a heartbeat even while the main thread waits for I/O or CUDA."""
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.location = "Starting TIFF benchmark"
+        self.stage = "initializing CUDA"
+        self.start = perf_counter()
+        self.stop = Event()
+
+    def tell(self):
+        if self.callback:
+            self.callback(
+                f"{perf_counter() - self.start:.0f}s | {self.location} | {self.stage}"
+            )
+
+    def __enter__(self):
+        def heartbeat():
+            while not self.stop.wait(15):
+                self.tell()
+
+        self.tell()
+        if self.callback:
+            self.thread = Thread(target=heartbeat, daemon=True)
+            self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        if self.callback:
+            self.thread.join()
+
+
+class TileSample:
+    """Uniform reservoir of accepted native tiles across the entire stack."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.rng = np.random.default_rng(0)
+        self.seen = 0
+        self.entries = []
+
+    def consider(self, page, page_index, start, matches, side):
+        sequence = np.arange(self.seen, self.seen + len(matches))
+        self.seen += len(matches)
+        slots = sequence.copy()
+        later = sequence >= self.limit
+        slots[later] = self.rng.integers(sequence[later] + 1)
+        keep = slots < self.limit
+        for slot, (idx, ref_id, dx, dy) in zip(slots[keep], matches[keep]):
+            tile_index = start + int(idx)
+            row, col = divmod(tile_index, page.shape[1] // side)
+            y, x = row * side, col * side
+            pixels = page[y : y + side, x : x + side].copy()
+            entry = (page_index, tile_index, pixels, int(ref_id), dx, dy)
+            if slot == len(self.entries):
+                self.entries.append(entry)
+            else:
+                self.entries[slot] = entry
 
 
 class Run:
-    def __init__(self, cp):
+    def __init__(self, cp, progress):
         self.stream = cp.cuda.get_current_stream()
+        self.progress = progress
         self.seconds = Counter()
         self.valid = Counter()
         self.attempted = Counter()
@@ -31,6 +98,7 @@ class Run:
 
     @contextmanager
     def time(self, stage):
+        self.progress.stage = stage
         start = perf_counter()
         yield
         self.stream.synchronize()
@@ -85,8 +153,8 @@ def _raw_means(tiles, matches, cp):
     return tiles[ids].mean(axis=(1, 2), dtype=cp.float64).get()
 
 
-def _decoded_pages(stack):
-    pages = iter(stack.pages)
+def _decoded_pages(stack, max_pages=None):
+    pages = islice(stack.pages, max_pages)
 
     def read_next():
         start = perf_counter()
@@ -181,6 +249,9 @@ def benchmark(
     psf=None,
     device=0,
     progress=None,
+    sample_tiles=DEFAULT_SAMPLE,
+    max_pages=None,
+    checkpoint=None,
 ):
     try:
         import tifffile
@@ -194,6 +265,12 @@ def benchmark(
         )
     if reference_page < 0 or device < 0:
         raise ValueError("Device and reference-page indices must be nonnegative")
+    if sample_tiles is not None and sample_tiles < 1:
+        raise ValueError(
+            "sample_tiles must be positive, or None for exhaustive measurement"
+        )
+    if max_pages is not None and max_pages < 1:
+        raise ValueError("max_pages must be positive")
     if psf is not None:
         if len(psf) != 2 or not all(np.isfinite(s) and s > 0 for s in psf):
             raise ValueError(
@@ -201,15 +278,24 @@ def benchmark(
             )
         psf = tuple(psf)
     total_start = perf_counter()
-    cp = array_backend("cuda")
-    if device >= cp.cuda.runtime.getDeviceCount():
-        raise ValueError(f"CUDA device {device} is unavailable")
     ref_path = Path(reference or path)
-    with cp.cuda.Device(device), tifffile.TiffFile(path) as stack:
-        run = Run(cp)
+    with ExitStack() as resources:
+        live = resources.enter_context(Progress(progress))
+        cp = array_backend("cuda")
+        if device >= cp.cuda.runtime.getDeviceCount():
+            raise ValueError(f"CUDA device {device} is unavailable")
+        resources.enter_context(cp.cuda.Device(device))
+        gpu = cp.cuda.runtime.getDeviceProperties(device)["name"].decode()
+        live.location = f"CUDA {device}: {gpu}"
+        live.stage = "opening TIFF and reading reference"
+        live.tell()
+        stack = resources.enter_context(tifffile.TiffFile(path))
+        run = Run(cp, live)
         batch_size = max(1, min(64, 2**20 // tile_size**2))
         with run.time("reference_and_warmup"):
             ref = _reference(ref_path, reference_page, tifffile)
+            live.stage = f"discovering reference lattices on CPU ({ref.shape[1]} x {ref.shape[0]})"
+            live.tell()
             templates = prepare_reference(ref, tile_size, shape, cp)
             first = stack.pages[0]
             if len(first.shape) != 2 or min(first.shape) < tile_size:
@@ -220,7 +306,10 @@ def benchmark(
                 batch_size,
                 (first.shape[0] // tile_size) * (first.shape[1] // tile_size),
             )
-            for template in templates:
+            for number, template in enumerate(templates, 1):
+                live.location = f"Warming reference {number}/{len(templates)}"
+                live.stage = "CUDA selection"
+                live.tell()
                 tile = template.pixels.astype(ref.dtype)
                 batch = cp.repeat(tile[None], warm_count, axis=0)
                 matches = select_tiles(batch, [template], min_corr, cp)
@@ -234,17 +323,67 @@ def benchmark(
                     )
                     tile = cp.rint((pixels - pixels.min()) * scale).astype(first.dtype)
                     batch = cp.repeat(tile[None], warm_count, axis=0)
-                warm = Run(cp)
+                warm = Run(cp, live)
                 _raw_means(batch, matches, cp)
                 _measure(tile, template.geometry(np.zeros(2)), template, psf, warm, cp)
-        if progress:
-            progress(
-                f"Prepared {len(templates)} reference hole pattern(s) on CUDA device {device}"
-            )
+        sample = TileSample(sample_tiles) if sample_tiles is not None else None
+        mode = (
+            "all accepted tiles"
+            if sample is None
+            else f"uniform sample of up to {sample_tiles} accepted tiles"
+        )
+        live.location = f"Starting scan, measuring {mode}"
+        live.stage = "reading TIFF page 1"
+        live.tell()
         axis = cp.arange(tile_size)
-        pages = tested = accepted = edge_pixels = 0
+        pages = tested = accepted = edge_pixels = measured = 0
         scan_start = perf_counter()
-        for data, decode_seconds in _decoded_pages(stack):
+        last_save = -np.inf
+
+        def save_progress(force=False):
+            nonlocal last_save
+            now = perf_counter()
+            if checkpoint and (force or now - last_save >= 15):
+                checkpoint(
+                    {
+                        "status": "running",
+                        "input": str(path),
+                        "gpu": gpu,
+                        "sample_tiles": sample_tiles,
+                        "pages_completed": pages,
+                        "tested_tiles": tested,
+                        "accepted_tiles": accepted,
+                        "measured_tiles": measured,
+                        "methods": run.methods(),
+                        "stage_seconds": dict(run.seconds),
+                        "elapsed_seconds": now - total_start,
+                    }
+                )
+                last_save = now
+
+        def measure_batch(tiles, matches, locations):
+            nonlocal measured
+            if not len(matches):
+                return
+            with run.time("raw"):
+                means = _raw_means(tiles, matches, cp)
+            for (idx, ref_id, dx, dy), mean, (page_index, tile_index) in zip(
+                matches, means, locations
+            ):
+                count = (
+                    str(measured + 1)
+                    if sample is None
+                    else f"{measured + 1}/{len(sample.entries)}"
+                )
+                live.location = f"Measuring accepted tile {count}, page {page_index + 1}, native tile {tile_index + 1}"
+                template = templates[int(ref_id)]
+                region = template.geometry(np.array([dx, dy]))
+                _measure(tiles[int(idx)], region, template, psf, run, cp)
+                run.record("raw", [mean], 1)
+                measured += 1
+                save_progress(force=measured == 1)
+
+        for data, decode_seconds in _decoded_pages(stack, max_pages):
             run.seconds["decode"] += decode_seconds
             h, w = data.shape
             ny, nx = h // tile_size, w // tile_size
@@ -256,6 +395,9 @@ def benchmark(
             with run.time("selection"):
                 frame = cp.asarray(data)
             for start in range(0, ny * nx, batch_size):
+                live.location = (
+                    f"Selecting on page {pages + 1}, tile {start + 1}/{ny * nx}"
+                )
                 with run.time("selection"):
                     indices = cp.arange(start, min(start + batch_size, ny * nx))
                     y = (indices // nx)[:, None] * tile_size + axis
@@ -264,24 +406,41 @@ def benchmark(
                     matches = select_tiles(tiles, templates, min_corr, cp)
                 tested += len(tiles)
                 accepted += len(matches)
-                if len(matches):
-                    with run.time("raw"):
-                        means = _raw_means(tiles, matches, cp)
-                    run.record("raw", means, len(means))
-                for idx, ref_id, dx, dy in matches:
-                    template = templates[int(ref_id)]
-                    region = template.geometry(np.array([dx, dy]))
-                    _measure(tiles[int(idx)], region, template, psf, run, cp)
+                if sample is None:
+                    measure_batch(
+                        tiles,
+                        matches,
+                        ((pages, start + int(idx)) for idx in matches[:, 0]),
+                    )
+                else:
+                    sample.consider(data, pages, start, matches, tile_size)
             pages += 1
-            if progress and (pages == 1 or pages % 10 == 0):
-                progress(f"Read {pages} pages, selected {accepted}/{tested} tiles")
+            live.location = f"Read {pages} pages, accepted {accepted}/{tested} tiles, measured {measured}"
+            live.stage = "waiting for next TIFF page"
+            if pages == 1:
+                live.tell()
+            save_progress()
+        if sample is not None:
+            live.location = f"Scanned {pages} pages, measuring {len(sample.entries)} of {accepted} accepted tiles"
+            live.stage = "uploading sample"
+            live.tell()
+            # Preserve integer bit depth, including for saturation checks, and
+            # batch raw brightness on the same selected tiles as the other methods.
+            for dtype in sorted({entry[2].dtype for entry in sample.entries}, key=str):
+                group = [entry for entry in sample.entries if entry[2].dtype == dtype]
+                for start in range(0, len(group), batch_size):
+                    entries = group[start : start + batch_size]
+                    with run.time("sample_upload"):
+                        tiles = cp.asarray(np.stack([e[2] for e in entries]))
+                    matches = np.array([(i, *e[3:]) for i, e in enumerate(entries)])
+                    measure_batch(tiles, matches, (e[:2] for e in entries))
         scan_seconds = perf_counter() - scan_start
-        gpu = cp.cuda.runtime.getDeviceProperties(device)["name"].decode()
     methods = run.methods()
     ranked = sorted(
         (m for m in METHODS if methods[m]["valid"]), key=lambda m: methods[m]["seconds"]
     )
     return {
+        "status": "complete",
         "input": str(path),
         "reference": str(ref_path),
         "reference_page": reference_page,
@@ -294,6 +453,12 @@ def benchmark(
         "pages": pages,
         "tested_tiles": tested,
         "accepted_tiles": accepted,
+        "measured_tiles": measured,
+        "sample_tiles": sample_tiles,
+        "max_pages": max_pages,
+        "sample_locations_page_tile_zero_based": [e[:2] for e in sample.entries]
+        if sample is not None
+        else None,
         "excluded_edge_pixels": edge_pixels,
         "stage_seconds": dict(run.seconds),
         "methods": methods,
@@ -305,6 +470,32 @@ def benchmark(
         "pages_per_second": pages / scan_seconds,
         "total_seconds": perf_counter() - total_start,
     }
+
+
+class PartialReport:
+    """Publish readable snapshots next to the requested final report."""
+
+    def __init__(self, target):
+        self.path = target.with_suffix(".partial.json")
+        self.created = False
+
+    def write(self, payload):
+        if not self.created:
+            with self.path.open("x", encoding="utf-8") as output:
+                json.dump(payload, output, indent=2, allow_nan=False)
+            self.created = True
+            return
+        tmp = None
+        try:
+            with NamedTemporaryFile(
+                mode="w", dir=self.path.parent, encoding="utf-8", delete=False
+            ) as temp:
+                tmp = Path(temp.name)
+                json.dump(payload, temp, indent=2, allow_nan=False)
+            os.replace(tmp, self.path)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
 
 
 def main(argv=None):
@@ -332,6 +523,25 @@ def main(argv=None):
         help="Minimum correlation in every quadrant",
     )
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
+    sampling = parser.add_mutually_exclusive_group()
+    sampling.add_argument(
+        "--sample-tiles",
+        type=int,
+        default=DEFAULT_SAMPLE,
+        help=f"Measure all methods on a uniform sample from the accepted tiles (default: {DEFAULT_SAMPLE})",
+    )
+    sampling.add_argument(
+        "--all-tiles",
+        dest="sample_tiles",
+        action="store_const",
+        const=None,
+        help="Measure every accepted tile, including its per-tile blur fit",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        help="Read at most this many target pages for a short trial",
+    )
     parser.add_argument(
         "--shape",
         choices=("auto", "square", "circle", "ellipse"),
@@ -347,8 +557,9 @@ def main(argv=None):
     )
     parser.add_argument("--json", type=Path, help="Also write a new timing JSON file")
     args = parser.parse_args(argv)
+    partial = PartialReport(args.json) if args.json else None
     try:
-        if args.json and args.json.exists():
+        if args.json and (args.json.exists() or partial.path.exists()):
             raise ValueError(f"Choose a new JSON output path: {args.json}")
         result = benchmark(
             args.tiff,
@@ -357,6 +568,9 @@ def main(argv=None):
             tile_size=args.tile_size,
             min_corr=args.min_corr,
             device=args.device,
+            sample_tiles=args.sample_tiles,
+            max_pages=args.max_pages,
+            checkpoint=partial.write if partial else None,
             shape=args.shape,
             psf=args.psf_sigma_px,
             progress=lambda s: print(s, flush=True),
@@ -364,11 +578,13 @@ def main(argv=None):
         if args.json:
             with args.json.open("x", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, allow_nan=False)
+            if partial.created:
+                partial.path.unlink()
     except (OSError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"TIFF benchmark: {exc}\n")
     print(
         f"{result['gpu']} | {result['pages']} pages | {result['accepted_tiles']}/{result['tested_tiles']} "
-        f"tiles selected | {result['excluded_edge_pixels']} edge pixels skipped"
+        f"tiles selected | {result['measured_tiles']} measured | {result['excluded_edge_pixels']} edge pixels skipped"
     )
     stages = result["stage_seconds"]
     print(

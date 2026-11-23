@@ -46,39 +46,46 @@ class ApertureLibrary:
         self.sigma = sigma
         max_width = max(self.w[-1], self.h[-1])
         self.radius = int(np.ceil(0.72 * max_width + 4.5 * max(sigma) + 2))
+        filters = ndimage
+        if xp is not np:
+            from cupyx.scipy import ndimage as filters
+        dtype = xp.float64 if xp is np else xp.float32
         fine = (
-            np.arange(-self.radius * self.scale, self.radius * self.scale + 1)
+            xp.arange(
+                -self.radius * self.scale, self.radius * self.scale + 1, dtype=dtype
+            )
             / self.scale
         )
-        y, x = np.meshgrid(fine, fine, indexing="ij")
+        y, x = xp.meshgrid(fine, fine, indexing="ij")
         u = np.cos(angle) * x + np.sin(angle) * y
         v = -np.sin(angle) * x + np.cos(angle) * y
-        data = np.empty(
-            (len(self.w), len(self.h), len(fine), len(fine)), dtype=np.float32
+        widths = xp.asarray(np.repeat(self.w, len(self.h)), dtype=dtype)
+        heights = (
+            xp.asarray(np.tile(self.h, len(self.w)), dtype=dtype)
+            if shape == "ellipse"
+            else widths
         )
-        eps = 1 / self.scale
-        for i, wi in enumerate(self.w):
-            for j, hj in enumerate(self.h):
-                hi = hj if shape == "ellipse" else wi
-                if shape == "square":
-                    inside = np.maximum(abs(u) - wi / 2, abs(v) - hi / 2)
-                else:
-                    # First-order signed distance near the ellipse boundary.
-                    radius = np.hypot(2 * u / wi, 2 * v / hi)
-                    grad = np.hypot(4 * u / wi**2, 4 * v / hi**2) / np.maximum(
-                        radius, 1e-8
-                    )
-                    inside = (radius - 1) / np.maximum(grad, 1 / max(wi, hi))
-                mask = np.clip(0.5 - inside / eps, 0, 1).astype(np.float32)
-                blurred = ndimage.gaussian_filter(
-                    mask,
-                    (sigma[1] * self.scale, sigma[0] * self.scale),
-                    mode="constant",
-                )
-                data[i, j] = ndimage.uniform_filter(
-                    blurred, self.scale, mode="constant"
-                )
-        self.data = xp.asarray(data)
+        data = xp.empty((len(widths), len(fine), len(fine)), dtype=xp.float32)
+        # Filter many aperture sizes together on CUDA, keeping the temporary
+        # footprint bounded. The leading dimension indexes independent images.
+        batch = 1 if xp is np else max(1, 2**19 // len(fine) ** 2)
+        for start in range(0, len(widths), batch):
+            group = slice(start, start + batch)
+            wi, hi = widths[group, None, None], heights[group, None, None]
+            if shape == "square":
+                inside = xp.maximum(abs(u) - wi / 2, abs(v) - hi / 2)
+            else:
+                radius = xp.hypot(2 * u / wi, 2 * v / hi)
+                grad = xp.hypot(4 * u / wi**2, 4 * v / hi**2) / xp.maximum(radius, 1e-8)
+                inside = (radius - 1) / xp.maximum(grad, 1 / xp.maximum(wi, hi))
+            mask = xp.clip(0.5 - inside * self.scale, 0, 1).astype(xp.float32)
+            blurred = filters.gaussian_filter(
+                mask, (0, sigma[1] * self.scale, sigma[0] * self.scale), mode="constant"
+            )
+            data[group] = filters.uniform_filter(
+                blurred, (1, self.scale, self.scale), mode="constant"
+            )
+        self.data = data.reshape(len(self.w), len(self.h), len(fine), len(fine))
 
     @staticmethod
     def _grid(value):
@@ -157,7 +164,18 @@ class ApertureLibrary:
         return image
 
 
-def solve_stamps(library, obs, xoff, yoff, initial_w, initial_h, neighbors, steps):
+def solve_stamps(
+    library,
+    obs,
+    xoff,
+    yoff,
+    initial_w,
+    initial_h,
+    neighbors,
+    steps,
+    *,
+    profile_only=False,
+):
     """Fit native samples. Neighbor images stay at independent seed locations."""
     xp = library.xp
     obs, x, y = [xp.asarray(a, dtype=xp.float32) for a in (obs, xoff, yoff)]
@@ -183,7 +201,13 @@ def solve_stamps(library, obs, xoff, yoff, initial_w, initial_h, neighbors, step
     if ellipse:
         h = xp.clip(h, library.h[0] + 0.001, library.h[-1] - 0.001)
     for iteration in range(steps + 1):
-        t, tx, ty, tw, th = library.evaluate(x - cx[:, None], y - cy[:, None], w, h)
+        final_profile = profile_only and iteration == steps
+        if final_profile:
+            t = library.evaluate(
+                x - cx[:, None], y - cy[:, None], w, h, derivatives=False
+            )
+        else:
+            t, tx, ty, tw, th = library.evaluate(x - cx[:, None], y - cy[:, None], w, h)
         t += tail
         if iteration == 0:
             tmean, zmean = t.mean(axis=1), z.mean(axis=1)
@@ -193,6 +217,9 @@ def solve_stamps(library, obs, xoff, yoff, initial_w, initial_h, neighbors, step
             )
             base = zmean - amp * tmean
         residual = z - base[:, None] - amp[:, None] * t
+        if final_profile:
+            rmse = xp.sqrt((residual**2).mean(axis=1))
+            return to_host(xp, xp.stack((xp.median(rmse), xp.median(w))))
         columns = [
             xp.ones_like(t),
             t,

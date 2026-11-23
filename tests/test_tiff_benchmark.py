@@ -7,7 +7,7 @@ from actis.fit import array_backend
 from actis.harmonics import harmonic_tiles
 from actis.pooled import pooled_tiles
 from actis.synthetic import render_repeats
-from actis.tiff_benchmark import METHODS, benchmark
+from actis.tiff_benchmark import METHODS, PartialReport, TileSample, benchmark
 from actis.tiff_tiles import prepare_reference, select_tiles
 
 
@@ -83,6 +83,7 @@ def test_streamed_gpu_methods_agree_with_native_estimators(cuda, holes, tmp_path
     )
     assert result["excluded_edge_pixels"] == 3 * (99 * 197 - 96 * 192)
     assert set(result["methods"]) == set(METHODS)
+    assert result["measured_tiles"] == 2
     assert result["scan_seconds"] < result["total_seconds"]
     assert result["stage_seconds"]["fit_setup"] > 0
 
@@ -116,3 +117,53 @@ def test_streamed_gpu_methods_agree_with_native_estimators(cuda, holes, tmp_path
     assert empty["fastest_with_valid_results"] is None
     assert empty["tested_tiles"] == 1 and empty["accepted_tiles"] == 0
     assert all(r["attempted"] == r["seconds"] == 0 for r in empty["methods"].values())
+
+
+def test_tile_sample_is_repeatable_across_batch_boundaries():
+    def sample(batch_size):
+        sampler = TileSample(4)
+        for page_id in range(6):
+            page = np.arange(12, dtype=np.uint16)[None] + 12 * page_id
+            for start in range(0, 12, batch_size):
+                count = min(batch_size, 12 - start)
+                matches = [(idx, 0, 0.0, 0.0) for idx in range(count)]
+                sampler.consider(page, page_id, start, np.asarray(matches), 1)
+            page.fill(0)
+        assert sampler.seen == 72
+        return [(p, t, im.item()) for p, t, im, *_ in sampler.entries]
+
+    selected = sample(1)
+    assert len(selected) == len(set(selected)) == 4
+    assert any(page > 0 for page, _, _ in selected)
+    assert all(value == 12 * page + tile for page, tile, value in selected)
+    assert selected == sample(5)
+
+
+def test_sample_exhaustive_and_interrupted_report(cuda, holes, tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "mixed.tif"
+    with tifffile.TiffWriter(path) as tif:
+        for _ in range(3):
+            tif.write(np.hstack((holes, holes)))
+        tif.write(np.zeros((96, 96, 3), dtype="u1"), photometric="rgb")
+    kwargs = {
+        "reference_page": 0,
+        "tile_size": 96,
+        "shape": "square",
+        "psf": (0.78, 0.96),
+    }
+    sampled = benchmark(path, sample_tiles=2, max_pages=3, **kwargs)
+    full = benchmark(path, sample_tiles=None, max_pages=3, **kwargs)
+    assert sampled["status"] == full["status"] == "complete"
+    assert sampled["accepted_tiles"] == full["measured_tiles"] == 6
+    assert sampled["measured_tiles"] == sampled["methods"]["raw"]["valid"] == 2
+    assert full["methods"]["raw"]["valid"] == 6
+    assert len(sampled["sample_locations_page_tile_zero_based"]) == 2
+    partial = PartialReport(tmp_path / "timing.json")
+    with pytest.raises(ValueError, match="single-channel"):
+        benchmark(path, checkpoint=partial.write, sample_tiles=None, **kwargs)
+    import json
+
+    saved = json.loads(partial.path.read_text())
+    assert saved["status"] == "running" and saved["measured_tiles"] >= 1
+    assert saved["methods"]["raw"]["valid"] == saved["measured_tiles"]
