@@ -25,7 +25,7 @@ actis-contours = "actis.contourlab.server:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-actis = ["report.html", "report.css", "report.js"]
+actis = ["report.html", "report.css", "report.js", "tiff_sites.cu"]
 "actis.contourlab" = ["static/*"]
 
 [tool.pytest.ini_options]

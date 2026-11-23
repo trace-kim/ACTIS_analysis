@@ -406,6 +406,46 @@ def _representative(ids, limit=10):
     return ids[np.linspace(0, len(ids) - 1, min(limit, len(ids)), dtype=int)]
 
 
+BLUR_CANDIDATES = (
+    (0.45, 0.45),
+    (0.85, 0.85),
+    (1.25, 1.25),
+    (1.75, 1.75),
+    (0.7, 1.15),
+    (1.15, 0.7),
+)
+BLUR_STEP = 0.16
+
+
+def _blur_vertex(coarse, profile):
+    """Refine the best coarse blur with independent quadratic axis profiles."""
+    sx, sy = coarse
+    costs = {s: score**2 for score, s, _ in profile}
+    vertex = []
+    for ax, ay in ((1, 0), (0, 1)):
+        left = costs[round(sx - BLUR_STEP * ax, 3), round(sy - BLUR_STEP * ay, 3)]
+        right = costs[round(sx + BLUR_STEP * ax, 3), round(sy + BLUR_STEP * ay, 3)]
+        curvature = left + right - 2 * costs[coarse]
+        if curvature > 1e-10:
+            move = 0.5 * BLUR_STEP * np.clip((left - right) / curvature, -2, 2)
+        else:
+            move = -BLUR_STEP if left < right else BLUR_STEP
+        vertex.append(round(((sx if ax else sy) + move) * 20) / 20)
+    return tuple(vertex)
+
+
+def _blur_result(profile, psf):
+    best = min(profile)
+    # Compare the free per-site widths at nuisance settings giving almost
+    # the same predictive image residual. This is an empirical sensitivity
+    # diagnostic, not a confidence interval for physical mask CD.
+    tolerance = max(0.0025, best[0] * 0.05)
+    supported = [w for r, _, w in profile if r <= best[0] + tolerance]
+    weak = any(abs(w - best[2]) >= max(0.3, best[2] * 0.07) for w in supported)
+    at_limit = psf is None and (max(best[1]) >= 1.74 or min(best[1]) <= 0.31)
+    return best, supported, weak, at_limit
+
+
 def _model_methods(
     image,
     centers,
@@ -479,19 +519,6 @@ def _model_methods(
     bins = {key: np.asarray(ids) for key, ids in bins.items()}
     if not bins:
         return result
-    if psf is None:
-        # Profile tile-shared effective blur with independent geometry and
-        # contrast per selected hole. Include x/y blur differences from TDI.
-        candidates = [
-            (0.45, 0.45),
-            (0.85, 0.85),
-            (1.25, 1.25),
-            (1.75, 1.75),
-            (0.7, 1.15),
-            (1.15, 0.7),
-        ]
-    else:
-        candidates = [psf]
     profiles = defaultdict(list)
 
     def profile_sigma(sigma, keys):
@@ -502,11 +529,11 @@ def _model_methods(
             profiles[key].append((float(rmse), sigma, float(width_px)))
 
     if psf is None:
-        for sigma in candidates:
+        for sigma in BLUR_CANDIDATES:
             profile_sigma(sigma, bins)
         # Refine both detector-axis sigmas near the winning coarse setting.
         # Profiles from multiple tiles at identical settings reuse the library.
-        delta = 0.16
+        delta = BLUR_STEP
         trials = defaultdict(list)
         coarse = {}
         for key in bins:
@@ -520,20 +547,8 @@ def _model_methods(
             profile_sigma(sigma, keys)
         interpolated = defaultdict(list)
         for key, (sx, sy) in coarse.items():
-            costs = {s: score**2 for score, s, _ in profiles[key]}
-            base = costs[sx, sy]
-            vertex = []
-            for ax, ay in ((1, 0), (0, 1)):
-                left = costs[round(sx - delta * ax, 3), round(sy - delta * ay, 3)]
-                right = costs[round(sx + delta * ax, 3), round(sy + delta * ay, 3)]
-                curvature = left + right - 2 * base
-                if curvature > 1e-10:
-                    move = 0.5 * delta * np.clip((left - right) / curvature, -2, 2)
-                else:
-                    move = -delta if left < right else delta
-                vertex.append(round(((sx if ax else sy) + move) * 20) / 20)
-            extra = tuple(vertex)
-            if extra not in costs:
+            extra = _blur_vertex((sx, sy), profiles[key])
+            if extra not in {s for _, s, _ in profiles[key]}:
                 interpolated[extra].append(key)
         for sigma, keys in interpolated.items():
             profile_sigma(sigma, keys)
@@ -543,14 +558,7 @@ def _model_methods(
 
     by_sigma = defaultdict(list)
     for key, profile in profiles.items():
-        best = min(profile)
-        # Compare the free per-site widths at nuisance settings giving almost
-        # the same predictive image residual. This is an empirical sensitivity
-        # diagnostic, not a confidence interval for physical mask CD.
-        tolerance = max(0.0025, best[0] * 0.05)
-        supported = [w for r, _, w in profile if r <= best[0] + tolerance]
-        weak = any(abs(w - best[2]) >= max(0.3, best[2] * 0.07) for w in supported)
-        at_limit = psf is None and (max(best[1]) >= 1.74 or min(best[1]) <= 0.31)
+        best, supported, weak, at_limit = _blur_result(profile, psf)
         diagnostic = dict(
             psf_source="fixed" if psf is not None else "tile_profile",
             blur_profile_candidate_count=len(profile),

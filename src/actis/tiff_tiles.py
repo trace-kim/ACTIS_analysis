@@ -2,11 +2,22 @@
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from itertools import repeat
 
 import numpy as np
 
 from .discovery import Region, discover
-from .harmonics import _frequencies
+from .harmonics import _frequencies, measure_orders
+
+
+def _harmonic_cds(region, freq, amplitudes, floors):
+    values = []
+    for amplitude, floor in zip(amplitudes, floors):
+        row = measure_orders(
+            amplitude, floor, freq, region, {"status": "insufficient_orders"}
+        )
+        values.append(row.get("cd_px", np.nan))
+    return values
 
 
 @dataclass
@@ -42,6 +53,37 @@ class ReferenceTile:
         amplitude, side1, side2 = np.split(values.get(), 3)
         noise = max(1e-12, float(np.median(np.minimum(abs(side1), abs(side2)))))
         return amplitude * np.exp(2j * np.pi * (freq @ anchor)), noise
+
+    def harmonic_cds(self, tiles, shifts, pool, workers):
+        side = tiles.shape[-1]
+        freq = _frequencies(self.region.basis)
+        centers = self.region.centers + shifts[:, None, :]
+        counts = ((centers >= -0.5) & (centers < side - 0.5)).all(axis=2).sum(axis=1)
+        enough = counts >= max(
+            16, 0.74 * side**2 / abs(np.linalg.det(self.region.basis))
+        )
+        cds = np.full(len(tiles), np.nan)
+        if len(freq) < 5 or side < 5 * self.region.pitch or not enough.any():
+            return cds
+        means = (tiles * self.window).sum(axis=(1, 2), keepdims=True, dtype=np.float64)
+        weighted = ((tiles - means) * self.window).astype(self.dft_y.dtype)
+        orders = ((self.dft_y @ weighted) * self.dft_x).sum(axis=2).get()[enough]
+        amp, off1, off2 = np.split(orders, 3, axis=1)
+        floors = np.maximum(1e-12, np.median(np.minimum(abs(off1), abs(off2)), axis=1))
+        anchors = self.region.diagnostics["anchor_xy"] + shifts[enough]
+        amp *= np.exp(2j * np.pi * (anchors @ freq.T))
+        if pool is None or len(amp) < workers:
+            cds[enough] = _harmonic_cds(self.region, freq, amp, floors)
+        else:
+            jobs = pool.map(
+                _harmonic_cds,
+                repeat(self.region),
+                repeat(freq),
+                np.array_split(amp, workers),
+                np.array_split(floors, workers),
+            )
+            cds[enough] = np.concatenate(list(jobs))
+        return cds
 
 
 def prepare_reference(image, side, shape, cp):

@@ -79,6 +79,57 @@ def test_batched_pooled_matches_independent_shifted_tiles(cuda, holes):
     np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=0, equal_nan=True)
 
 
+@pytest.mark.parametrize(
+    "shape,pitch,cd_nm,psf",
+    [
+        ("square", 8, 82, None),
+        ("ellipse", 14, 130, None),
+        ("circle", 24, 280, (0.78, 0.96)),
+    ],
+)
+def test_batched_site_fits_match_independent_tiles(cuda, shape, pitch, cd_nm, psf):
+    from actis import tiff_sites
+    from actis.tiff_benchmark import Progress, Run, _measure_native_sites
+
+    side = 144
+    images, _ = render_repeats(
+        shape=shape,
+        image_shape=(side, side),
+        pitch_px=pitch,
+        cd_nm=cd_nm,
+        angle_deg=8,
+        n_repeats=1,
+        nuisance=False,
+        supersample=4,
+    )
+    template = prepare_reference(images[0], side, shape, cuda)[0]
+    shifts = np.array([[0.0, 0.0], [1.5, -0.75], [0.0, 0.0]])
+    moved = shift(images[0], shifts[1, ::-1], order=1, mode="nearest")
+    moved[45:70, 53:75] = moved.min()  # Missing sites among valid neighbors
+    tiles = cuda.asarray(np.stack([images[0], moved, np.zeros_like(moved)]))
+    methods = ("contour", "flux", "model", "differential")
+
+    class RecordedRun(Run):
+        def __init__(self):
+            super().__init__(cuda, Progress(None), methods)
+            self.values = {name: [] for name in methods}
+
+        def record(self, name, values, attempted):
+            super().record(name, values, attempted)
+            self.values[name].extend(values)
+
+    expected, actual = RecordedRun(), RecordedRun()
+    for tile, delta in zip(tiles, shifts):
+        _measure_native_sites(tile, template.geometry(delta), psf, expected, cuda)
+    tiff_sites.measure_group(tiles, template, shifts, psf, actual, cuda)
+    for method in methods:
+        assert actual.attempted[method] == expected.attempted[method]
+        assert actual.valid[method] == expected.valid[method] > 0
+        np.testing.assert_allclose(
+            actual.values[method], expected.values[method], rtol=1e-4, err_msg=method
+        )
+
+
 def test_streamed_gpu_methods_agree_with_native_estimators(cuda, holes, tmp_path):
     tifffile = pytest.importorskip("tifffile")
     # Nonzero reference index, 16-bit reference and compressed 8-bit target.
@@ -174,14 +225,10 @@ def test_single_pooled_method_skips_other_work_even_in_warmup(
     def unexpected(*args, **kwargs):
         pytest.fail("Ran an unrequested estimator")
 
-    for name in (
-        "_model_methods",
-        "_contours",
-        "harmonic_tiles",
-        "_flux",
-        "_raw_means",
-    ):
-        monkeypatch.setattr(f"actis.tiff_benchmark.{name}", unexpected)
+    monkeypatch.setattr("actis.tiff_benchmark._measure_native_sites", unexpected)
+    monkeypatch.setattr("actis.tiff_benchmark._raw_means", unexpected)
+    monkeypatch.setattr("actis.tiff_sites.measure_group", unexpected)
+    monkeypatch.setattr("actis.tiff_tiles.ReferenceTile.harmonic_cds", unexpected)
     kwargs = {"method": "pooled", "tile_size": 96, "shape": "square"}
     full = benchmark(path, sample_tiles=None, **kwargs)
     sample = benchmark(path, sample_tiles=1, **kwargs)
@@ -220,7 +267,9 @@ def test_page_sample_decodes_only_chosen_pages_and_keeps_native_indices(
         return read(page)
 
     monkeypatch.setattr(tiff_benchmark, "_read_page", record_page)
-    result = benchmark(path, method="raw", tile_size=96, shape="square", sample_pages=3)
+    result = benchmark(
+        path, method="raw", tile_size=96, shape="square", sample_pages=3, sample_tiles=3
+    )
     indices = result["sample_page_indices_zero_based"]
     assert decoded == [0, *indices]  # Reference plus three target pages
     assert [i // 4 for i in indices] == [0, 1, 2]
@@ -236,9 +285,10 @@ def test_cli_screens_every_page_unless_a_page_limit_is_explicit(cuda, holes, tmp
     path = tmp_path / "many.tif"
     tifffile.imwrite(path, np.repeat(holes[None], 40, axis=0), photometric="minisblack")
     for name, flags, pages, measured in (
-        ("default", [], 40, 32),
+        ("default", [], 40, 40),
         ("sample_pages", ["--sample-pages", "8"], 8, 8),
-        ("all_pages", ["--all-pages"], 40, 32),
+        ("all_pages", ["--all-pages"], 40, 40),
+        ("tile_sample", ["--sample-tiles", "32"], 40, 32),
         ("full", ["--all-tiles"], 40, 40),
         ("explicit_full", ["--all-pages", "--all-tiles"], 40, 40),
     ):

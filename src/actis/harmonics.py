@@ -511,102 +511,102 @@ def iter_harmonic_tiles(
                 anchor + shift - lo,
                 **({"trace": trace} if capture else {}),
             )
-            radii = np.linalg.norm(freq, axis=1)
-            fundamental = (radii <= 1.26 / region.pitch) & (abs(amplitude) > 5 * noise)
-            if capture:
-                trace.update(
-                    noise=noise,
-                    anchored_re=amplitude.real,
-                    anchored_im=amplitude.imag,
-                    fundamental=fundamental,
-                    rank=(
-                        int(np.linalg.matrix_rank(freq[fundamental]))
-                        if fundamental.any()
-                        else 0
-                    ),
-                )
-            if fundamental.sum() < 2 or np.linalg.matrix_rank(freq[fundamental]) < 2:
-                row["status"] = "two_dimensional_phase_unresolved"
-                yield row
-                continue
-            f = freq[fundamental]
-            w = np.abs(amplitude[fundamental])
-            d = np.linalg.lstsq(
-                f * w[:, None],
-                -np.angle(amplitude[fundamental]) * w / (2 * np.pi),
-                rcond=None,
-            )[0]
-            # Localization by phase requires residuals smaller than half a
-            # period and a common displacement across visible fundamental orders.
-            phase_err = np.angle(amplitude[fundamental] * np.exp(2j * np.pi * (f @ d)))
-            if capture:
-                trace.update(
-                    displacement=d,
-                    phase_err=phase_err,
-                    phase_rms=np.sqrt(np.average(phase_err**2, weights=w**2)),
-                )
-            if (
-                np.linalg.norm(d) > 0.35 * region.pitch
-                or np.average(phase_err**2, weights=w**2) > 0.18**2
-            ):
-                row["status"] = "inconsistent_lattice_phase"
-                yield row
-                continue
-            row.update(dx_px=float(d[0]), dy_px=float(d[1]), phase_status="ok")
-            if region.shape not in ("ellipse", "circle", "square"):
-                row["status"] = "ambiguous_shape"
-                yield row
-                continue
-            real = (amplitude * np.exp(2j * np.pi * (freq @ d))).real
-            good = abs(amplitude) > max(4 * noise, 0.008 * abs(amplitude).max())
-            # Signed near-zero Fourier orders also constrain size, while a
-            # field with only the first diffracted order cannot identify blur.
-            n_orders = int(good.sum())
-            row["n_orders"] = n_orders
-            if capture:
-                trace.update(signed=real, good=good)
-            if (
-                n_orders < (7 if region.shape == "ellipse" else 5)
-                or radii[good].max() < 1.8 / region.pitch
-            ):
-                yield row
-                continue
-            include = radii < min(0.46, 1.22 * radii[good].max())
-            if capture:
-                trace["include"] = include
-            if include.sum() < 6:
-                yield row
-                continue
-            if capture:
-                trace["fit"] = {}
-            wid, ht, sx, sy, cond, rms, status = _fit_orders(
-                real[include],
-                freq[include],
-                np.full(include.sum(), noise),
-                region.pitch,
-                region,
-                **({"trace": trace["fit"]} if capture else {}),
-            )
-            row.update(
-                condition=cond,
-                fit_rms=rms,
-                status=status,
-                blur_x_px=float(sx),
-                blur_y_px=float(sy),
-            )
-            if status == "ok":
-                area_diameter = (
-                    2 * np.sqrt(wid * ht / np.pi)
-                    if region.shape == "square"
-                    else np.sqrt(wid * ht)
-                )
-                row.update(
-                    cd_px=float(max(wid, ht)),
-                    cd_x_px=float(wid),
-                    cd_y_px=float(ht),
-                    area_diameter_px=float(area_diameter),
-                )
-            yield row
+            yield measure_orders(amplitude, noise, freq, region, row, trace)
+
+
+def measure_orders(amplitude, noise, freq, region, row, trace=None):
+    """Apply the harmonic phase, fit and identifiability tests to native DFT orders."""
+    radii = np.linalg.norm(freq, axis=1)
+    fundamental = (radii <= 1.26 / region.pitch) & (abs(amplitude) > 5 * noise)
+    if trace is not None:
+        trace.update(
+            noise=noise,
+            anchored_re=amplitude.real,
+            anchored_im=amplitude.imag,
+            fundamental=fundamental,
+            rank=(
+                int(np.linalg.matrix_rank(freq[fundamental]))
+                if fundamental.any()
+                else 0
+            ),
+        )
+    if fundamental.sum() < 2 or np.linalg.matrix_rank(freq[fundamental]) < 2:
+        row["status"] = "two_dimensional_phase_unresolved"
+        return row
+    f = freq[fundamental]
+    w = np.abs(amplitude[fundamental])
+    d = np.linalg.lstsq(
+        f * w[:, None],
+        -np.angle(amplitude[fundamental]) * w / (2 * np.pi),
+        rcond=None,
+    )[0]
+    # Localization by phase requires residuals smaller than half a
+    # period and a common displacement across visible fundamental orders.
+    phase_err = np.angle(amplitude[fundamental] * np.exp(2j * np.pi * (f @ d)))
+    if trace is not None:
+        trace.update(
+            displacement=d,
+            phase_err=phase_err,
+            phase_rms=np.sqrt(np.average(phase_err**2, weights=w**2)),
+        )
+    if (
+        np.linalg.norm(d) > 0.35 * region.pitch
+        or np.average(phase_err**2, weights=w**2) > 0.18**2
+    ):
+        row["status"] = "inconsistent_lattice_phase"
+        return row
+    row.update(dx_px=float(d[0]), dy_px=float(d[1]), phase_status="ok")
+    if region.shape not in ("ellipse", "circle", "square"):
+        row["status"] = "ambiguous_shape"
+        return row
+    real = (amplitude * np.exp(2j * np.pi * (freq @ d))).real
+    good = abs(amplitude) > max(4 * noise, 0.008 * abs(amplitude).max())
+    # Signed near-zero Fourier orders also constrain size, while a
+    # field with only the first diffracted order cannot identify blur.
+    n_orders = int(good.sum())
+    row["n_orders"] = n_orders
+    if trace is not None:
+        trace.update(signed=real, good=good)
+    if (
+        n_orders < (7 if region.shape == "ellipse" else 5)
+        or radii[good].max() < 1.8 / region.pitch
+    ):
+        return row
+    include = radii < min(0.46, 1.22 * radii[good].max())
+    if trace is not None:
+        trace["include"] = include
+    if include.sum() < 6:
+        return row
+    if trace is not None:
+        trace["fit"] = {}
+    wid, ht, sx, sy, cond, rms, status = _fit_orders(
+        real[include],
+        freq[include],
+        np.full(include.sum(), noise),
+        region.pitch,
+        region,
+        **({"trace": trace["fit"]} if trace is not None else {}),
+    )
+    row.update(
+        condition=cond,
+        fit_rms=rms,
+        status=status,
+        blur_x_px=float(sx),
+        blur_y_px=float(sy),
+    )
+    if status == "ok":
+        area_diameter = (
+            2 * np.sqrt(wid * ht / np.pi)
+            if region.shape == "square"
+            else np.sqrt(wid * ht)
+        )
+        row.update(
+            cd_px=float(max(wid, ht)),
+            cd_x_px=float(wid),
+            cd_y_px=float(ht),
+            area_diameter_px=float(area_diameter),
+        )
+    return row
 
 
 def harmonic_tiles(

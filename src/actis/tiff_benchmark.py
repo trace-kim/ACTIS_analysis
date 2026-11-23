@@ -4,9 +4,10 @@ import argparse
 import json
 import os
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from itertools import islice
+from multiprocessing import get_context
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Event, Thread
@@ -15,15 +16,14 @@ from time import perf_counter
 import numpy as np
 from PIL import Image
 
+from . import tiff_sites
 from .estimators import METHOD_NAMES, _contours, _flux, _model_methods
 from .fit import array_backend
-from .harmonics import harmonic_tiles
 from .pooled import pooled_matched_cds
 from .tiff_tiles import prepare_reference, select_tiles
 
 METHODS = ("raw", *METHOD_NAMES, "harmonic", "pooled")
 FITS = ("model", "differential")
-DEFAULT_SAMPLE = 32
 
 
 class Progress:
@@ -88,10 +88,11 @@ class TileSample:
 
 
 class Run:
-    def __init__(self, cp, progress, methods):
+    def __init__(self, cp, progress, methods, pool=None, workers=1):
         self.stream = cp.cuda.get_current_stream()
         self.progress = progress
         self.selected = methods
+        self.pool, self.workers = pool, workers
         self.seconds = Counter()
         self.valid = Counter()
         self.attempted = Counter()
@@ -108,7 +109,7 @@ class Run:
     def record(self, method, values, attempted):
         self.attempted[method] += attempted
         self.valid[method] += len(values)
-        self.sums[method] += sum(values)
+        self.sums[method] += float(np.sum(values, dtype=np.float64))
 
     def methods(self):
         rows = {}
@@ -207,20 +208,26 @@ def _batch_values(tiles, matches, templates, run, cp):
     if "raw" in run.selected:
         with run.time("raw"):
             values["raw"] = _raw_means(tiles, matches, cp)
-    if "pooled" in run.selected:
-        with run.time("pooled"):
+    for name in ("pooled", "harmonic"):
+        if name not in run.selected:
+            continue
+        with run.time(name):
             cds = np.full(len(matches), np.nan)
             for ref_id in np.unique(matches[:, 1].astype(int)):
                 group = matches[:, 1] == ref_id
                 indices = cp.asarray(matches[group, 0], dtype=cp.int32)
-                cds[group] = pooled_matched_cds(
-                    tiles[indices], templates[ref_id].region, matches[group, 2:], cp
+                subset, shifts = tiles[indices], matches[group, 2:]
+                template = templates[ref_id]
+                cds[group] = (
+                    pooled_matched_cds(subset, template.region, shifts, cp)
+                    if name == "pooled"
+                    else template.harmonic_cds(subset, shifts, run.pool, run.workers)
                 )
-            values["pooled"] = cds
+            values[name] = cds
     return values
 
 
-def _measure(tile, region, template, psf, run, cp):
+def _measure_native_sites(tile, region, psf, run, cp):
     side = tile.shape[0]
     args = (region.centers, region.pitch, region.shape)
     fit_names = tuple(name for name in FITS if name in run.selected)
@@ -257,18 +264,6 @@ def _measure(tile, region, template, psf, run, cp):
         run.seconds.update(fit_seconds)
         for name, rows in fits.items():
             run.record(name, [r["cd_px"] for r in rows if r["valid"]], len(rows))
-    if "harmonic" in run.selected:
-        with run.time("harmonic"):
-            rows = harmonic_tiles(
-                tile,
-                region,
-                tile_px=side,
-                origin_xy=(-0.5, -0.5),
-                sample_orders=template.sample_orders,
-            )
-        run.record(
-            "harmonic", [r["cd_px"] for r in rows if r["status"] == "ok"], len(rows)
-        )
 
 
 def benchmark(
@@ -282,11 +277,12 @@ def benchmark(
     psf=None,
     device=0,
     progress=None,
-    sample_tiles=DEFAULT_SAMPLE,
+    sample_tiles=None,
     max_pages=None,
     checkpoint=None,
     method=None,
     sample_pages=None,
+    harmonic_workers=1,
 ):
     try:
         import tifffile
@@ -342,7 +338,16 @@ def benchmark(
             page_indices = (
                 np.random.default_rng(0).integers(edges[:-1], edges[1:]).tolist()
             )
-        run = Run(cp, live, selected)
+        workers = harmonic_workers
+        pool = None
+        if "harmonic" in selected and sample_tiles is None and workers > 1:
+            # Workers fit spectra on the CPU. Never fork the CUDA context.
+            pool = resources.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=workers, mp_context=get_context("spawn")
+                )
+            )
+        run = Run(cp, live, selected, pool, workers)
         batch_size = max(1, min(64, 2**20 // tile_size**2))
         with run.time("reference_and_warmup"):
             ref = _reference(ref_path, reference_page, tifffile)
@@ -376,8 +381,16 @@ def benchmark(
                     tile = cp.rint((pixels - pixels.min()) * scale).astype(first.dtype)
                     batch = cp.repeat(tile[None], warm_count, axis=0)
                 warm = Run(cp, live, selected)
-                _batch_values(batch, matches, [template], warm, cp)
-                _measure(tile, template.geometry(np.zeros(2)), template, psf, warm, cp)
+                _batch_values(batch[:1], matches[:1], [template], warm, cp)
+                if any(m in selected for m in METHOD_NAMES):
+                    if tiff_sites.supported(template.region):
+                        tiff_sites.measure_group(
+                            tile[None], template, np.zeros((1, 2)), psf, warm, cp
+                        )
+                    else:
+                        _measure_native_sites(
+                            tile, template.geometry(np.zeros(2)), psf, warm, cp
+                        )
         sample = TileSample(sample_tiles) if sample_tiles is not None else None
         mode = (
             "all accepted tiles"
@@ -395,10 +408,10 @@ def benchmark(
         scan_start = perf_counter()
         last_save = -np.inf
 
-        def save_progress(force=False):
+        def save_progress():
             nonlocal last_save
             now = perf_counter()
-            if checkpoint and (force or now - last_save >= 15):
+            if checkpoint and now - last_save >= 15:
                 checkpoint(
                     {
                         "status": "running",
@@ -418,33 +431,28 @@ def benchmark(
                 )
                 last_save = now
 
-        def measure_batch(tiles, matches, locations):
+        def measure_batch(tiles, matches):
             nonlocal measured
             if not len(matches):
                 return
             values = _batch_values(tiles, matches, templates, run, cp)
-            if len(values) == len(selected):
-                for name, column in values.items():
-                    run.record(name, column[np.isfinite(column)], len(column))
-                measured += len(matches)
-                save_progress()
-                return
-            for i, ((idx, ref_id, dx, dy), (page_index, tile_index)) in enumerate(
-                zip(matches, locations)
-            ):
-                count = (
-                    str(measured + 1)
-                    if sample is None
-                    else f"{measured + 1}/{len(sample.entries)}"
-                )
-                live.location = f"Measuring accepted tile {count}, page {page_index + 1}, native tile {tile_index + 1}"
-                template = templates[int(ref_id)]
-                region = template.geometry(np.array([dx, dy]))
-                _measure(tiles[int(idx)], region, template, psf, run, cp)
-                for name, column in values.items():
-                    run.record(name, [column[i]] if np.isfinite(column[i]) else [], 1)
-                measured += 1
-                save_progress(force=measured == 1)
+            if any(name in selected for name in METHOD_NAMES):
+                for ref in np.unique(matches[:, 1].astype(int)):
+                    group = matches[matches[:, 1] == ref]
+                    template = templates[ref]
+                    if tiff_sites.supported(template.region):
+                        ids = cp.asarray(group[:, 0], dtype=cp.int32)
+                        tiff_sites.measure_group(
+                            tiles[ids], template, group[:, 2:], psf, run, cp
+                        )
+                    else:
+                        for idx, _, dx, dy in group:
+                            region = template.geometry(np.array([dx, dy]))
+                            _measure_native_sites(tiles[int(idx)], region, psf, run, cp)
+            for name, column in values.items():
+                run.record(name, column[np.isfinite(column)], len(column))
+            measured += len(matches)
+            save_progress()
 
         for page_index, data, decode_seconds in _decoded_pages(
             stack, max_pages, page_indices
@@ -475,11 +483,7 @@ def benchmark(
                 tested += len(tiles)
                 accepted += len(matches)
                 if sample is None:
-                    measure_batch(
-                        tiles,
-                        matches,
-                        ((page_index, start + int(idx)) for idx in matches[:, 0]),
-                    )
+                    measure_batch(tiles, matches)
                 else:
                     sample.consider(data, page_index, start, matches, tile_size)
             pages += 1
@@ -501,7 +505,7 @@ def benchmark(
                     with run.time("sample_upload"):
                         tiles = cp.asarray(np.stack([e[2] for e in entries]))
                     matches = np.array([(i, *e[3:]) for i, e in enumerate(entries)])
-                    measure_batch(tiles, matches, (e[:2] for e in entries))
+                    measure_batch(tiles, matches)
         scan_seconds = perf_counter() - scan_start
     methods = run.methods()
     # Inclusive model and differential times both contain the same contour
@@ -608,21 +612,21 @@ def main(argv=None):
     parser.add_argument(
         "--method",
         choices=METHODS,
-        help="Time only this method (default: compare all seven). Combine with --all-tiles for production timing.",
+        help="Time one method on the selected tiles (default: all seven methods)",
     )
     sampling = parser.add_mutually_exclusive_group()
     sampling.add_argument(
         "--sample-tiles",
         type=int,
-        default=DEFAULT_SAMPLE,
-        help=f"Measure a uniform sample from the accepted tiles (default: {DEFAULT_SAMPLE})",
+        help="Limit measurements to a uniform sample of N accepted tiles",
+        metavar="N",
     )
     sampling.add_argument(
         "--all-tiles",
         dest="sample_tiles",
         action="store_const",
         const=None,
-        help="Measure every accepted tile with the requested methods",
+        help="Measure every accepted tile with the requested methods (default)",
     )
     pages = parser.add_mutually_exclusive_group()
     pages.add_argument(
@@ -639,7 +643,7 @@ def main(argv=None):
     pages.add_argument(
         "--all-pages",
         action="store_true",
-        help="Screen every page (default). Add --all-tiles to measure every accepted tile.",
+        help="Screen every TIFF page (default)",
     )
     parser.add_argument(
         "--shape",
@@ -671,6 +675,9 @@ def main(argv=None):
             sample_tiles=args.sample_tiles,
             max_pages=args.max_pages,
             sample_pages=args.sample_pages,
+            harmonic_workers=min(
+                8, (getattr(os, "process_cpu_count", os.cpu_count)() or 1)
+            ),
             checkpoint=partial.write if partial else None,
             shape=args.shape,
             psf=args.psf_sigma_px,
