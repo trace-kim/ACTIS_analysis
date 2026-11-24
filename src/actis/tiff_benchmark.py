@@ -164,6 +164,19 @@ class TileMaps:
         self.reference.append(np.full(size, -1, dtype=np.int8))
         return len(self.grids) - 1
 
+    def file(self, position, matches, values, openings, blurs):
+        """Keep what _measure_page returned for the page at `position`.
+
+        The first column of `matches` is each tile's index on the page.
+        """
+        where = matches[:, 0].astype(int)
+        self.reference[position][where] = matches[:, 1]
+        for name, column in values.items():
+            self.values[position][name][where] = column
+        for name, column in openings.items():
+            self.openings[position][name][where] = column
+        self.blur.extend((position, *blur) for blur in blurs)
+
     def arrays(self):
         """Stack the pages as (page, tile row, tile column). Smaller pages are padded."""
         rows = max((g[0] for g in self.grids), default=0)
@@ -527,16 +540,11 @@ def benchmark(
         def measure(tiles, matches, position):
             """Measure one page's accepted tiles and file each tile's value."""
             nonlocal measured
-            values, openings, blurs = _measure_page(
-                tiles, matches, templates, psf, run, cp
+            maps.file(
+                position,
+                matches,
+                *_measure_page(tiles, matches, templates, psf, run, cp),
             )
-            where = matches[:, 0].astype(int)
-            maps.reference[position][where] = matches[:, 1]
-            for name, column in values.items():
-                maps.values[position][name][where] = column
-            for name, column in openings.items():
-                maps.openings[position][name][where] = column
-            maps.blur.extend((position, *blur) for blur in blurs)
             measured += len(matches)
             save_progress()
 

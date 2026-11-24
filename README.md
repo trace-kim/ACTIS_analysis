@@ -265,6 +265,70 @@ Only the explicit options `--sample-pages N` and `--max-pages N` limit the pages
 
 The selector takes one exemplar from each detected reference lattice and tests every complete scan tile against those exemplars, independent of page position. A batched GPU FFT estimates translation. All four quadrants of the overlapping pixels must then match at the same shift. The score is the lowest quadrant correlation after local gain and offset normalization. A blank or striped quadrant can therefore disqualify a tile whose overall correlation is high. This tests for hole arrays represented in the reference. Inspect labeled examples from the instrument when choosing `--min-corr` (default 0.80). The default tile side is 128 pixels. Choose an even `--tile-size` spanning at least five hole pitches. The output counts pixels skipped in incomplete edge tiles. Use `--shape` only when the reference hole shape is known. The JSON lists the shape found for each reference lattice in `reference_shapes`. With the shape `ambiguous`, the two aperture fits and the lattice harmonics give no sizes.
 
+## Measure every stripe of a scan
+
+`measure_stripes.py` runs a method on all board stacks of a scan and keeps every tile's value for a map. The method is raw brightness unless `--method` names others. It needs the CUDA extra and a holes-only reference, like the TIFF benchmark above.
+
+~~~sh
+python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output D:\ACTIS\scan-raw
+~~~
+
+The scan folder holds one subfolder per stripe, for example `S1`, and a `header.xml`. A board stack is named `<stripe>_<vertical segment>_<board>.tiff`, so `1_1_1.tiff` to `1_1_4.tiff` are the four boards of the first segment of stripe 1. Only the file names are read, not the subfolder names. `header.xml` is not read yet. `stripes.json` records where it is.
+
+### Boards are merged first
+
+Page by page, the four boards of a segment are merged into one page of 5,408 columns (4 × 1,376 − 3 × 32), and that page is what gets screened and measured. Neighbouring boards image the same 32 columns. Each board gives up 16 of them, so every column is measured once and comes from the board it lies deeper inside. Boards go left to right in number order. `--overlap` and `--boards` set other numbers.
+
+The merged page is cut into tiles from its top left corner. At the default 128 px a page gives 16 × 42 tiles and leaves 32 columns over at the right, as many as neighbouring stripes share. Pages keep the order and orientation of the files. Reversed page order and flipped pages of a stripe scanned upwards are left to the map.
+
+For every page the run also compares the 32 columns as each of the two boards recorded them. A correlation near 1 means the boards overlap as assumed. A low value on pages that show pattern at the seam means they do not, by board order, overlap width or alignment. The console prints one number per seam: the level the best tenth of the segment's pages reach, so empty pages do not pull it down.
+
+### What a run leaves behind
+
+| File | Contents |
+|---|---|
+| `stripes.json` | The settings, the path of `header.xml`, and one entry per segment: its board files, the result file, page count, board and merged page size, tile grid, seam columns, accepted and screened tiles, the mean per method and the seconds per stage. `incomplete` lists segments without all boards, which are not measured. |
+| `<stripe>_<segment>.npz` | The tile values of one segment. |
+
+| Array in the `.npz` | Shape | Contents |
+|---|---|---|
+| `raw`, or the name of each method that ran | (page, tile row, tile column) | The tile's value. NaN where the tile was not accepted or gave no valid value. |
+| `reference` | (page, tile row, tile column) | The reference lattice the tile matched, −1 for a tile that was not accepted. |
+| `page_index` | (page) | The zero-based TIFF page of each row. |
+| `seam_correlation` | (page, seam) | Agreement of neighbouring boards in their shared columns. NaN where those columns are flat. |
+| `stripe`, `vertical`, `tile_size`, `overlap_px`, `boards`, `board_columns` | single numbers | What the map needs to place a tile without `stripes.json`. |
+
+Tile `[p, r, c]` covers rows `r × tile_size` to `(r + 1) × tile_size` and columns `c × tile_size` to `(c + 1) × tile_size` of merged page `p`. The methods that measure each opening also store `<method>_openings`, and the two aperture fits `blur_sigma_px` and `blur_usable`, as in the TIFF benchmark.
+
+~~~python
+import json
+from pathlib import Path
+
+import numpy as np
+
+run = Path(r"D:\ACTIS\scan-raw")
+for segment in json.loads((run / "stripes.json").read_text(encoding="utf-8"))["segments"]:
+    if segment["status"] == "complete":
+        raw = np.load(run / segment["result"])["raw"]  # (page, tile row, tile column)
+~~~
+
+### Long runs
+
+A segment's file is written when the segment is finished. Running the same command again on the same output folder continues a stopped run: complete segments stay, failed ones are tried again. A segment that cannot be read is recorded as failed with the reason, and the run goes on. Other settings need a new output folder.
+
+`--stripe 1 3` measures only those stripes. `--max-pages 50` stops each segment after 50 pages for a trial. `--method raw pooled` runs several methods on the same accepted tiles. `--device` chooses the CUDA device.
+
+### Speed
+
+One synthetic segment of production size took 103 to 109 s for raw brightness on an RTX 4060 Ti, read from a SATA hard disk with nothing in the file cache. It was four 8-bit board stacks of 1,500 pages, 16.9 GB, with 1,008,000 tiles screened and 912,000 measured. The disk set the pace: the reader was busy for all but one second, at about 160 MB/s. The GPU needed 16 s of it, 2.5 s to upload and merge, 13 s to screen and 0.5 s for the brightness.
+
+Each segment's `seconds` in `stripes.json` show where its time went. `read` is how long the background reader worked. `read_wait` is how long the measurement stood still waiting for it, which the console prints as waiting for the disk. `merge`, `selection` and the method names are GPU stages.
+
+- **Pages are measured one merged page at a time.** Screening costs 11.7 µs per tile with the 672 tiles of one merged page in a batch, and 10.9 µs with several pages in a batch, so larger batches would gain about 7% of the screening time.
+- **Files are read in blocks.** The reader takes about 64 MB of one board, then the same pages of the next board, one block ahead of the measurement. Reading one page of each board in turn took 140 to 150 s on the same files.
+
+The four files of that test each lay in a few pieces on the disk, as copied files do. Written four at a time, in 169 pieces each, they took 118 and 141 s. These numbers come from one PC and synthetic stacks.
+
 ## Throughput and production boundary
 
 The report times input, discovery, alignment, each estimator and rendering separately. Optional `--io-sample "D:\ACTIS\stripes\2_1_1.tiff"` measures sequential file reading on the workstation. The operating system can cache a repeated read. The 1,500-page projections use 4,227,072,000 decoded pixels per board stack. Reference PNG bit depth, pattern density, TIFF compression and parallelism affect transfer to production. The exhaustive method comparison is a qualification run. Evaluate the selected method's throughput separately.
@@ -275,6 +339,6 @@ Run the resident-data benchmark to measure the raw, flux, pooled-moment and harm
 .\.venv\Scripts\actis benchmark --input "D:\ACTIS\reference-pngs" --output "D:\ACTIS\reports\timing-01.json" --workers 4 --seconds 5 --io-sample "D:\ACTIS\stripes\2_1_1.tiff"
 ~~~
 
-The production board stacks have shape up to (1500, 2048, 1376) in (page, row, column) order at 8 bits per pixel. A file name encodes stripe, vertical segment and board. The four simultaneous boards have 32-column overlaps and a combined width of 5,408 pixels. Neighboring stripes overlap by 32 columns. Stripe 1 scans down from the top. Even stripes scan up with reversed segment/page order and vertically flipped pages. The far end can overrun the nominal mask boundary by a fractional page, giving neighboring stripes different Y origins. The single-file TIFF benchmark measures native pages. Board and stripe stitching belong to the next phase.
+The production board stacks have shape up to (1500, 2048, 1376) in (page, row, column) order at 8 bits per pixel. A file name encodes stripe, vertical segment and board. The four simultaneous boards have 32-column overlaps and a combined width of 5,408 pixels. Neighboring stripes overlap by 32 columns. Stripe 1 scans down from the top. Even stripes scan up with reversed segment/page order and vertically flipped pages. The far end can overrun the nominal mask boundary by a fractional page, giving neighboring stripes different Y origins. The single-file TIFF benchmark measures native pages. The stripe measurement above merges the boards. Placing the stripes on the mask belongs to the next phase.
 
 The equipment evidence, method assumptions and physical calibration requirements are documented in [the research notes](docs/metrology.md).

@@ -19,6 +19,7 @@ tiff = ["tifffile", "imagecodecs"]
 [project.scripts]
 actis = "actis.cli:main"
 actis-benchmark-tiff = "actis.tiff_benchmark:main"
+actis-stripes = "actis.stripes:main"
 actis-contours = "actis.contourlab.server:main"
 
 [tool.setuptools.packages.find]
