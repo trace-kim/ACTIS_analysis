@@ -273,7 +273,7 @@ The selector takes one exemplar from each detected reference lattice and tests e
 python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output D:\ACTIS\scan-raw
 ~~~
 
-The scan folder holds one subfolder per stripe, for example `S1`, and a `header.xml`. A board stack is named `<stripe>_<vertical segment>_<board>.tiff`, so `1_1_1.tiff` to `1_1_4.tiff` are the four boards of the first segment of stripe 1. Only the file names are read, not the subfolder names. `header.xml` is not read yet. `stripes.json` records where it is.
+The scan folder holds a `header.xml` and the board stacks, which may lie at any depth below it, for example in `RAW\S1`. A board stack is named `<stripe>_<vertical segment>_<board>.tiff`, so `1_1_1.tiff` to `1_1_4.tiff` are the four boards of the first segment of stripe 1. Only the file names are read, not the folder names. A name that occurs twice under the scan folder stops the run and names both files. `header.xml` is not read yet. `stripes.json` records where it is.
 
 ### Boards are merged first
 

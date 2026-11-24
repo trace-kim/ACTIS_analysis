@@ -1,9 +1,9 @@
 """Measure every stripe of a scan and keep each tile's value for a map.
 
-A scan is a folder with one subfolder per stripe. Several boards record a
-stripe side by side, each into its own multi-page TIFF named
-<stripe>_<vertical segment>_<board>.tiff. Neighbouring boards image the same
-few columns. Page by page, the boards are merged with those columns counted
+A scan is a folder that holds the board stacks of every stripe, at any depth
+below it. Several boards record a stripe side by side, each into its own
+multi-page TIFF named <stripe>_<vertical segment>_<board>.tiff, and that name
+is all a file is found by. Neighbouring boards image the same few columns. Page by page, the boards are merged with those columns counted
 once, the merged page is cut into tiles, the tiles are screened against the
 reference, and the accepted tiles are measured.
 
@@ -66,7 +66,7 @@ class Segment:
 
 
 def find_segments(root, boards=4):
-    """Group the TIFFs in the subfolders of `root` into segments.
+    """Group the board TIFFs under `root`, at any depth, into segments.
 
     Returns the segments that have boards 1 to `boards`, in stripe order, and
     a list saying which board sets are incomplete.
@@ -75,7 +75,7 @@ def find_segments(root, boards=4):
     if not root.is_dir():
         raise ValueError(f"Scan folder does not exist: {root}")
     found = {}
-    for path in sorted(root.glob("*/*")):
+    for path in sorted(root.rglob("*")):
         match = NAME.fullmatch(path.name)
         if match is None or not path.is_file():
             continue
@@ -89,7 +89,7 @@ def find_segments(root, boards=4):
         slot[board] = path
     if not found:
         raise ValueError(
-            f"No <stripe>_<vertical>_<board>.tiff files in the subfolders of {root}"
+            f"No <stripe>_<vertical>_<board>.tiff files in {root} or its subfolders"
         )
     wanted = list(range(1, boards + 1))
     segments, incomplete = [], []
@@ -547,7 +547,9 @@ def measure_stripes(
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "root", type=Path, help="Scan folder: one subfolder per stripe, and header.xml"
+        "root",
+        type=Path,
+        help="Scan folder: holds header.xml and, at any depth, the board stacks",
     )
     parser.add_argument(
         "--reference",

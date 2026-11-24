@@ -76,7 +76,7 @@ def hole_tiles(layout):
 
 
 def write_boards(folder, stem, pages, tifffile):
-    folder.mkdir(exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=True)
     for number, board in enumerate(split(np.stack(pages)), 1):
         path = folder / f"{stem}_{number}.tiff"
         tifffile.imwrite(path, board, photometric="minisblack")
@@ -103,25 +103,34 @@ def test_boards_merge_with_shared_columns_counted_once():
 
 
 def test_segments_are_found_by_file_name(tmp_path):
-    names = ["S1/1_1_%d.tiff", "S1/1_2_%d.tiff", "S10/10_1_%d.TIF", "S2/2_1_%d.tiff"]
+    # Stripe folders inside a folder, beside the scan's own files, and no folder at all.
+    names = ["RAW/S1/1_1_%d.tiff", "RAW/S1/1_2_%d.tiff", "RAW/S10/10_1_%d.TIF"]
+    names += ["S2/2_1_%d.tiff", "3_1_%d.tiff"]
     for name in names:
         for board in range(1, 5):
             path = tmp_path / (name % board)
-            path.parent.mkdir(exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
     (tmp_path / "S2" / "2_1_3.tiff").unlink()
-    for other in ("header.xml", "S1/notes.txt", "S1/1_1_1_copy.tiff", "9_9_1.tiff"):
+    for other in ("header.xml", "RAW/S1/notes.txt", "RAW/S1/1_1_1_copy.tiff"):
         (tmp_path / other).touch()
     segments, incomplete = find_segments(tmp_path)
-    # In number order: stripe 10 follows stripe 1, not the other way round.
+    # In number order: stripe 10 follows stripe 3, not stripe 1.
     assert [(s.stripe, s.vertical, s.name) for s in segments] == [
         (1, 1, "1_1"),
         (1, 2, "1_2"),
+        (3, 1, "3_1"),
         (10, 1, "10_1"),
     ]
-    assert [p.name for p in segments[2].files] == [f"10_1_{b}.TIF" for b in range(1, 5)]
+    assert [p.name for p in segments[3].files] == [f"10_1_{b}.TIF" for b in range(1, 5)]
     assert incomplete == [{"stripe": 2, "vertical": 1, "boards_found": [1, 2, 4]}]
     assert len(find_segments(tmp_path, boards=3)[0]) == 0
+    assert [s.name for s in find_segments(tmp_path / "RAW")[0]] == [
+        "1_1",
+        "1_2",
+        "10_1",
+    ]
+    assert [s.name for s in find_segments(tmp_path / "RAW" / "S10")[0]] == ["10_1"]
 
     (tmp_path / "S2" / "1_1_4.tif").touch()
     with pytest.raises(ValueError, match="stored twice"):
@@ -177,15 +186,19 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
     places = [[(0, 0), (0, 1), (1, 3)], [(0, 2), (1, 1)], []], [[(1, 0)], [(0, 3)]]
     first = [merged_page(tile, where) for where in places[0]]
     second = [merged_page(tile, where) for where in places[1]] + first[:1]
-    write_boards(root / "S1", "1_1", first, tifffile)
-    write_boards(root / "S1", "1_2", second, tifffile)
+    write_boards(root / "RAW" / "S1", "1_1", first, tifffile)
+    write_boards(root / "RAW" / "S1", "1_2", second, tifffile)
     short = split(np.stack(second[:2]))[2]
-    tifffile.imwrite(root / "S1" / "1_2_3.tiff", short, photometric="minisblack")
-    write_boards(root / "S2", "2_1", first, tifffile)
-    (root / "S2" / "2_1_4.tiff").unlink()
-    write_boards(root / "S3", "3_1", first, tifffile)
+    tifffile.imwrite(
+        root / "RAW" / "S1" / "1_2_3.tiff", short, photometric="minisblack"
+    )
+    write_boards(root / "RAW" / "S2", "2_1", first, tifffile)
+    (root / "RAW" / "S2" / "2_1_4.tiff").unlink()
+    write_boards(root / "RAW" / "S3", "3_1", first, tifffile)
     narrow = split(np.stack(first))[1][..., :120]
-    tifffile.imwrite(root / "S3" / "3_1_2.tiff", narrow, photometric="minisblack")
+    tifffile.imwrite(
+        root / "RAW" / "S3" / "3_1_2.tiff", narrow, photometric="minisblack"
+    )
 
     lines = []
     kwargs = {"reference": reference, "tile_size": SIDE, "shape": "square"}
@@ -206,7 +219,7 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
     ]
     assert "3_1_2.tiff is 120 x 195 px" in three["error"] and "result" not in three
     assert not (out / "3_1.npz").exists()
-    assert one["files"] == [f"S1/1_1_{b}.tiff" for b in range(1, 5)]
+    assert one["files"] == [f"RAW/S1/1_1_{b}.tiff" for b in range(1, 5)]
     assert (one["pages"], one["board_shape"], one["page_shape"]) == (
         3,
         [195, 128],
