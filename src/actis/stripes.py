@@ -8,7 +8,9 @@ once, the merged page is cut into tiles, the tiles are screened against the
 reference, and the accepted tiles are measured.
 
 Every segment gets one .npz of values shaped (page, tile row, tile column).
-stripes.json lists them with the geometry a map needs.
+stripes.json lists them with the geometry a map needs. On request a second
+.npz keeps the outer columns of every merged page, which neighbouring stripes
+share, so the shift between stripes can be found without reading the scan again.
 """
 
 import argparse
@@ -46,6 +48,8 @@ NAME = re.compile(r"(\d+)_(\d+)_(\d+)\.tiff?", re.IGNORECASE)
 READ_BLOCK_BYTES = 2**26
 # Most pixels screened in one batch. A merged page of four boards fits.
 SCREEN_PIXELS = 2**24
+# Columns that neighbouring stripes share: the usual width of an edge strip.
+EDGE_COLUMNS = 32
 
 
 @dataclass(frozen=True)
@@ -238,12 +242,14 @@ def _measure_merged_page(boards, index, templates, settings, run, maps, cp):
 def _measure_segment(segment, templates, settings, cp, live, tifffile):
     """Measure every merged page of one segment.
 
-    Returns the arrays to save and a summary for the manifest.
+    Returns the arrays to save, the edge strips if they are kept, and a
+    summary for the manifest.
     """
     tile, overlap = settings["tile_size"], settings["overlap_px"]
+    edge = settings["edge_columns"]
     methods = tuple(settings["methods"])
     run, maps = Run(cp, live, methods), TileMaps(methods)
-    notes, seams, layout = [], [], None
+    notes, seams, left, right, layout = [], [], [], [], None
     tested = accepted = 0
     start = perf_counter()
     pages = _board_pages(
@@ -259,6 +265,11 @@ def _measure_segment(segment, templates, settings, cp, live, tifffile):
                         f"The boards are {layout[0][1]} columns wide, no wider "
                         f"than the overlap of {overlap}"
                     )
+                if edge > layout[0][1] - overlap:
+                    raise ValueError(
+                        f"Edge strips of {edge} columns do not fit boards of "
+                        f"{layout[0][1]} columns that share {overlap}"
+                    )
             for path, board in zip(segment.files, boards):
                 if (board.shape, board.dtype) != layout:
                     raise ValueError(
@@ -272,6 +283,10 @@ def _measure_segment(segment, templates, settings, cp, live, tifffile):
             seams.append(seam)
             tested += screened
             accepted += kept
+            if edge:
+                # Copies, because a view would keep its whole page in memory.
+                left.append(boards[0][:, :edge].copy())
+                right.append(boards[-1][:, -edge:].copy())
             live.stage = "reading the board files"
     if layout is None:
         raise ValueError(f"{segment.files[0].name} has no pages")
@@ -309,7 +324,16 @@ def _measure_segment(segment, templates, settings, cp, live, tifffile):
         "seconds": {"total": perf_counter() - start, **run.seconds},
         "notes": notes,
     }
-    return arrays, summary
+    edges = {}
+    if edge:
+        edges = {
+            "left": np.stack(left),
+            "right": np.stack(right),
+            "page_index": arrays["page_index"],
+            "stripe": segment.stripe,
+            "vertical": segment.vertical,
+        }
+    return arrays, edges, summary
 
 
 def _earlier_segments(output, settings):
@@ -317,7 +341,9 @@ def _earlier_segments(output, settings):
     manifest = output / MANIFEST
     if manifest.is_file():
         earlier = json.loads(manifest.read_text(encoding="utf-8"))
-        if earlier.get("format") != FORMAT or earlier.get("settings") != settings:
+        # A run from before edge strips existed kept none.
+        known = {"edge_columns": 0, **earlier.get("settings", {})}
+        if earlier.get("format") != FORMAT or known != settings:
             raise ValueError(
                 f"{output} holds a run with other settings. Choose a new output folder"
             )
@@ -379,12 +405,15 @@ def measure_stripes(
     device=0,
     stripes=None,
     max_pages=None,
+    edge_columns=0,
     progress=None,
 ):
     """Measure the segments under `root` into `output` and return the manifest.
 
     A segment that `output` already holds from an earlier run with the same
     settings is left as it is, so a stopped run continues where it ended.
+    `edge_columns` above 0 also saves that many columns from the left and
+    from the right edge of every merged page.
     """
     try:
         import tifffile
@@ -399,9 +428,10 @@ def measure_stripes(
         raise ValueError(
             "Use an even tile size of at least 16 and a minimum correlation in (0,1]"
         )
-    if min(overlap, device, reference_page) < 0 or boards < 1:
+    if min(overlap, edge_columns, device, reference_page) < 0 or boards < 1:
         raise ValueError(
-            "Overlap, device and reference page must be nonnegative, with at least one board"
+            "Overlap, edge columns, device and reference page must be nonnegative, "
+            "with at least one board"
         )
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive")
@@ -425,6 +455,7 @@ def measure_stripes(
             "boards": boards,
             "shape": shape,
             "max_pages": max_pages,
+            "edge_columns": edge_columns,
         }
     )
     entries = _earlier_segments(output, settings)
@@ -467,7 +498,11 @@ def measure_stripes(
             if (
                 entry
                 and entry["status"] == "complete"
-                and (output / entry["result"]).is_file()
+                and all(
+                    (output / entry[kept]).is_file()
+                    for kept in ("result", "edges")
+                    if kept in entry
+                )
             ):
                 say(f"{segment.name}: measured by an earlier run")
                 continue
@@ -479,15 +514,26 @@ def measure_stripes(
                 "files": [path.relative_to(root).as_posix() for path in segment.files],
             }
             try:
-                arrays, summary = _measure_segment(
+                arrays, edges, summary = _measure_segment(
                     segment, templates, settings, cp, live, tifffile
                 )
             except (OSError, ValueError, tifffile.TiffFileError) as error:
                 entry.update(status="failed", error=str(error))
             else:
                 entry.update(status="complete", result=f"{segment.name}.npz", **summary)
+                live.stage = "saving the results"
+                saving = perf_counter()
+                if edges:
+                    entry["edges"] = f"{segment.name}_edges.npz"
+                    # Not compressed. Noisy synthetic strips of a 1,500-page segment
+                    # took 6 s to compress and shrank by a third at most.
+                    with _replacing(output / entry["edges"]) as out:
+                        np.savez(out, **edges)
                 with _replacing(output / entry["result"]) as out:
                     np.savez_compressed(out, **arrays)
+                saved = perf_counter() - saving
+                entry["seconds"]["save"] = saved
+                entry["seconds"]["total"] += saved
             entries[key] = native(entry)
             manifest["segments"] = [entries[k] for k in sorted(entries)]
             text = json.dumps(native(manifest), indent=2, allow_nan=False)
@@ -568,6 +614,17 @@ def main(argv=None):
         type=int,
         help="Read at most this many pages of each segment, for a short trial",
     )
+    parser.add_argument(
+        "--edge-strips",
+        nargs="?",
+        type=int,
+        const=EDGE_COLUMNS,
+        default=0,
+        metavar="COLUMNS",
+        help="Also save the outer columns of every merged page, which neighbouring "
+        "stripes share, to find the shift between stripes later "
+        f"(width when no number is given: {EDGE_COLUMNS} columns per edge)",
+    )
     args = parser.parse_args(argv)
     start = perf_counter()
     try:
@@ -585,6 +642,7 @@ def main(argv=None):
             device=args.device,
             stripes=args.stripe,
             max_pages=args.max_pages,
+            edge_columns=args.edge_strips,
             progress=lambda line: print(line, flush=True),
         )
     except (OSError, ValueError, RuntimeError) as error:

@@ -251,8 +251,16 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
     monkeypatch.setattr("actis.stripes._measure_segment", recorded)
     again = measure_stripes(root, out, **kwargs)
     assert measured == ["3_1"] and again == manifest
+    # A folder written before edge strips existed continues as one without them.
+    old = json.loads((out / MANIFEST).read_text(encoding="utf-8"))
+    del old["settings"]["edge_columns"]
+    (out / MANIFEST).write_text(json.dumps(old), encoding="utf-8")
+    assert measure_stripes(root, out, **kwargs) == manifest
+    assert measured == ["3_1", "3_1"]
     with pytest.raises(ValueError, match="other settings"):
         measure_stripes(root, out, **{**kwargs, "min_corr": 0.7})
+    with pytest.raises(ValueError, match="other settings"):
+        measure_stripes(root, out, edge_columns=32, **kwargs)
     (tmp_path / "taken").mkdir()
     (tmp_path / "taken" / "file.txt").touch()
     with pytest.raises(ValueError, match="new or empty folder"):
@@ -271,9 +279,56 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
         np.testing.assert_array_equal(np.isfinite(data[name]), accepted, err_msg=name)
     assert data["blur_sigma_px"].shape == (1, 1, 2)
 
+    # On request the outer columns of every merged page are kept as stored.
+    strips = {**kwargs, "stripes": [1], "edge_columns": 32}
+    kept = measure_stripes(root, tmp_path / "edges", **strips)
+    assert kept["settings"]["edge_columns"] == 32
+    assert "edges" not in one and "save" in one["seconds"]
+    for entry, pages in zip(kept["segments"], (first, second[:2])):
+        assert entry["edges"] == f"1_{entry['vertical']}_edges.npz"
+        pages = np.stack(pages)
+        with np.load(tmp_path / "edges" / entry["edges"]) as edges:
+            assert edges["left"].dtype == np.uint8
+            np.testing.assert_array_equal(edges["left"], pages[:, :, :32])
+            np.testing.assert_array_equal(edges["right"], pages[:, :, -32:])
+            np.testing.assert_array_equal(edges["page_index"], np.arange(len(pages)))
+            assert (int(edges["stripe"]), int(edges["vertical"])) == (
+                1,
+                entry["vertical"],
+            )
+        # Keeping the strips does not change the values.
+        with np.load(tmp_path / "edges" / entry["result"]) as with_strips:
+            np.testing.assert_array_equal(
+                with_strips["raw"], np.load(out / entry["result"])["raw"]
+            )
+    # A segment whose strips are gone is measured again.
+    (tmp_path / "edges" / "1_2_edges.npz").unlink()
+    del measured[:]
+    redone = measure_stripes(root, tmp_path / "edges", **strips)
+    assert measured == ["1_2"] and redone["segments"][0] == kept["segments"][0]
+    assert (tmp_path / "edges" / "1_2_edges.npz").is_file()
+    # The boards are 128 columns wide and share 32, so 96 are a board's own.
+    wide = measure_stripes(root, tmp_path / "wide", **{**strips, "edge_columns": 97})
+    assert all("Edge strips of 97" in s["error"] for s in wide["segments"])
+    with pytest.raises(ValueError, match="nonnegative"):
+        measure_stripes(root, tmp_path / "negative", **{**strips, "edge_columns": -1})
+
     arguments = [str(root), "--reference", str(reference), "--tile-size", str(SIDE)]
     arguments += ["--shape", "square", "--output"]
     assert main([*arguments, str(tmp_path / "cli"), "--stripe", "1"]) == 0
     saved = json.loads((tmp_path / "cli" / MANIFEST).read_text(encoding="utf-8"))
     assert [s["result"] for s in saved["segments"]] == ["1_1.npz", "1_2.npz"]
     assert main([*arguments, str(tmp_path / "cli")]) == 1  # 3_1 cannot be merged
+    trial = [
+        *arguments,
+        str(tmp_path / "cli-edges"),
+        "--stripe",
+        "1",
+        "--max-pages",
+        "1",
+    ]
+    assert main([*trial, "--edge-strips"]) == 0
+    edges = np.load(tmp_path / "cli-edges" / "1_1_edges.npz")
+    assert edges["right"].shape == (1, 195, 32)
+    with pytest.raises(SystemExit):  # the folder holds strips of 32 columns, not 16
+        main([*trial, "--edge-strips", "16"])

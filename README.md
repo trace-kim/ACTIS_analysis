@@ -287,8 +287,9 @@ For every page the run also compares the 32 columns as each of the two boards re
 
 | File | Contents |
 |---|---|
-| `stripes.json` | The settings, the path of `header.xml`, and one entry per segment: its board files, the result file, page count, board and merged page size, tile grid, seam columns, accepted and screened tiles, the mean per method and the seconds per stage. `incomplete` lists segments without all boards, which are not measured. |
+| `stripes.json` | The settings, the path of `header.xml`, and one entry per segment: its board files, the result file, the strip file under `edges` if strips are kept, page count, board and merged page size, tile grid, seam columns, accepted and screened tiles, the mean per method and the seconds per stage. `incomplete` lists segments without all boards, which are not measured. |
 | `<stripe>_<segment>.npz` | The tile values of one segment. |
+| `<stripe>_<segment>_edges.npz` | With `--edge-strips`: the pixels of the outer columns of every merged page of the segment. |
 
 | Array in the `.npz` | Shape | Contents |
 |---|---|---|
@@ -312,9 +313,30 @@ for segment in json.loads((run / "stripes.json").read_text(encoding="utf-8"))["s
         raw = np.load(run / segment["result"])["raw"]  # (page, tile row, tile column)
 ~~~
 
+### Edge strips for the shift between stripes
+
+Neighbouring stripes share 32 columns, and a stripe does not begin at the height where its neighbour ended. This measurement does not align stripes. It keeps every stripe as stored. `--edge-strips` saves the pixels an alignment needs, so the scan is not read a second time: the first 32 and the last 32 columns of every merged page. `--edge-strips 64` saves 64 columns per edge.
+
+~~~sh
+python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output D:\ACTIS\scan-raw --edge-strips
+~~~
+
+| Array in `<stripe>_<segment>_edges.npz` | Shape | Contents |
+|---|---|---|
+| `left` | (page, row, column) | Columns 0 to 31 of each merged page, which board 1 recorded. |
+| `right` | (page, row, column) | The last 32 columns of each merged page, which board 4 recorded. At the default tile size and strip width these are the columns no tile covers. |
+| `page_index` | (page) | The zero-based TIFF page of each row, as in the value file. |
+| `stripe`, `vertical` | single numbers | The segment. |
+
+The strips have the pixel type of the TIFFs and the page order and orientation of the files, like the values. Saving them does not change the values.
+
+A 1,500-page segment adds 188 MB, 1.1% of what was read. The file is not compressed. Writing two synthetic strips of that size took 0.2 s. Compressing them took 6 s and saved a quarter to a third.
+
+An output folder holds a run with strips or a run without. Adding strips later needs a new output folder and a second pass over the scan.
+
 ### Long runs
 
-A segment's file is written when the segment is finished. Running the same command again on the same output folder continues a stopped run: complete segments stay, failed ones are tried again. A segment that cannot be read is recorded as failed with the reason, and the run goes on. Other settings need a new output folder.
+A segment's files are written when the segment is finished. Running the same command again on the same output folder continues a stopped run: complete segments stay, failed ones are tried again. A segment that cannot be read is recorded as failed with the reason, and the run goes on. Other settings need a new output folder.
 
 `--stripe 1 3` measures only those stripes. `--max-pages 50` stops each segment after 50 pages for a trial. `--method raw pooled` runs several methods on the same accepted tiles. `--device` chooses the CUDA device.
 
@@ -322,7 +344,7 @@ A segment's file is written when the segment is finished. Running the same comma
 
 One synthetic segment of production size took 103 to 109 s for raw brightness on an RTX 4060 Ti, read from a SATA hard disk with nothing in the file cache. It was four 8-bit board stacks of 1,500 pages, 16.9 GB, with 1,008,000 tiles screened and 912,000 measured. The disk set the pace: the reader was busy for all but one second, at about 160 MB/s. The GPU needed 16 s of it, 2.5 s to upload and merge, 13 s to screen and 0.5 s for the brightness.
 
-Each segment's `seconds` in `stripes.json` show where its time went. `read` is how long the background reader worked. `read_wait` is how long the measurement stood still waiting for it, which the console prints as waiting for the disk. `merge`, `selection` and the method names are GPU stages.
+Each segment's `seconds` in `stripes.json` show where its time went. `read` is how long the background reader worked. `read_wait` is how long the measurement stood still waiting for it, which the console prints as waiting for the disk. `merge`, `selection` and the method names are GPU stages. `save` is the time to write the segment's files.
 
 - **Pages are measured one merged page at a time.** Screening costs 11.7 µs per tile with the 672 tiles of one merged page in a batch, and 10.9 µs with several pages in a batch, so larger batches would gain about 7% of the screening time.
 - **Files are read in blocks.** The reader takes about 64 MB of one board, then the same pages of the next board, one block ahead of the measurement. Reading one page of each board in turn took 140 to 150 s on the same files.
