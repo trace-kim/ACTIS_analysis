@@ -149,6 +149,25 @@ def seam_agreement(boards, overlap, xp=np):
     return to_host(xp, agreement).astype(np.float32)
 
 
+def cut_tiles(page, tile, xp=np):
+    """Cut a page into whole tiles from its top-left corner, row by row.
+
+    Returns the tiles shaped (tile row x tile column, tile, tile) and the grid
+    size (rows, columns). Rows and columns left over at the right and bottom
+    belong to no tile.
+    """
+    ny, nx = page.shape[0] // tile, page.shape[1] // tile
+    if not ny * nx:
+        raise ValueError(
+            f"Tile size {tile} exceeds the merged page: "
+            f"{page.shape[1]} x {page.shape[0]} px"
+        )
+    tiles = xp.ascontiguousarray(
+        page[: ny * tile, : nx * tile].reshape(ny, tile, nx, tile).transpose(0, 2, 1, 3)
+    ).reshape(ny * nx, tile, tile)
+    return tiles, (ny, nx)
+
+
 def _board_pages(files, max_pages, seconds, notes, tifffile):
     """Yield (page index, one page per board) for the pages every board has.
 
@@ -207,17 +226,7 @@ def _measure_merged_page(boards, index, templates, settings, run, maps, cp):
         parts = [cp.asarray(board) for board in boards]
         seams = seam_agreement(parts, overlap, cp)
         page = merge_boards(parts, overlap, cp)
-        ny, nx = page.shape[0] // tile, page.shape[1] // tile
-        if not ny * nx:
-            raise ValueError(
-                f"Tile size {tile} exceeds the merged page: "
-                f"{page.shape[1]} x {page.shape[0]} px"
-            )
-        tiles = cp.ascontiguousarray(
-            page[: ny * tile, : nx * tile]
-            .reshape(ny, tile, nx, tile)
-            .transpose(0, 2, 1, 3)
-        ).reshape(ny * nx, tile, tile)
+        tiles, (ny, nx) = cut_tiles(page, tile, cp)
     position = maps.add_page(index, ny, nx)
     batch = max(1, SCREEN_PIXELS // tile**2)
     with run.time("selection"):

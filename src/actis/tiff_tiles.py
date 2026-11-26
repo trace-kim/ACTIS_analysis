@@ -251,8 +251,13 @@ def _match(tiles, spectra, template, cp):
     return scores, shift_x, shift_y
 
 
-def select_tiles(tiles, templates, min_corr, cp):
-    """Return (batch index, reference index, native dx, dy) for accepted tiles."""
+def score_tiles(tiles, templates, cp):
+    """Score every tile against its best-matching reference.
+
+    Returns four device arrays with one entry per tile: the score (the lowest
+    of the four quadrant correlations), the index of the reference that gave
+    it, and that reference's native dx and dy.
+    """
     data = tiles.astype(cp.float32, copy=False)
     window = templates[0].window
     centered = data - (data * window).sum(axis=(1, 2), keepdims=True)
@@ -266,6 +271,12 @@ def select_tiles(tiles, templates, min_corr, cp):
         match_x = cp.where(better, dx, match_x)
         match_y = cp.where(better, dy, match_y)
         best = cp.maximum(score, best)
+    return best, reference_ids, match_x, match_y
+
+
+def select_tiles(tiles, templates, min_corr, cp):
+    """Return (batch index, reference index, native dx, dy) for accepted tiles."""
+    best, reference_ids, match_x, match_y = score_tiles(tiles, templates, cp)
     keep = cp.flatnonzero(best >= min_corr)
     return cp.column_stack(
         (keep, reference_ids[keep], match_x[keep], match_y[keep])

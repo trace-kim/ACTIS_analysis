@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ACTIS Tile Screening</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+/* Layout: one reading column of about 70 characters; diagrams, the tile model and the table widen to 1000 px. */
+:root {
+  --bg: #f4f6f9; --surface: #ffffff; --ink: #16202c; --muted: #4f5b69; --line: #d6dce4; --code: #e8ecf1;
+  --accept: #0a78bd; --reject: #c05600; --glow: #9a6100;
+  --display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --text: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, "Courier New", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1217; --surface: #151b23; --ink: #e5eaf0; --muted: #a1acb9; --line: #2b3440; --code: #1b222c;
+    --accept: #4cc3ff; --reject: #ff9a3d; --glow: #f2c14e; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1217; --surface: #151b23; --ink: #e5eaf0; --muted: #a1acb9; --line: #2b3440; --code: #1b222c;
+  --accept: #4cc3ff; --reject: #ff9a3d; --glow: #f2c14e; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 var(--text); }
+.page {
+  max-width: 1000px; margin: 0 auto; padding-block: 48px 80px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 64px;
+}
+section, header { display: grid; gap: 20px; min-width: 0; }
+.col { max-width: 44rem; }
+h1, h2, h3 { font-family: var(--display); line-height: 1.15; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+h1 { font-size: clamp(2.1rem, 5vw, 3rem); font-weight: 600; }
+h2 { font-size: 1.7rem; font-weight: 600; }
+h3 { font-size: 1.25rem; font-weight: 600; }
+p, ul, ol { margin: 0; }
+.eyebrow { font: 500 0.82rem/1.4 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.lede { font-size: 1.2rem; color: var(--muted); }
+code, .mono { font-family: var(--mono); font-size: 0.9em; }
+:not(pre) > code { background: var(--code); padding: 0.1em 0.35em; border-radius: 4px; }
+pre { margin: 0; background: var(--code); border-radius: 8px; padding: 16px 18px; overflow-x: auto; font: 0.95rem/1.55 var(--mono); }
+a { color: var(--accept); }
+:focus-visible { outline: 3px solid var(--accept); outline-offset: 3px; }
+
+/* Short answer */
+.answer { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 24px; display: grid; gap: 18px; }
+.answer h2 { font-size: 1.3rem; }
+.causes { list-style: none; padding: 0; display: grid; gap: 14px; }
+.causes li { display: grid; grid-template-columns: 2.2rem 1fr; gap: 12px; align-items: start; }
+.letter { font: 600 1rem/2.2rem var(--display); width: 2.2rem; height: 2.2rem; text-align: center; border-radius: 50%; border: 1.5px solid var(--glow); color: var(--glow); }
+.causes strong { display: block; }
+
+/* Figures */
+figure { margin: 0; display: grid; gap: 12px; min-width: 0; }
+figcaption { color: var(--muted); font-size: 0.98rem; max-width: 44rem; }
+.scroll { overflow-x: auto; }
+svg.diagram { display: block; width: 100%; min-width: 620px; height: auto; }
+.diagram text { font-family: var(--text); fill: var(--ink); }
+.diagram .box { fill: var(--surface); stroke: var(--muted); stroke-width: 1.3; }
+.diagram .title { font-family: var(--display); font-weight: 600; font-size: 16px; }
+.diagram .sub { font-size: 13px; fill: var(--muted); }
+.diagram .label { font-size: 13px; fill: var(--muted); }
+.diagram .note { font-size: 13.5px; fill: var(--glow); font-weight: 600; }
+.diagram .wire { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+.diagram .head { fill: var(--muted); }
+.diagram .axis { stroke: var(--line); stroke-width: 1; fill: none; }
+.diagram .tick { font: 12px var(--mono); fill: var(--muted); }
+
+/* Steps */
+.steps { list-style: none; padding: 0; display: grid; gap: 28px; counter-reset: step; }
+.steps > li { display: grid; grid-template-columns: 2.6rem minmax(0, 1fr); gap: 16px; counter-increment: step; }
+.steps > li::before {
+  content: counter(step); font: 600 1.15rem/2.6rem var(--display); text-align: center;
+  width: 2.6rem; height: 2.6rem; border-radius: 8px; background: var(--code); color: var(--ink);
+}
+.step { display: grid; gap: 8px; max-width: 44rem; min-width: 0; }
+.where { font: 0.88rem/1.4 var(--mono); color: var(--muted); }
+details { border-top: 1px solid var(--line); padding-top: 8px; }
+summary { cursor: pointer; color: var(--accept); font-weight: 500; }
+details[open] summary { margin-bottom: 8px; }
+details p + p { margin-top: 8px; }
+
+/* Tile model */
+.model { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 24px; display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 32px; align-items: start; }
+@media (max-width: 760px) { .model { grid-template-columns: minmax(0, 1fr); } }
+#tile { width: 100%; max-width: 340px; height: auto; display: block; border-radius: 6px; }
+.tile-key { font-size: 0.92rem; color: var(--muted); margin-top: 10px; }
+.controls { display: grid; gap: 22px; min-width: 0; }
+.control { display: grid; gap: 6px; }
+.control label { font-weight: 600; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.control output { font-family: var(--mono); font-weight: 500; }
+.control .hint { font-size: 0.9rem; color: var(--muted); }
+input[type="range"] { width: 100%; accent-color: var(--accept); }
+.presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.presets button {
+  font: 500 0.92rem var(--text); color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 999px; padding: 6px 14px; cursor: pointer;
+}
+.presets button:hover { border-color: var(--accept); }
+.readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; border-top: 1px solid var(--line); padding-top: 18px; }
+.readout div { display: grid; gap: 2px; align-content: start; }
+.readout .k { font-size: 0.9rem; color: var(--muted); }
+.readout .v { font: 500 1.7rem/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+.verdict { justify-self: start; font: 600 0.85rem/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; padding: 6px 10px; border-radius: 999px; border: 1.5px solid currentColor; }
+.verdict.pass { color: var(--accept); }
+.verdict.fail { color: var(--reject); }
+
+/* Reading the figure, table */
+.keys { list-style: none; padding: 0; display: grid; gap: 10px; }
+.keys li { display: grid; grid-template-columns: 1.6rem 1fr; gap: 12px; align-items: center; }
+.swatch { width: 1.6rem; height: 1.1rem; border-radius: 3px; }
+.sw-accept { border: 2px solid var(--accept); }
+.sw-reject { border: 2px solid var(--reject); background: color-mix(in srgb, var(--reject) 22%, transparent); }
+.sw-none { border: 1px solid var(--muted); background: repeating-linear-gradient(45deg, var(--muted) 0 1.5px, transparent 1.5px 5px); }
+.sw-seam { height: 0; border-top: 2px dashed var(--glow); }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.case { border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; display: grid; gap: 6px; background: var(--surface); }
+.case .then { font-weight: 600; }
+table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 0.98rem; }
+th, td { text-align: left; vertical-align: top; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+th { font: 600 0.82rem/1.3 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+td:first-child { font-weight: 600; }
+footer { color: var(--muted); font-size: 0.92rem; border-top: 1px solid var(--line); padding-top: 20px; display: grid; gap: 8px; }
+footer ul { padding-left: 1.2rem; font-family: var(--mono); font-size: 0.86rem; }
+</style>
+</head>
+<body>
+<main class="page">
+
+<header>
+  <p class="eyebrow">ACTIS stripe run · measure_stripes.py</p>
+  <h1>How tiles are screened</h1>
+  <p class="lede col">The stripe run cuts every merged page into 128-pixel tiles and measures only the tiles whose hole pattern matches the reference. This page follows one tile through that test and shows what the test cannot see.</p>
+
+  <div class="answer col" aria-labelledby="why">
+    <h2 id="why">Why tiles at a pattern edge can come out bright</h2>
+    <ol class="causes">
+      <li><span class="letter">A</span><p><strong>Part of a tile may lie past the edge.</strong> Up to 23 of a tile's 128 columns can lie outside the pattern and the tile still passes, fewer when that area is much brighter or darker than the pattern. Its raw mean includes those columns.</p></li>
+      <li><span class="letter">B</span><p><strong>The test ignores brightness.</strong> Each quadrant's mean and contrast are removed before comparing. A tile lit by a bright area nearby scores as well as any other, and its raw mean is higher.</p></li>
+      <li><span class="letter">C</span><p><strong>A thin border is never compared.</strong> After aligning, a strip of up to about half a hole pitch on one side and one end is left out of the score, but counted in the raw mean.</p></li>
+    </ol>
+    <p>Each tile is judged alone. Nothing in the run drops a tile for being next to a pattern edge or next to a rejected tile.</p>
+  </div>
+</header>
+
+<section aria-labelledby="paths">
+  <h2 id="paths" class="col">One tile, two paths</h2>
+  <figure>
+    <div class="scroll">
+      <svg class="diagram" viewBox="0 0 760 640" role="img" aria-label="Each tile is scored on its pattern shape with brightness and contrast removed, and separately measured as the mean of every pixel with brightness kept. The score only decides whether the raw mean is stored.">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path class="head" fill="currentColor" d="M0 0 L10 5 L0 10 z"/>
+          </marker>
+        </defs>
+        <!-- Row 1: merged page -->
+        <rect class="box" x="290" y="20" width="180" height="58" rx="8"/>
+        <text class="title" x="380" y="45" text-anchor="middle">Merged page</text>
+        <text class="sub" x="380" y="65" text-anchor="middle">4 boards · 5,408 × 2,048 px</text>
+        <path class="wire" d="M380 78 V128" marker-end="url(#arrow)"/>
+        <text class="label" x="392" y="108">cut from the top-left corner</text>
+        <!-- Row 2: template and tile -->
+        <rect class="box" x="80" y="130" width="180" height="58" rx="8"/>
+        <text class="title" x="170" y="155" text-anchor="middle">Template</text>
+        <text class="sub" x="170" y="175" text-anchor="middle">clean 128-px reference tile</text>
+        <rect class="box" x="290" y="130" width="180" height="58" rx="8"/>
+        <text class="title" x="380" y="155" text-anchor="middle">One tile</text>
+        <text class="sub" x="380" y="175" text-anchor="middle">128 × 128 px · 1 of 672</text>
+        <!-- Branches from the tile -->
+        <path class="wire" d="M170 188 V248" marker-end="url(#arrow)"/>
+        <text class="label" x="162" y="224" text-anchor="end">compared with</text>
+        <path class="wire" d="M340 188 V279 H262" marker-end="url(#arrow)"/>
+        <text class="label" x="332" y="232" text-anchor="end">to score</text>
+        <path class="wire" d="M430 188 V279 H498" marker-end="url(#arrow)"/>
+        <text class="label" x="440" y="232">to measure</text>
+        <!-- Row 3: align and raw -->
+        <rect class="box" x="80" y="250" width="180" height="58" rx="8"/>
+        <text class="title" x="170" y="275" text-anchor="middle">Align</text>
+        <text class="sub" x="170" y="295" text-anchor="middle">FFT peak, shift ≤ 1 pitch</text>
+        <rect class="box" x="500" y="250" width="180" height="58" rx="8"/>
+        <text class="title" x="590" y="275" text-anchor="middle">Raw mean</text>
+        <text class="sub" x="590" y="295" text-anchor="middle">all 16,384 px as recorded</text>
+        <text class="note" x="580" y="338" text-anchor="end">brightness kept</text>
+        <!-- Row 4: score -->
+        <path class="wire" d="M170 308 V358" marker-end="url(#arrow)"/>
+        <text class="label" x="182" y="338">shift dx, dy</text>
+        <rect class="box" x="80" y="360" width="180" height="58" rx="8"/>
+        <text class="title" x="170" y="385" text-anchor="middle">Score</text>
+        <text class="sub" x="170" y="405" text-anchor="middle">lowest of 4 quadrant r</text>
+        <text class="note" x="280" y="384">brightness and contrast</text>
+        <text class="note" x="280" y="403">removed in each quadrant</text>
+        <!-- Row 5: verdict -->
+        <path class="wire" d="M170 418 V448" marker-end="url(#arrow)"/>
+        <path class="box" d="M170 450 L250 490 L170 530 L90 490 Z"/>
+        <text class="title" x="170" y="496" text-anchor="middle" style="font-size:15px">≥ 0.80 ?</text>
+        <path class="wire" d="M250 490 H540 V558" marker-end="url(#arrow)"/>
+        <text class="label" x="268" y="480">yes: keep the raw mean · no: NaN</text>
+        <!-- Row 6: stored -->
+        <path class="wire" d="M590 308 V558" marker-end="url(#arrow)"/>
+        <rect class="box" x="470" y="560" width="240" height="58" rx="8"/>
+        <text class="title" x="590" y="585" text-anchor="middle">Stored value</text>
+        <text class="sub" x="590" y="605" text-anchor="middle">raw mean, or NaN if rejected</text>
+      </svg>
+    </div>
+    <figcaption>The score sees only the shape of the pattern. The stored value sees the brightness of every pixel. The score decides whether that value is kept, and is then thrown away.</figcaption>
+  </figure>
+</section>
+
+<section aria-labelledby="steps">
+  <h2 id="steps" class="col">The five steps</h2>
+  <ol class="steps">
+    <li><div class="step">
+      <h3>Make the template</h3>
+      <p class="where">prepare_reference · src/actis/tiff_tiles.py:76</p>
+      <p>The reference image is searched for hole lattices. One 128 × 128 tile is cut from the middle of each lattice that is large enough. Every tile of every page is compared with that clean tile.</p>
+      <details><summary>More detail</summary>
+        <p>A lattice must be at least one tile wide and tall, with at least five pitches across the tile. Several lattices give several templates. Each page tile is scored against all of them and keeps the best.</p>
+        <p>The template's mean is removed, a Hann window is applied and its spectrum is computed once. The shift search radius is the longest lattice vector rounded up, at most 32 px. For a 6.6 px pitch that is 7 px.</p>
+      </details>
+    </div></li>
+    <li><div class="step">
+      <h3>Merge the boards and cut tiles</h3>
+      <p class="where">merge_boards, cut_tiles · src/actis/stripes.py:114, 152</p>
+      <p>The four board pages are joined left to right with the 32 shared columns counted once: 4 × 1,376 − 3 × 32 = 5,408 columns. Tiles are cut from the top-left corner, 42 across and 16 down, 672 per page.</p>
+      <p>The grid does not follow the pattern, so a pattern edge can fall anywhere inside a tile. The last 32 columns belong to no tile.</p>
+    </div></li>
+    <li><div class="step">
+      <h3>Align the tile with the template</h3>
+      <p class="where">_match · src/actis/tiff_tiles.py:219</p>
+      <p>Tile and template are cross-correlated by FFT. The peak is searched only within the search radius, about one pitch. Among equally high peaks the one nearest zero shift wins. A parabola through the peak gives the sub-pixel shift.</p>
+    </div></li>
+    <li><div class="step">
+      <h3>Score the tile</h3>
+      <p class="where">_quadrant_scores, score_tiles · src/actis/tiff_tiles.py:193, 254</p>
+      <p>The template is moved by that shift and laid over the tile. The tile is split into four 64 × 64 quadrants, and in each the Pearson correlation of tile and template is computed over the pixels the moved template covers. The score is the lowest of the four. A score of 0.80 or more accepts the tile (<code>--min-corr</code>).</p>
+      <details><summary>Why the lowest of four, and why Pearson</summary>
+        <p>One correlation over the whole tile would forgive an empty quadrant, because the other three would hold the average up. Taking the lowest makes every quadrant show the pattern. A quadrant with no pattern scores about 0.</p>
+        <p>Pearson correlation subtracts each image's mean and divides by its spread. That lets one template work on pages of different exposure and focus. It is also why the score cannot see brightness (B).</p>
+      </details>
+    </div></li>
+    <li><div class="step">
+      <h3>Measure</h3>
+      <p class="where">_raw_means · src/actis/tiff_benchmark.py:230</p>
+      <p>An accepted tile's raw value is the mean of all its 16,384 pixels as recorded. A rejected tile gets NaN in the results and −1 in <code>reference</code>. The score and the shift are not saved.</p>
+    </div></li>
+  </ol>
+</section>
+
+<section aria-labelledby="blind">
+  <h2 id="blind" class="col">What the score cannot see</h2>
+
+  <h3 class="col">A · Part of the tile past the pattern edge</h3>
+  <p class="col">Move a pattern edge into the tile and choose how bright the area past it is. The numbers come from an idealised model of one quadrant pair: the edge runs straight down through the right half, alignment is perfect, there is no noise or blur, and holes cover 25% of each lattice cell (the synthetic geometry; the real hole size is not on record).</p>
+
+  <div class="model">
+    <div>
+      <svg id="tile" viewBox="0 0 128 128" role="img" aria-label="A 128-pixel tile of bright holes split into four quadrants, with the score of each quadrant. A strip at the right lies past the pattern edge."></svg>
+      <p class="tile-key">Dashed lines split the tile into its four quadrants. The number in each is that quadrant's correlation with the template.</p>
+    </div>
+    <div class="controls">
+      <div class="control">
+        <label for="cols">Columns past the edge <output id="cols-out" for="cols">16 px</output></label>
+        <input id="cols" type="range" min="0" max="64" step="1" value="16">
+        <span class="hint">Out of 128. The right two quadrants lose this many of their 64 columns.</span>
+      </div>
+      <div class="control">
+        <label for="level">Brightness past the edge <output id="level-out" for="level">50%</output></label>
+        <input id="level" type="range" min="0" max="100" step="5" value="50">
+        <span class="hint">0% is the background between holes, 100% the inside of a hole.</span>
+        <div class="presets" role="group" aria-label="Brightness presets">
+          <button type="button" data-level="0">Dark, like between holes</button>
+          <button type="button" data-level="25">The pattern's average</button>
+          <button type="button" data-level="100">Bright open area</button>
+        </div>
+      </div>
+      <div class="readout" aria-live="polite">
+        <div><span class="k">Score</span><span class="v" id="score">0.83</span><span class="verdict pass" id="verdict">Accepted</span></div>
+        <div><span class="k">Raw mean, against a tile fully inside</span><span class="v" id="raw">+12.5%</span><span class="k">of the pattern's signal above background</span></div>
+        <div><span class="k">Widest strip that passes at this brightness</span><span class="v" id="widest">18 px</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col">
+    <details><summary>The model's formulas</summary>
+      <p>A quadrant whose fraction <span class="mono">f</span> shows the pattern, with the rest flat at level <span class="mono">c</span>, correlates with the template as <span class="mono">r = √f / √(1 + (1 − f) d²)</span>, where <span class="mono">d = (c − μ) / σ</span> is how far the flat area is from the pattern's mean, in units of the pattern's pixel spread. With holes covering a fraction <span class="mono">a</span> of the cell, <span class="mono">d = (t − a) / √(a (1 − a))</span> for brightness <span class="mono">t</span> on the 0–100% scale above.</p>
+      <p>At the pattern's average brightness <span class="mono">d = 0</span> and <span class="mono">r = √f</span>, so 0.80 passes down to <span class="mono">f = 0.64</span>: 23 of 64 columns past the edge. The raw mean of the tile moves by <span class="mono">(k / 128)(t − a) / a</span> of the pattern's signal above background, for <span class="mono">k</span> columns past the edge.</p>
+      <p>On a synthetic page with blur and noise, tiles with 12 px past the edge into a dark area scored 0.82 to 0.90. The model gives 0.87.</p>
+    </details>
+  </div>
+  <p class="col">A brighter area past the edge lets fewer columns through, but each column lifts the raw mean more. A bright open area 7 px into the tile still passes, and adds about 16% to the pattern's signal above background.</p>
+
+  <h3 class="col">B · Light added to the whole tile</h3>
+  <figure>
+    <div class="scroll">
+      <svg class="diagram" viewBox="0 0 780 290" role="img" aria-label="Two intensity traces across three holes. One is the other raised by 18 DN. Both score 1.00 against the template, while their means are 85 and 103 DN.">
+        <text class="label" x="340" y="16" text-anchor="middle">Both traces score 1.00 against the template</text>
+        <path class="axis" d="M60 30 V250 H620"/>
+        <path class="axis" d="M60 195 H620 M60 140 H620 M60 85 H620 M60 30 H620" stroke-dasharray="2 4"/>
+        <text class="tick" x="52" y="254" text-anchor="end">0</text>
+        <text class="tick" x="52" y="199" text-anchor="end">50</text>
+        <text class="tick" x="52" y="144" text-anchor="end">100</text>
+        <text class="tick" x="52" y="89" text-anchor="end">150</text>
+        <text class="tick" x="52" y="34" text-anchor="end">200</text>
+        <text class="tick" x="16" y="144" text-anchor="middle" transform="rotate(-90 16 144)">DN</text>
+        <text class="label" x="340" y="276" text-anchor="middle">position across three holes</text>
+        <polyline fill="none" stroke="currentColor" stroke-width="2" style="color: var(--ink)" points="60.0,210.3 67.0,209.4 74.0,206.6 81.0,201.9 88.0,194.8 95.0,185.4 102.0,173.4 109.0,159.3 116.0,143.6 123.0,127.4 130.0,112.0 137.0,99.0 144.0,89.8 151.0,85.3 158.0,86.2 165.0,92.3 172.0,103.0 179.0,117.0 186.0,132.8 193.0,148.9 200.0,164.2 207.0,177.7 214.0,188.8 221.0,197.4 228.0,203.7 235.0,207.8 242.0,209.9 249.0,210.2 256.0,208.7 263.0,205.3 270.0,199.8 277.0,192.0 284.0,181.6 291.0,168.9 298.0,154.2 305.0,138.2 312.0,122.1 319.0,107.4 326.0,95.5 333.0,87.7 340.0,85.0 347.0,87.7 354.0,95.5 361.0,107.4 368.0,122.1 375.0,138.2 382.0,154.2 389.0,168.9 396.0,181.6 403.0,192.0 410.0,199.8 417.0,205.3 424.0,208.7 431.0,210.2 438.0,209.9 445.0,207.8 452.0,203.7 459.0,197.4 466.0,188.8 473.0,177.7 480.0,164.2 487.0,148.9 494.0,132.8 501.0,117.0 508.0,103.0 515.0,92.3 522.0,86.2 529.0,85.3 536.0,89.8 543.0,99.0 550.0,112.0 557.0,127.4 564.0,143.6 571.0,159.3 578.0,173.4 585.0,185.4 592.0,194.8 599.0,201.9 606.0,206.6 613.0,209.4 620.0,210.3"/>
+        <polyline fill="none" stroke="currentColor" stroke-width="2" style="color: var(--glow)" points="60.0,190.5 67.0,189.6 74.0,186.8 81.0,182.1 88.0,175.0 95.0,165.6 102.0,153.6 109.0,139.5 116.0,123.8 123.0,107.6 130.0,92.2 137.0,79.2 144.0,70.0 151.0,65.5 158.0,66.4 165.0,72.5 172.0,83.2 179.0,97.2 186.0,113.0 193.0,129.1 200.0,144.4 207.0,157.9 214.0,169.0 221.0,177.6 228.0,183.9 235.0,188.0 242.0,190.1 249.0,190.4 256.0,188.9 263.0,185.5 270.0,180.0 277.0,172.2 284.0,161.8 291.0,149.1 298.0,134.4 305.0,118.4 312.0,102.3 319.0,87.6 326.0,75.7 333.0,67.9 340.0,65.2 347.0,67.9 354.0,75.7 361.0,87.6 368.0,102.3 375.0,118.4 382.0,134.4 389.0,149.1 396.0,161.8 403.0,172.2 410.0,180.0 417.0,185.5 424.0,188.9 431.0,190.4 438.0,190.1 445.0,188.0 452.0,183.9 459.0,177.6 466.0,169.0 473.0,157.9 480.0,144.4 487.0,129.1 494.0,113.0 501.0,97.2 508.0,83.2 515.0,72.5 522.0,66.4 529.0,65.5 536.0,70.0 543.0,79.2 550.0,92.2 557.0,107.6 564.0,123.8 571.0,139.5 578.0,153.6 585.0,165.6 592.0,175.0 599.0,182.1 606.0,186.8 613.0,189.6 620.0,190.5"/>
+        <path d="M60 156.1 H620" fill="none" stroke="currentColor" stroke-width="1.4" stroke-dasharray="6 4" style="color: var(--ink)"/>
+        <path d="M60 136.3 H620" fill="none" stroke="currentColor" stroke-width="1.4" stroke-dasharray="6 4" style="color: var(--glow)"/>
+        <text class="label" x="630" y="140" style="fill: var(--glow)">mean 103 DN</text>
+        <text class="label" x="630" y="160" style="fill: var(--ink)">mean 85 DN</text>
+        <text class="label" x="630" y="194" style="fill: var(--glow)">near a bright area</text>
+        <text class="label" x="630" y="214" style="fill: var(--ink)">inside the array</text>
+      </svg>
+    </div>
+    <figcaption>Two tiles across three holes, with illustrative numbers. The upper trace is the lower one plus 18 DN of light from a bright area nearby. Adding a constant, or scaling the contrast, leaves a correlation unchanged, so both tiles score 1.00. Their raw means differ by the full 18 DN.</figcaption>
+  </figure>
+  <p class="col">Light that varies across a tile lowers the score only a little. On the synthetic page, tiles under a glow that rose toward a bright pad still scored 0.99 to 1.00, and their raw mean was 12% above that of a tile further in. Holes that print larger near an array edge are invisible to the score for the same reason.</p>
+
+  <h3 class="col">C · The border that is never compared</h3>
+  <p class="col">The moved template does not cover the whole tile. A strip as wide as the shift, up to about half a hole pitch, is left out of every quadrant's correlation on one side and at one end. Those pixels still count in the raw mean. A pattern edge inside that strip goes unnoticed by the score.</p>
+</section>
+
+<section aria-labelledby="check">
+  <h2 id="check" class="col">Check it on your pages</h2>
+  <p class="col"><code>scripts/show_tile_selection.py</code> runs the same merge, tile grid and screen on one page and draws the verdict of every tile.</p>
+  <pre>python scripts/show_tile_selection.py D:\ACTIS\scan\RAW\S1\1_1_?.tiff --reference holes.tiff --page 120</pre>
+  <p class="col">Give the four board files of a segment to see the merged page the stripe run screened, with the same tile grid. The <code>?</code> pattern also works in PowerShell. Pages count from 0, like <code>page_index</code> in the results. On a machine without a display, add <code>--save page120.png</code>.</p>
+  <ul class="keys col">
+    <li><span class="swatch sw-accept"></span><span>Accepted tile. Its score is printed in the middle.</span></li>
+    <li><span class="swatch sw-reject"></span><span>Rejected tile.</span></li>
+    <li><span class="swatch sw-none"></span><span>Columns or rows that belong to no tile.</span></li>
+    <li><span class="swatch sw-seam"></span><span>Board seam.</span></li>
+  </ul>
+  <p class="col">Hover over a tile to see its score, raw mean and shift in the window's status bar.</p>
+  <h3 class="col">Telling A from B</h3>
+  <div class="pair">
+    <div class="case">
+      <span>The bright edge tiles score between 0.80 and about 0.95, and the pattern visibly stops inside them.</span>
+      <span class="then">A: tiles partly past the edge.</span>
+    </div>
+    <div class="case">
+      <span>The bright edge tiles score near 1.00, the pattern fills them, and the hover shows a higher raw mean.</span>
+      <span class="then">B: real extra light, or larger holes at the edge.</span>
+    </div>
+  </div>
+  <p class="col">Running the viewer with <code>--min-corr 0.95</code> shows which tiles a stricter threshold would drop, without measuring the stripe again.</p>
+</section>
+
+<section aria-labelledby="fixes">
+  <h2 id="fixes" class="col">Ways to close the gap</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Change</th><th>Removes</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Keep each tile's score and shift in the results</td><td>Nothing by itself. The map can then drop low scores later without reading the scan again.</td><td>Three more numbers per tile.</td></tr>
+        <tr><td>Drop accepted tiles that touch a rejected tile</td><td>A and B along every pattern edge.</td><td>One ring of tiles around each array. Tiles in a page's top and bottom rows need their neighbours from the next page.</td></tr>
+        <tr><td>Raise <code>--min-corr</code></td><td>Part of A.</td><td>Also rejects good tiles on blurred or noisy pages.</td></tr>
+        <tr><td>Average only where the matched pattern lies</td><td>A and C.</td><td>A mask per tile. The raw value stops being a plain tile mean.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">The first two together are the smallest change that covers both A and B. None of these is built yet.</p>
+</section>
+
+<footer>
+  <p>Describes the code on branch report-redesign as of 26 November 2026. The synthetic page mentioned above was made for testing; no real ACTIS page was used.</p>
+  <ul>
+    <li>src/actis/stripes.py · merge_boards, cut_tiles, _measure_merged_page</li>
+    <li>src/actis/tiff_tiles.py · prepare_reference, _match, _quadrant_scores, score_tiles, select_tiles</li>
+    <li>src/actis/tiff_benchmark.py · _raw_means</li>
+    <li>scripts/show_tile_selection.py</li>
+  </ul>
+</footer>
+
+</main>
+<script>
+(() => {
+  const AREA = 0.25;                                  // holes' share of a lattice cell
+  const SPREAD = Math.sqrt(AREA * (1 - AREA));        // pixel spread, in units of the hole step
+  const MIN_CORR = 0.80;
+  const PITCH = 6.77, RADIUS = 1.9;                   // px, synthetic geometry
+  const GROUND = [21, 23, 27], HOLE = [233, 237, 242];
+  const ns = "http://www.w3.org/2000/svg";
+  const $ = (id) => document.getElementById(id);
+  const cols = $("cols"), level = $("level"), tile = $("tile");
+
+  function quadrant(k, t) {
+    const f = (64 - k) / 64;
+    if (f <= 0) return 0;
+    const d = (t - AREA) / SPREAD;
+    return Math.sqrt(f) / Math.sqrt(1 + (1 - f) * d * d);
+  }
+  function widest(t) {
+    let k = 0;
+    while (k < 64 && quadrant(k + 1, t) >= MIN_CORR) k++;
+    return k;
+  }
+  function make(tag, attrs, parent) {
+    const el = document.createElementNS(ns, tag);
+    for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+    parent.appendChild(el);
+    return el;
+  }
+  const mix = (t) => `rgb(${GROUND.map((g, i) => Math.round(g + t * (HOLE[i] - g))).join(",")})`;
+
+  // The tile: dark ground, bright holes, a strip past the edge, quadrant lines and labels.
+  make("rect", { x: 0, y: 0, width: 128, height: 128, fill: mix(0) }, tile);
+  const holes = make("g", { fill: mix(1) }, tile);
+  for (let y = PITCH / 2; y < 128; y += PITCH)
+    for (let x = PITCH / 2; x < 128; x += PITCH) make("circle", { cx: x.toFixed(2), cy: y.toFixed(2), r: RADIUS }, holes);
+  const strip = make("rect", { x: 128, y: 0, width: 0, height: 128, fill: mix(0.5) }, tile);
+  const edge = make("line", { x1: 128, y1: 0, x2: 128, y2: 128, stroke: "#ffe066", "stroke-width": 0.9 }, tile);
+  const guide = { stroke: "#ffffff", "stroke-opacity": 0.7, "stroke-width": 0.6, "stroke-dasharray": "2 2" };
+  make("line", { x1: 64, y1: 0, x2: 64, y2: 128, ...guide }, tile);
+  make("line", { x1: 0, y1: 64, x2: 128, y2: 64, ...guide }, tile);
+  const label = (x, y) => make("text", {
+    x, y, "text-anchor": "middle", "dominant-baseline": "central", "font-size": 8, "font-weight": 600,
+    fill: "#ffffff", stroke: "#000000", "stroke-width": 2.2, "paint-order": "stroke",
+    "font-family": "IBM Plex Mono, Consolas, monospace",
+  }, tile);
+  const left = [label(32, 32), label(32, 96)], right = [label(96, 32), label(96, 96)];
+
+  function update() {
+    const k = Number(cols.value), t = Number(level.value) / 100;
+    const r = quadrant(k, t), pass = r >= MIN_CORR;
+    $("cols-out").textContent = `${k} px`;
+    $("level-out").textContent = `${level.value}%`;
+    strip.setAttribute("x", 128 - k);
+    strip.setAttribute("width", k);
+    strip.setAttribute("fill", mix(t));
+    edge.setAttribute("x1", 128 - k);
+    edge.setAttribute("x2", 128 - k);
+    edge.setAttribute("visibility", k ? "visible" : "hidden");
+    for (const el of left) { el.textContent = "1.00"; el.setAttribute("fill", "#ffffff"); }
+    for (const el of right) { el.textContent = r.toFixed(2); el.setAttribute("fill", k ? (pass ? "#4cc3ff" : "#ff9a3d") : "#ffffff"); }
+    $("score").textContent = Math.min(1, r).toFixed(2);
+    const verdict = $("verdict");
+    verdict.textContent = pass ? "Accepted" : "Rejected";
+    verdict.className = `verdict ${pass ? "pass" : "fail"}`;
+    const shift = (k / 128) * (t - AREA) / AREA * 100;
+    const sign = shift > 0.05 ? "+" : shift < -0.05 ? "−" : "";
+    $("raw").textContent = `${sign}${Math.abs(shift).toFixed(1)}%`;
+    $("widest").textContent = `${widest(t)} px`;
+  }
+  cols.addEventListener("input", update);
+  level.addEventListener("input", update);
+  for (const button of document.querySelectorAll("[data-level]"))
+    button.addEventListener("click", () => { level.value = button.dataset.level; update(); });
+  update();
+})();
+</script>
+</body>
+</html>
