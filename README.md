@@ -267,7 +267,7 @@ The selector takes one exemplar from each detected reference lattice and tests e
 
 ## Measure every stripe of a scan
 
-`measure_stripes.py` runs a method on all board stacks of a scan, in tiles of about 10 µm, and averages the tiles into bins of about 100 µm for a map. The method is raw brightness unless `--method` names others. It needs the CUDA extra and a holes-only reference, like the TIFF benchmark above.
+`measure_stripes.py` runs a method on all board stacks of a scan, in tiles of about 10 µm, and averages the tiles into bins of about 100 µm for a map. The method is raw brightness unless `--method` names others. `--method all` runs all seven on the same tiles in one pass over the scan. It needs the CUDA extra and a holes-only reference, like the TIFF benchmark above. To measure several scans unattended, each on its own GPU, see [Measure several scans unattended](#measure-several-scans-unattended).
 
 ~~~sh
 python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output D:\ACTIS\scan-raw
@@ -294,7 +294,9 @@ The merged pages of a segment are stacked into one strip, in the order and orien
 
 The threshold cannot reject anything in very small bins. No tile of n can lie more than (n − 1)/√n standard deviations from their mean. That is 1.5 for four tiles, so a 2 × 2 bin never loses a tile at 1.5. A bin of 110 tiles can reach 10.4.
 
-The console prints the pixel size, the tile and bin sizes in µm and the GPU before the first segment.
+The console prints the pixel size, the tile and bin sizes in µm and the GPU before the first segment. Every method then measures the reference tile itself, and the console prints what each found there. A method that finds nothing on the reference finds nothing in the scan, since only tiles like the reference are measured.
+
+`pooled` finds nothing on dense arrays. Around each opening it uses a window of the largest odd number of pixels up to the pitch, and at least 5. On synthetic 80 nm squares (3.8 px) at a pitch of 6.7 px that window is 5 × 5 px, its border lies on the opening's own blurred edge, and every opening fails its checks: no value at tiles of 128, 238 or 476 px. With openings farther apart, as at the 8 px pitch of the tests, it measures.
 
 Cutting tiles across page boundaries assumes that a page continues the one before it without a gap or a repeat, which has not been checked on real pages. A tile across a boundary where the hole lattice jumps fails the screen. On a synthetic stack that repeats one page, with a jump of half a pitch at every boundary, tiles within pages passed 100% and tiles across boundaries 19%. Each finished segment's line therefore gives the accepted share for tile rows within one page and across two, and `stripes.json` holds the counts under `accepted_by_rows`. Clearly fewer across boundaries means the pages do not join.
 
@@ -306,7 +308,7 @@ python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output 
 
 | File | Contents |
 |---|---|
-| `stripes.json` | Format `actis-stripes-2`. The settings with the pixel size in µm, the header and where the pixel size came from, the tile side in pixels, the GPU (number, name and PCI bus), and one entry per segment: its board files, the result file, the strip file under `edges` if strips are kept, page count, board and merged page size, tile grid, first tile column, rows left over, bin size in tiles, bin grid, seam columns, accepted and screened tiles, per method the mean over tiles, the mean over bins and the tiles averaged, and the seconds per stage. `incomplete` lists segments without all boards, which are not measured. |
+| `stripes.json` | Format `actis-stripes-2`. The settings with the pixel size in µm, the header and where the pixel size came from, the tile side in pixels, the GPU (number, name and PCI bus), what each method measured on each reference tile (`reference_values`, null for nothing, and `reference_errors`), and one entry per segment: its board files, the result file, the strip file under `edges` if strips are kept, page count, board and merged page size, tile grid, first tile column, rows left over, bin size in tiles, bin grid, seam columns, accepted and screened tiles, per method the mean over tiles, the mean over bins, the tiles averaged and the batches it failed in (`failed_batches`, with the first `error` and its `traceback`), and the seconds per stage. A failed segment has `error`, and `traceback` when the error is not about its files. `incomplete` lists segments without all boards, which are not measured. |
 | `<stripe>_<segment>.npz` | The tile and bin values of one segment. |
 | `<stripe>_<segment>_edges.npz` | With `--edge-strips`: the pixels of the outer columns of every merged page of the segment. |
 
@@ -366,9 +368,11 @@ An output folder holds a run with strips or a run without. Adding strips later n
 
 ### Long runs
 
-A segment's files are written when the segment is finished. Running the same command again on the same output folder continues a stopped run: complete segments stay, failed ones are tried again. A segment that cannot be read is recorded as failed with the reason, and the run goes on. Other settings need a new output folder.
+A segment's files are written when the segment is finished. Running the same command again on the same output folder continues a stopped run: complete segments stay, failed ones are tried again. A segment that cannot be read is recorded as failed with the reason, and the run goes on. So is a segment that fails for any other reason, with the traceback in `stripes.json`, unless the GPU no longer works afterwards: then the run stops with a message, and running it again continues. Other settings need a new output folder.
 
-`--stripe 1 3` measures only those stripes. `--max-pages 50` stops each segment after 50 pages for a trial. `--method raw pooled` runs several methods on the same accepted tiles.
+A method that raises an error loses only its own values, in the batch of tile rows where it happened, about one page. That batch is measured again one method at a time, and the other methods keep theirs. The segment's line says how many batches each method failed in and the first error, and `stripes.json` keeps the traceback.
+
+`--stripe 1 3` measures only those stripes, and `--segment 3_1 4_2` only those segments. `--max-pages 50` stops each segment after 50 pages for a trial. `--method raw pooled` runs several methods on the same accepted tiles, and `--method all` all seven.
 
 `--gpu 1` measures on the second GPU (`--device` is the same option). The numbers are those `nvidia-smi` shows: the command numbers GPUs by PCI bus, while CUDA's own default puts the fastest first, so the two could disagree on a PC with different GPUs. A `CUDA_DEVICE_ORDER` already set in the environment is kept. One run uses one GPU. To use two at once, start two runs on different stripes into different output folders, for example `--stripe 1 2 3 --gpu 0` and `--stripe 4 5 6 --gpu 1`. Both read the same disk, so this gains little while the disk sets the pace (see below).
 
@@ -382,6 +386,70 @@ Each segment's `seconds` in `stripes.json` show where its time went. `read` is h
 - **Files are read in blocks.** The reader takes about 64 MB of one board, then the same pages of the next board, one block ahead of the measurement. Reading one page of each board in turn took 140 to 150 s on the same files.
 
 The four files of that test each lay in a few pieces on the disk, as copied files do. Written four at a time, in 169 pieces each, they took 118 and 141 s. These numbers come from one PC and synthetic stacks.
+
+All seven methods at once, on 10 µm tiles (476 px), took 0.33 s per merged page on the same GPU: synthetic pages of 2,048 × 5,408 px of 80 nm squares at a pitch of 6.7 px, about 4,900 openings per tile, read from the file cache. That is about 8 minutes of GPU time for a 1,500-page segment, less than reading the segment from a hard disk takes. Per page, the contour seeds and the two aperture fits took 0.18 s, `pooled` 0.06 s, `harmonic` 0.03 s, `flux` 0.02 s and screening 0.015 s. Real pages with fewer openings per tile take less.
+
+## Measure several scans unattended
+
+`measure_scans.py` measures several scans at once, each on its own GPU, and goes on in the background after the console is closed, for a run over a weekend. Every scan is a stripe run as above, with any of its options.
+
+Copy `scripts\scans.example.ini`, then fill in one section per scan: the scan folder, a new folder for its results, and its GPU, numbered as `nvidia-smi` numbers them. Settings under `[DEFAULT]` apply to every scan, and a scan's own section can set them again. Every key is a `measure_stripes.py` option without its dashes. `yes` gives an option without a value, `no` leaves it out, and paths are written as they are.
+
+~~~ini
+[DEFAULT]
+reference = D:\ACTIS\reference\holes.tiff
+method = all
+edge-strips = 32
+
+[scan-A]
+root = D:\ACTIS\scan-A
+output = D:\ACTIS\results\scan-A
+gpu = 0
+
+[scan-B]
+root = D:\ACTIS\scan-B
+output = D:\ACTIS\results\scan-B
+gpu = 1
+~~~
+
+Check the scans and start them:
+
+~~~powershell
+.\.venv\Scripts\python scripts\measure_scans.py D:\ACTIS\scans.ini
+~~~
+
+The command first runs a trial on the first 30 pages of a segment in the middle of every scan, all scans at once, each on its GPU. For every scan it prints the GPU, the pixel size and where it came from, the tiles accepted, the seams, the methods that gave values, the pace, and how long the rest takes at that pace. It takes a minute or two. Then it starts one supervisor per scan in the background and returns.
+
+- **Problems stop the start**, so nothing runs: a scan folder that does not exist, an output folder that holds other files or a run with other settings, a trial that fails (a header that cannot be read, a GPU that does not exist), or a drive without room for the results.
+- **Warnings ask first**, and `--yes` starts without asking: two scans on one GPU, a method that gave no value or failed in the trial, or no tile that matched the reference in the trial's pages. Those pages may lie outside the pattern, so this is a warning and not a problem.
+
+What the runs have done, at any time, and stopping them:
+
+~~~powershell
+.\.venv\Scripts\python scripts\measure_scans.py D:\ACTIS\scans.ini --status
+.\.venv\Scripts\python scripts\measure_scans.py D:\ACTIS\scans.ini --stop
+~~~
+
+`--status` says for every scan whether it is running, finished or stopped, and why. It also gives the segments complete, the segment being measured, the time left at the pace so far, every segment that did not complete with the reason, the methods that failed in some batches, and how many tiles each method put into bins. Starting again continues the runs where they ended, also after `--stop` or a restart of the PC: complete segments stay. `--only scan-B` acts on one scan of the file.
+
+### What a supervisor does
+
+- **One process per segment.** Each segment is measured by its own stripe run, so every segment starts with a fresh GPU. An error that leaves the GPU unusable, or a crash of the process, costs only that segment.
+- **Every segment gets an outcome.** It is *complete* or *failed* (the reason comes from `stripes.json`). It is *crashed* if its process ended before recording it (with the exit code and the last lines it printed), and *stalled* if its progress did not change for 30 minutes (`--stall-minutes`), in which case its process is stopped.
+- **One more try.** At the end, the segments that did not complete are measured once more (`--retries`).
+- **Pauses and stops.** After three segments in a row that did not complete, it waits ten minutes before each next one, so that a disk that is away for a while costs few segments. After five processes in a row that ended without recording their segment, something outside the segments is wrong, such as the GPU or the header, and the supervisor stops with that reason.
+- **No sleep.** It keeps Windows from going to sleep while it runs.
+
+The logs are in a folder beside the config file, named after it (`scans-logs` for `scans.ini`; `--logs` sets another). For every scan it holds `<scan>.log`, with everything the stripe runs printed and the time of every line, the supervisor's state `<scan>.json`, and the trial's output in `trial-<scan>` and `trial-<scan>.log`.
+
+### Before leaving
+
+- Signing out of Windows ends the runs. Disconnecting a remote desktop session does not. A restart for Windows Update ends them too, so pause updates for the weekend. After a restart, run the start command again.
+- Started over SSH, the runs may end with the session if Windows keeps them in the session's job. The command says so when that happens. This has not been tried over SSH.
+- Scans read from one hard disk share its speed. The trials run at the same time, so their pace already includes that, roughly.
+- The time left is an estimate from 30 pages, and from pages already in the file cache when the start command is run a second time.
+
+This was tested on this development PC: three synthetic scans of eight segments each, all on its one GPU, started, checked, stopped part way and started again. It has not run on the workstation, its four GPUs or real scans.
 
 ## Throughput and production boundary
 

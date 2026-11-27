@@ -25,6 +25,8 @@ import argparse
 import json
 import os
 import re
+import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
@@ -40,6 +42,7 @@ from .fit import array_backend, to_host
 from .tiff_benchmark import (
     FITS,
     METHODS,
+    UNITS,
     Progress,
     Run,
     TileMaps,
@@ -417,10 +420,75 @@ def _board_pages(files, max_pages, seconds, notes, tifffile):
                 )
 
 
-def _measure_rows(strip, first_row, templates, settings, tile, run, maps, cp):
+def gpu_works(cp):
+    """Whether the current GPU still runs work. Some CUDA errors end its context."""
+    try:
+        cp.cuda.runtime.deviceSynchronize()
+        return float(cp.arange(3, dtype=cp.float32).sum()) == 3.0
+    except Exception:
+        return False
+
+
+def _error_text(error):
+    return f"{type(error).__name__}: {error}"
+
+
+def _note_problem(problems, name, error):
+    entry = problems.setdefault(name, {"failed_batches": 0})
+    entry["failed_batches"] += 1
+    if "error" not in entry:
+        entry["error"] = _error_text(error)
+        entry["traceback"] = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+
+
+def _measure_kept(tiles, matches, templates, run, cp, problems):
+    """Measure a batch like _measure_page, but a method that fails loses only its own values.
+
+    After an error the batch is measured again one method at a time. A method
+    that fails on its own gets no values in this batch, and its first error is
+    kept in `problems`. An error after which the GPU no longer works is raised.
+    """
+
+    def counts():
+        return run.valid.copy(), run.attempted.copy(), run.sums.copy()
+
+    def restore(saved):
+        run.valid, run.attempted, run.sums = saved
+
+    saved = counts()
+    try:
+        return _measure_page(tiles, matches, templates, None, run, cp)
+    except Exception:
+        if not gpu_works(cp):
+            raise
+        restore(saved)
+    selected, values, openings, blurs = run.selected, {}, {}, []
+    try:
+        for name in selected:
+            run.selected = (name,)
+            saved = counts()
+            try:
+                part = _measure_page(tiles, matches, templates, None, run, cp)
+            except Exception as error:
+                if not gpu_works(cp):
+                    raise
+                restore(saved)
+                _note_problem(problems, name, error)
+                continue
+            values.update(part[0])
+            openings.update(part[1])
+            blurs.extend(part[2])
+    finally:
+        run.selected = selected
+    return values, openings, blurs
+
+
+def _measure_rows(strip, first_row, templates, settings, tile, run, maps, cp, problems):
     """Cut the whole rows of tiles at the top of `strip`, screen them and
     measure the accepted ones. Tile row 0 of the strip is tile row `first_row`
-    of the segment.
+    of the segment. A method that fails is noted in `problems`.
 
     Returns how many rows of tiles were cut, screened and accepted.
     """
@@ -442,7 +510,9 @@ def _measure_rows(strip, first_row, templates, settings, tile, run, maps, cp):
             tiles = tiles[cp.asarray(matches[:, 0], dtype=cp.int32)]
     if len(matches):
         maps.file(
-            position, matches, *_measure_page(tiles, matches, templates, None, run, cp)
+            position,
+            matches,
+            *_measure_kept(tiles, matches, templates, run, cp, problems),
         )
     return ny, ny * nx, len(matches)
 
@@ -476,7 +546,7 @@ def _measure_segment(segment, templates, settings, tiling, cp, live, tifffile):
     edge = settings["edge_columns"]
     methods = tuple(settings["methods"])
     run, maps = Run(cp, live, methods), TileMaps(methods)
-    notes, seams, left, right, page_index = [], [], [], [], []
+    notes, seams, left, right, page_index, problems = [], [], [], [], [], {}
     layout = across = strip = None
     tested = accepted = rows = 0
     start = perf_counter()
@@ -519,7 +589,7 @@ def _measure_segment(segment, templates, settings, tiling, cp, live, tifffile):
             page_index.append(index)
             if len(strip) >= tile:
                 cut, screened, kept = _measure_rows(
-                    strip, rows, templates, settings, tile, run, maps, cp
+                    strip, rows, templates, settings, tile, run, maps, cp, problems
                 )
                 strip = strip[cut * tile :]
                 rows += cut
@@ -551,6 +621,9 @@ def _measure_segment(segment, templates, settings, tiling, cp, live, tifffile):
             bin_mean=float(values[found].mean(dtype=np.float64))
             if found.any()
             else None,
+            # Batches of tile rows in which the method raised an error and so
+            # has no values, with the first error and where it was raised.
+            **{"failed_batches": 0, **problems.get(name, {})},
         )
     # Tiles that run from one page into the next pass the screen as often as
     # the others only if the pages continue each other without a gap or repeat.
@@ -651,7 +724,22 @@ def _replacing(path):
     partial = path.with_name(path.name + ".part")
     with partial.open("wb") as out:
         yield out
-    os.replace(partial, path)
+    replace(partial, path)
+
+
+def replace(source, target, attempts=50):
+    """os.replace, waiting while another process has `target` open.
+
+    Windows refuses to replace a file that is open for reading, as it is for a
+    moment whenever someone checks on a run.
+    """
+    for attempt in range(attempts):
+        try:
+            return os.replace(source, target)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
 
 
 def _line(entry):
@@ -672,6 +760,12 @@ def _line(entry):
         "n/a" if seam is None else f"{seam:.2f}"
         for seam in entry["seam_correlation_p90"]
     )
+    failures = [
+        f"{method} failed in {row['failed_batches']} batches of tile rows, "
+        f"first with {row['error']}"
+        for method, row in entry["methods"].items()
+        if row.get("failed_batches")
+    ]
     seconds = entry["seconds"]
     shares = " and ".join(
         f"{accepted / tested:.0%} {where.replace('_', ' ')}"
@@ -687,8 +781,32 @@ def _line(entry):
             f"{values}, seams {seams or 'n/a'},",
             f"{seconds['total']:.0f} s ({seconds['read_wait']:.0f} s waiting for the disk)",
             *entry["notes"],
+            *(f"{failure}." for failure in failures),
         ]
     )
+
+
+def _reference_line(checks, refused):
+    """One line on what every method measured on the reference tiles."""
+    parts, empty = [], []
+    for name, values in checks.items():
+        found = [v for v in values if np.isfinite(v)]
+        if name in refused:
+            parts.append(f"{name} failed ({refused[name]['error']})")
+        elif found:
+            unit = UNITS.get(name, "px")
+            parts.append(f"{name} " + " / ".join(f"{v:.5g}" for v in found) + f" {unit}")
+        else:
+            parts.append(f"{name} no value")
+        if not found:
+            empty.append(name)
+    line = "On the reference tile itself: " + ", ".join(parts) + "."
+    if empty:
+        line += (
+            f" Expect no values from {', '.join(empty)} on this scan, since only "
+            "tiles like the reference are measured."
+        )
+    return line
 
 
 def measure_stripes(
@@ -709,22 +827,29 @@ def measure_stripes(
     shape="auto",
     device=0,
     stripes=None,
+    segments=None,
     max_pages=None,
     edge_columns=0,
     progress=None,
 ):
     """Measure the segments under `root` into `output` and return the manifest.
 
-    Tiles are `tile_um` square. Bins are `bin_y_um` along the stripe and
-    `bin_x_um` across it, the whole stripe when None, both rounded to whole
-    tiles. `reject_sigma` None averages every accepted tile of a bin. The
-    pixel size comes from the scan's header unless `pixel_nm` is given.
-    `device` is the GPU, numbered as CUDA numbers them in this process.
+    `methods` may be "all" for every method. Tiles are `tile_um` square. Bins
+    are `bin_y_um` along the stripe and `bin_x_um` across it, the whole stripe
+    when None, both rounded to whole tiles. `reject_sigma` None averages every
+    accepted tile of a bin. The pixel size comes from the scan's header unless
+    `pixel_nm` is given. `device` is the GPU, numbered as CUDA numbers them in
+    this process. `stripes` (numbers) and `segments` (names such as "3_1")
+    choose what to measure.
 
     A segment that `output` already holds from an earlier run with the same
     settings is left as it is, so a stopped run continues where it ended.
     `edge_columns` above 0 also saves that many columns from the left and
     from the right edge of every merged page.
+
+    A method that fails on some tiles loses only its own values there, and
+    the error is kept in the manifest. A segment that fails is recorded with
+    the reason and the run goes on, unless the GPU has stopped working.
     """
     try:
         import tifffile
@@ -732,9 +857,10 @@ def measure_stripes(
         raise RuntimeError(
             'Install the TIFF/CUDA dependencies with pip install -e ".[gpu]"'
         ) from None
-    methods = tuple(dict.fromkeys(methods))
+    methods = (methods,) if isinstance(methods, str) else tuple(methods)
+    methods = METHODS if "all" in methods else tuple(dict.fromkeys(methods))
     if not methods or any(name not in METHODS for name in methods):
-        raise ValueError(f"Choose methods from: {', '.join(METHODS)}")
+        raise ValueError(f"Choose methods from: {', '.join(METHODS)}, or all")
     if not tile_um > 0 or not 0 < min_corr <= 1:
         raise ValueError("Use a positive tile size and a minimum correlation in (0,1]")
     if not bin_y_um >= tile_um or not (bin_x_um is None or bin_x_um >= tile_um):
@@ -756,9 +882,19 @@ def measure_stripes(
         raise ValueError("max_pages must be positive")
     root, output = Path(root).resolve(), Path(output).resolve()
     reference = Path(reference).resolve()
+    wanted = segments
     segments, incomplete = find_segments(root, boards)
     if stripes is not None:
         segments = [s for s in segments if s.stripe in set(stripes)]
+    if wanted is not None:
+        wanted = {str(name) for name in wanted}
+        missing = sorted(wanted - {s.name for s in segments})
+        if missing:
+            raise ValueError(
+                f"No segment {', '.join(missing)} with boards 1 to {boards} under "
+                f"{root}" + ("" if stripes is None else " in the chosen stripes")
+            )
+        segments = [s for s in segments if s.name in wanted]
     if not segments:
         raise ValueError(
             f"No segment with boards 1 to {boards} to measure under {root}"
@@ -826,13 +962,21 @@ def measure_stripes(
         live.tell()
         pixels = _reference(reference, reference_page, tifffile)
         templates = prepare_reference(pixels, tiling.tile, shape, cp)
+        # Measure the reference tile itself, which compiles the kernels and
+        # shows before any scan is read whether a method can measure this
+        # pattern at all.
+        checks, refused = {name: [] for name in methods}, {}
         for template in templates:
-            # Compile the kernels, and stop now if the reference cannot match itself.
             tile = template.pixels.astype(pixels.dtype)[None]
             matches = select_tiles(tile, [template], min_corr, cp)
             if not len(matches):
                 raise ValueError("Reference tile failed its own correlation check")
-            _measure_page(tile, matches, [template], None, Run(cp, live, methods), cp)
+            values, _, _ = _measure_kept(
+                tile, matches, [template], Run(cp, live, methods), cp, refused
+            )
+            for name in methods:
+                checks[name].append(float(values.get(name, [np.nan])[0]))
+        say(_reference_line(checks, refused))
         manifest = {
             "format": FORMAT,
             "root": str(root),
@@ -846,6 +990,10 @@ def measure_stripes(
             "gpu_pci_bus": pci,
             "reference_shapes": [t.region.shape for t in templates],
             "reference_pitch_px": [float(t.region.pitch) for t in templates],
+            # What each method measured on each reference tile itself, None
+            # for nothing, and the error of a method that failed there.
+            "reference_values": checks,
+            "reference_errors": {k: v["error"] for k, v in refused.items()},
             "incomplete": incomplete,
         }
         output.mkdir(parents=True, exist_ok=True)
@@ -870,12 +1018,29 @@ def measure_stripes(
                 "vertical": segment.vertical,
                 "files": [path.relative_to(root).as_posix() for path in segment.files],
             }
+            lost = None
             try:
                 arrays, edges, summary = _measure_segment(
                     segment, templates, settings, tiling, cp, live, tifffile
                 )
             except (OSError, ValueError, tifffile.TiffFileError) as error:
                 entry.update(status="failed", error=str(error))
+            except Exception as error:
+                # Not a problem of the files. Keep where it happened, and go
+                # on with the next segment if the GPU still works.
+                entry.update(
+                    status="failed",
+                    error=_error_text(error),
+                    traceback="".join(
+                        traceback.format_exception(
+                            type(error), error, error.__traceback__
+                        )
+                    ),
+                )
+                if not gpu_works(cp):
+                    lost = error
+                else:
+                    cp.get_default_memory_pool().free_all_blocks()
             else:
                 entry.update(status="complete", result=f"{segment.name}.npz", **summary)
                 live.stage = "saving the results"
@@ -897,11 +1062,18 @@ def measure_stripes(
             with _replacing(output / MANIFEST) as out:
                 out.write(text.encode("utf-8"))
             say(_line(entries[key]))
+            if lost is not None:
+                raise RuntimeError(
+                    f"GPU {device} stopped working while measuring {segment.name} "
+                    f"({_error_text(lost)}). The segments measured so far are kept. "
+                    "Run the same command again to continue"
+                )
     manifest.setdefault("segments", [entries[k] for k in sorted(entries)])
     return native(manifest)
 
 
-def main(argv=None):
+def build_parser():
+    """The command-line options of a stripe run."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "root",
@@ -929,9 +1101,10 @@ def main(argv=None):
     parser.add_argument(
         "--method",
         nargs="+",
-        choices=METHODS,
+        choices=(*METHODS, "all"),
         default=["raw"],
-        help="Methods to run on every accepted tile (default: raw)",
+        help="Methods to run on every accepted tile, or all for all seven "
+        "(default: raw)",
     )
     parser.add_argument(
         "--tile-um",
@@ -1012,6 +1185,13 @@ def main(argv=None):
         metavar="N",
     )
     parser.add_argument(
+        "--segment",
+        nargs="+",
+        help="Measure only these segments, named <stripe>_<vertical segment> "
+        "like 3_1 (default: every segment)",
+        metavar="NAME",
+    )
+    parser.add_argument(
         "--max-pages",
         type=int,
         help="Read at most this many pages of each segment, for a short trial",
@@ -1027,6 +1207,11 @@ def main(argv=None):
         "stripes share, to find the shift between stripes later "
         f"(width when no number is given: {EDGE_COLUMNS} columns per edge)",
     )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
     args = parser.parse_args(argv)
     # By default CUDA puts the fastest GPU first, so its numbers need not be
     # those nvidia-smi shows. Number them by PCI bus, as nvidia-smi does. This
@@ -1051,6 +1236,7 @@ def main(argv=None):
             shape=args.shape,
             device=args.gpu,
             stripes=args.stripe,
+            segments=args.segment,
             max_pages=args.max_pages,
             edge_columns=args.edge_strips,
             progress=lambda line: print(line, flush=True),

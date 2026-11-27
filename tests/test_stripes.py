@@ -597,3 +597,89 @@ def test_every_stripe_is_measured_in_tiles_and_bins(
         main([*trial, "--edge-strips", "16"])
     with pytest.raises(SystemExit):  # a threshold, or no rejection, not both
         main([*trial, "--reject-sigma", "2"])
+
+
+def test_a_failing_method_or_segment_does_not_stop_the_run(
+    cuda, holes, tmp_path, monkeypatch
+):
+    tifffile = pytest.importorskip("tifffile")
+    from actis.tiff_tiles import ReferenceTile
+
+    tile = holes // 256
+    root = tmp_path / "scan"
+    reference = tmp_path / "reference.tiff"
+    tifffile.imwrite(reference, holes, photometric="minisblack")
+    where = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (1, 3)]
+    where += [(2, 1), (2, 3), (3, 0), (3, 2)]
+    write_boards(root / "RAW" / "S1", "1_1", merged_strip(tile, where, 3), tifffile)
+    write_boards(root / "RAW" / "S1", "1_2", merged_strip(tile, where, 3), tifffile)
+    kwargs = {"reference": reference, "tile_um": TILE_UM, "shape": "square"}
+    kwargs.update(pixel_nm=PIXEL_NM, bin_y_um=2 * TILE_UM, methods="all")
+
+    # The pages are measured in three batches: tile row 0, rows 1 and 2, and
+    # row 3. The harmonic fit fails on the six tiles of the second batch.
+    harmonic = ReferenceTile.harmonic_cds
+
+    def failing(self, tiles, shifts, cp):
+        if len(tiles) == 6:
+            raise RuntimeError("boom")
+        return harmonic(self, tiles, shifts, cp)
+
+    monkeypatch.setattr(ReferenceTile, "harmonic_cds", failing)
+    lines = []
+    manifest = measure_stripes(
+        root, tmp_path / "out", segments=["1_1"], progress=lines.append, **kwargs
+    )
+    assert manifest["settings"]["methods"] == list(METHODS)
+    assert [s["vertical"] for s in manifest["segments"]] == [1]
+    # Every method measured the reference tile, which has one batch of one tile.
+    assert set(manifest["reference_values"]) == set(METHODS)
+    assert manifest["reference_errors"] == {}
+    assert any(line.startswith("On the reference tile itself: raw ") for line in lines)
+    entry = manifest["segments"][0]
+    assert entry["status"] == "complete", entry.get("traceback") or entry.get("error")
+    row = entry["methods"]["harmonic"]
+    assert row["failed_batches"] == 1 and row["error"] == "RuntimeError: boom"
+    assert "boom" in row["traceback"] and "failing" in row["traceback"]
+    assert all(
+        entry["methods"][name]["failed_batches"] == 0
+        for name in METHODS
+        if name != "harmonic"
+    )
+    assert any("harmonic failed in 1 batches" in line for line in lines)
+    data = np.load(tmp_path / "out" / "1_1.npz")
+    accepted = held(where, 4)
+    np.testing.assert_array_equal(np.isfinite(data["tile_raw"]), accepted)
+    # Only the harmonic values of the failed batch are missing.
+    lost = accepted.copy()
+    lost[[0, 3]] = False
+    np.testing.assert_array_equal(np.isfinite(data["tile_harmonic"]), accepted & ~lost)
+    np.testing.assert_array_equal(np.isfinite(data["tile_contour"]), accepted)
+    assert row["valid"] == (accepted & ~lost).sum()
+
+    # A segment that fails for any reason is recorded, and the run goes on.
+    monkeypatch.setattr(ReferenceTile, "harmonic_cds", harmonic)
+    original = measure_stripes.__globals__["_measure_segment"]
+
+    def broken(segment, *args):
+        if segment.name == "1_1":
+            raise TypeError("not a file problem")
+        return original(segment, *args)
+
+    monkeypatch.setattr("actis.stripes._measure_segment", broken)
+    both = measure_stripes(root, tmp_path / "both", **kwargs)
+    first, second = both["segments"]
+    assert (first["status"], first["error"]) == ("failed", "TypeError: not a file problem")
+    assert "broken" in first["traceback"] and second["status"] == "complete"
+
+    # If the GPU no longer works afterwards, the run stops there.
+    monkeypatch.setattr("actis.stripes.gpu_works", lambda cp: False)
+    with pytest.raises(RuntimeError, match="GPU 0 stopped working while measuring 1_1"):
+        measure_stripes(root, tmp_path / "lost", **kwargs)
+    saved = json.loads((tmp_path / "lost" / MANIFEST).read_text(encoding="utf-8"))
+    assert [s["status"] for s in saved["segments"]] == ["failed"]
+
+    with pytest.raises(ValueError, match="No segment 9_9 with boards"):
+        measure_stripes(root, tmp_path / "none", segments=["1_1", "9_9"], **kwargs)
+    with pytest.raises(ValueError, match="or all"):
+        measure_stripes(root, tmp_path / "none", **{**kwargs, "methods": ["fast"]})

@@ -20,6 +20,7 @@ tiff = ["tifffile", "imagecodecs"]
 actis = "actis.cli:main"
 actis-benchmark-tiff = "actis.tiff_benchmark:main"
 actis-stripes = "actis.stripes:main"
+actis-scans = "actis.scans:main"
 actis-contours = "actis.contourlab.server:main"
 
 [tool.setuptools.packages.find]
