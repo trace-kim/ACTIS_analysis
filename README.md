@@ -267,39 +267,64 @@ The selector takes one exemplar from each detected reference lattice and tests e
 
 ## Measure every stripe of a scan
 
-`measure_stripes.py` runs a method on all board stacks of a scan and keeps every tile's value for a map. The method is raw brightness unless `--method` names others. It needs the CUDA extra and a holes-only reference, like the TIFF benchmark above.
+`measure_stripes.py` runs a method on all board stacks of a scan, in tiles of about 10 µm, and averages the tiles into bins of about 100 µm for a map. The method is raw brightness unless `--method` names others. It needs the CUDA extra and a holes-only reference, like the TIFF benchmark above.
 
 ~~~sh
 python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output D:\ACTIS\scan-raw
 ~~~
 
-The scan folder holds a `header.xml` and the board stacks, which may lie at any depth below it, for example in `RAW\S1`. A board stack is named `<stripe>_<vertical segment>_<board>.tiff`, so `1_1_1.tiff` to `1_1_4.tiff` are the four boards of the first segment of stripe 1. Only the file names are read, not the folder names. A name that occurs twice under the scan folder stops the run and names both files. `header.xml` is not read yet. `stripes.json` records where it is.
+The scan folder holds the header and the board stacks, which may lie at any depth below it, for example in `RAW\S1`. A board stack is named `<stripe>_<vertical segment>_<board>.tiff`, so `1_1_1.tiff` to `1_1_4.tiff` are the four boards of the first segment of stripe 1. Only the file names are read, not the folder names. A name that occurs twice under the scan folder stops the run and names both files.
+
+The pixel size comes from the scan's header, read with `actis.header` (`find_header` and `parse_header`, whose `pixel_x` and `pixel_y` are in µm). That module is the workstation's own and is not part of this repository. `--pixel-nm 21` gives the size for both directions instead, for a scan without a readable header or a PC without the module. `stripes.json` records the size used and where it came from.
 
 ### Boards are merged first
 
 Page by page, the four boards of a segment are merged into one page of 5,408 columns (4 × 1,376 − 3 × 32), and that page is what gets screened and measured. Neighbouring boards image the same 32 columns. Each board gives up 16 of them, so every column is measured once and comes from the board it lies deeper inside. Boards go left to right in number order. `--overlap` and `--boards` set other numbers.
 
-The merged page is cut into tiles from its top left corner. At the default 128 px a page gives 16 × 42 tiles and leaves 32 columns over at the right, as many as neighbouring stripes share. Pages keep the order and orientation of the files. Reversed page order and flipped pages of a stripe scanned upwards are left to the map.
-
 For every page the run also compares the 32 columns as each of the two boards recorded them. A correlation near 1 means the boards overlap as assumed. A low value on pages that show pattern at the seam means they do not, by board order, overlap width or alignment. The console prints one number per seam: the level the best tenth of the segment's pages reach, so empty pages do not pull it down.
+
+### Tiles and bins
+
+The merged pages of a segment are stacked into one strip, in the order and orientation of the files, and the strip is cut into square tiles. Reversed page order and flipped pages of a stripe scanned upwards are left to the map.
+
+- **Tiles.** `--tile-um 10` sets the side, which becomes the nearest even number of pixels at the scan's pixel size: 476 px at 21 nm. Across the stripe the tiles are centred. 5,408 columns hold 11 tiles and leave 86 columns at each edge, which no tile uses, so the 32 columns a stripe shares with each neighbour are measured by neither. Along the stripe a tile may run from one page into the next. The rows at the end of a segment that do not fill a tile are not used.
+- **Screening.** Every tile is compared with the reference as before, and only tiles that match it are measured.
+- **Bins.** `--bin-y-um 100` sets the length along the stripe and `--bin-x-um` the width across it, each made a whole number of tiles: 10 × 11 tiles at the defaults. A bin is at least one tile and never wider than the stripe, and no bin reaches into a neighbouring stripe. Without `--bin-x-um` a bin is as wide as every tile that fits across, 11 tiles or 110 µm at 21 nm per pixel. A narrower width that leaves tiles over centres the bins, and the tiles left at the edges are in no bin. Bins begin at the first tile row of the segment. The last bin row of a segment holds the tile rows that are left, so it can be shorter.
+- **A bin's value.** The mean of its accepted tiles, after leaving out each tile more than 1.5 standard deviations from the mean of the bin's tiles. The mean and the sample standard deviation are taken once, over all accepted tiles of the bin. `--reject-sigma 2` sets another threshold, and `--no-reject` averages every accepted tile. A bin with one tile keeps it. Each method is filtered on its own values.
+
+The threshold cannot reject anything in very small bins. No tile of n can lie more than (n − 1)/√n standard deviations from their mean. That is 1.5 for four tiles, so a 2 × 2 bin never loses a tile at 1.5. A bin of 110 tiles can reach 10.4.
+
+The console prints the pixel size, the tile and bin sizes in µm and the GPU before the first segment.
+
+Cutting tiles across page boundaries assumes that a page continues the one before it without a gap or a repeat, which has not been checked on real pages. A tile across a boundary where the hole lattice jumps fails the screen. On a synthetic stack that repeats one page, with a jump of half a pitch at every boundary, tiles within pages passed 100% and tiles across boundaries 19%. Each finished segment's line therefore gives the accepted share for tile rows within one page and across two, and `stripes.json` holds the counts under `accepted_by_rows`. Clearly fewer across boundaries means the pages do not join.
+
+~~~sh
+python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output D:\ACTIS\scan-50 --bin-y-um 50 --bin-x-um 50 --reject-sigma 2
+~~~
 
 ### What a run leaves behind
 
 | File | Contents |
 |---|---|
-| `stripes.json` | The settings, the path of `header.xml`, and one entry per segment: its board files, the result file, the strip file under `edges` if strips are kept, page count, board and merged page size, tile grid, seam columns, accepted and screened tiles, the mean per method and the seconds per stage. `incomplete` lists segments without all boards, which are not measured. |
-| `<stripe>_<segment>.npz` | The tile values of one segment. |
+| `stripes.json` | Format `actis-stripes-2`. The settings with the pixel size in µm, the header and where the pixel size came from, the tile side in pixels, the GPU (number, name and PCI bus), and one entry per segment: its board files, the result file, the strip file under `edges` if strips are kept, page count, board and merged page size, tile grid, first tile column, rows left over, bin size in tiles, bin grid, seam columns, accepted and screened tiles, per method the mean over tiles, the mean over bins and the tiles averaged, and the seconds per stage. `incomplete` lists segments without all boards, which are not measured. |
+| `<stripe>_<segment>.npz` | The tile and bin values of one segment. |
 | `<stripe>_<segment>_edges.npz` | With `--edge-strips`: the pixels of the outer columns of every merged page of the segment. |
 
 | Array in the `.npz` | Shape | Contents |
 |---|---|---|
-| `raw`, or the name of each method that ran | (page, tile row, tile column) | The tile's value. NaN where the tile was not accepted or gave no valid value. |
-| `reference` | (page, tile row, tile column) | The reference lattice the tile matched, −1 for a tile that was not accepted. |
-| `page_index` | (page) | The zero-based TIFF page of each row. |
+| `bin_raw`, or `bin_` and the name of each method that ran | (bin row, bin column) | The bin's value: the mean of the tiles it averaged. NaN where it averaged none. |
+| `bin_<method>_tiles` | (bin row, bin column) | How many tiles each bin averaged. |
+| `tile_raw`, or `tile_` and the name of each method | (tile row, tile column) | The tile's value. NaN where the tile was not accepted or gave no valid value. |
+| `tile_<method>_used` | (tile row, tile column) | Whether the tile is in its bin's value: accepted, valid, in a bin and not left out as too far from the bin's mean. |
+| `tile_reference` | (tile row, tile column) | The reference lattice the tile matched, −1 for a tile that was not accepted. |
+| `bin_rows`, `bin_columns` | (bin row, 2), (bin column, 2) | The first and the end tile row, and tile column, of each bin. |
+| `page_index` | (page) | The zero-based TIFF page of each merged page. |
 | `seam_correlation` | (page, seam) | Agreement of neighbouring boards in their shared columns. NaN where those columns are flat. |
-| `stripe`, `vertical`, `tile_size`, `overlap_px`, `boards`, `board_columns` | single numbers | What the map needs to place a tile without `stripes.json`. |
+| `stripe`, `vertical`, `tile_size`, `tile_x0`, `page_rows`, `pixel_um`, `reject_sigma`, `overlap_px`, `boards`, `board_columns` | single numbers, `pixel_um` (x, y) | What the map needs to place a tile without `stripes.json`. `reject_sigma` is NaN for `--no-reject`. |
 
-Tile `[p, r, c]` covers rows `r × tile_size` to `(r + 1) × tile_size` and columns `c × tile_size` to `(c + 1) × tile_size` of merged page `p`. The methods that measure each opening also store `<method>_openings`, and the two aperture fits `blur_sigma_px` and `blur_usable`, as in the TIFF benchmark.
+With `T` the tile size, tile `[r, c]` covers columns `tile_x0 + c × T` to `tile_x0 + (c + 1) × T` of the merged pages and rows `r × T` to `(r + 1) × T` of the strip, where strip row `y` is row `y mod page_rows` of merged page `page_index[y // page_rows]`. The methods that measure each opening also store `tile_<method>_openings`. The two aperture fits store `blur_sigma_px` and `blur_usable` for each batch of tile rows measured together, about one page's worth, with `blur_tile_row` giving the first tile row of each batch.
+
+The tile values are kept so that bins of another size, or another threshold, can be computed without reading the scan again:
 
 ~~~python
 import json
@@ -307,10 +332,15 @@ from pathlib import Path
 
 import numpy as np
 
+from actis.stripes import bin_tiles
+
 run = Path(r"D:\ACTIS\scan-raw")
 for segment in json.loads((run / "stripes.json").read_text(encoding="utf-8"))["segments"]:
     if segment["status"] == "complete":
-        raw = np.load(run / segment["result"])["raw"]  # (page, tile row, tile column)
+        data = np.load(run / segment["result"])
+        bins = data["bin_raw"]  # (bin row, bin column)
+        # Bins of 5 x 11 tiles from tile column 0, leaving out tiles beyond 2 sigma.
+        values, averaged, used = bin_tiles(data["tile_raw"], (5, 11), 0, reject_sigma=2.0)
 ~~~
 
 ### Edge strips for the shift between stripes
@@ -324,7 +354,7 @@ python scripts/measure_stripes.py D:\ACTIS\scan --reference holes.tiff --output 
 | Array in `<stripe>_<segment>_edges.npz` | Shape | Contents |
 |---|---|---|
 | `left` | (page, row, column) | Columns 0 to 31 of each merged page, which board 1 recorded. |
-| `right` | (page, row, column) | The last 32 columns of each merged page, which board 4 recorded. At the default tile size and strip width these are the columns no tile covers. |
+| `right` | (page, row, column) | The last 32 columns of each merged page, which board 4 recorded. At the default tile size no tile covers these columns or those of `left`. |
 | `page_index` | (page) | The zero-based TIFF page of each row, as in the value file. |
 | `stripe`, `vertical` | single numbers | The segment. |
 
@@ -338,11 +368,13 @@ An output folder holds a run with strips or a run without. Adding strips later n
 
 A segment's files are written when the segment is finished. Running the same command again on the same output folder continues a stopped run: complete segments stay, failed ones are tried again. A segment that cannot be read is recorded as failed with the reason, and the run goes on. Other settings need a new output folder.
 
-`--stripe 1 3` measures only those stripes. `--max-pages 50` stops each segment after 50 pages for a trial. `--method raw pooled` runs several methods on the same accepted tiles. `--device` chooses the CUDA device.
+`--stripe 1 3` measures only those stripes. `--max-pages 50` stops each segment after 50 pages for a trial. `--method raw pooled` runs several methods on the same accepted tiles.
+
+`--gpu 1` measures on the second GPU (`--device` is the same option). The numbers are those `nvidia-smi` shows: the command numbers GPUs by PCI bus, while CUDA's own default puts the fastest first, so the two could disagree on a PC with different GPUs. A `CUDA_DEVICE_ORDER` already set in the environment is kept. One run uses one GPU. To use two at once, start two runs on different stripes into different output folders, for example `--stripe 1 2 3 --gpu 0` and `--stripe 4 5 6 --gpu 1`. Both read the same disk, so this gains little while the disk sets the pace (see below).
 
 ### Speed
 
-One synthetic segment of production size took 103 to 109 s for raw brightness on an RTX 4060 Ti, read from a SATA hard disk with nothing in the file cache. It was four 8-bit board stacks of 1,500 pages, 16.9 GB, with 1,008,000 tiles screened and 912,000 measured. The disk set the pace: the reader was busy for all but one second, at about 160 MB/s. The GPU needed 16 s of it, 2.5 s to upload and merge, 13 s to screen and 0.5 s for the brightness.
+These numbers were measured with the earlier tiling, 128-px tiles cut page by page. They have not been measured again for 10 µm tiles. One synthetic segment of production size took 103 to 109 s for raw brightness on an RTX 4060 Ti, read from a SATA hard disk with nothing in the file cache. It was four 8-bit board stacks of 1,500 pages, 16.9 GB, with 1,008,000 tiles screened and 912,000 measured. The disk set the pace: the reader was busy for all but one second, at about 160 MB/s. The GPU needed 16 s of it, 2.5 s to upload and merge, 13 s to screen and 0.5 s for the brightness.
 
 Each segment's `seconds` in `stripes.json` show where its time went. `read` is how long the background reader worked. `read_wait` is how long the measurement stood still waiting for it, which the console prints as waiting for the disk. `merge`, `selection` and the method names are GPU stages. `save` is the time to write the segment's files.
 

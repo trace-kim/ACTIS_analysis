@@ -11,7 +11,7 @@ This document gives you the starting picture, says how far each part can be trus
 - A board TIFF has up to 1,500 **pages** of 2,048 rows by 1,376 columns, 8-bit grayscale. Pages follow one another along the scan direction.
 - Stripe 1 is scanned from the top of the mask downward and stored as scanned. Stripe 2 is scanned upward and stored flipped, and so on in turn. Neighbouring stripes share 32 columns. They do not begin at the same height, so each needs a vertical shift, which the header is expected to give only roughly.
 - `header.xml` is expected to hold the pattern position, the flip, the pixel size in nm and perhaps the shift. 21 nm per pixel is only a typical value, and each scan's own value must come from its header. **The header's structure is unknown on the development side.** Reading it is the first job.
-- `actis.stripes` already measures every stripe and writes one array of tile values per segment. Nothing yet reads the header, turns a stripe upright, finds the shift or places a tile on the mask.
+- `actis.stripes` measures every stripe in tiles of about 10 µm and averages them into bins of about 100 µm, using the pixel size it reads from the header through the workstation's `actis.header`. Nothing yet turns a stripe upright, finds the shift or places a bin on the mask.
 
 ## Where each fact comes from
 
@@ -134,7 +134,7 @@ Nothing between stripes is implemented. `actis.stripes` keeps every stripe exact
 21 nm per pixel at mask scale is a typical value, not a constant. In the user's words (2026-11-25), it "is a typical value", each scan "could differ" slightly, and "the actual value must be obtained from the header.xml file".
 
 - **The pixel size belongs to a scan.** Read it from that scan's header and keep it with that scan's results. Two scans cannot be assumed to share a value.
-- **The code does not do this yet.** 21 is the default of every `--pixel-nm` option, and nothing reads the header. Treat 21 as a fallback for a plausibility check, never as the value to compute positions or sizes with.
+- **`actis.stripes` does this; the older tools do not.** It reads `pixel_x` and `pixel_y` (µm) through `actis.header` and keeps them in `stripes.json` and every result file. `--pixel-nm` overrides them. In the other tools 21 is still the default of `--pixel-nm`. Treat 21 as a fallback for a plausibility check, never as the value to compute positions or sizes with.
 - **Along and across the scan.** Whether the scale is the same in both directions is not recorded. The two could differ, because one comes from the optics and the other from the stage speed and line rate.
 
 At the typical 21 nm per pixel:
@@ -146,7 +146,8 @@ At the typical 21 nm per pixel:
 | Step from one stripe to the next, if they share 32 columns | 5,376 | 112.896 µm |
 | Height of a page | 2,048 | 43.008 µm |
 | Length of a 1,500-page segment | 3,072,000 | 64.512 mm |
-| Default tile | 128 | 2.688 µm |
+| Default tile (10 µm) | 476 | 9.996 µm |
+| Default bin, along × across | 4,760 × 5,236 | 99.96 × 109.96 µm |
 | Reference PNG | 676 × 2,048 | 14.196 × 43.008 µm |
 
 Use these to check what the header says. Stripe positions that step by about 113 µm, for instance, would confirm both the scale and the 32 shared columns.
@@ -180,7 +181,8 @@ What is known is short.
 | It lies in the scan root and "contains metadata about the measurement". | User, 2026-11-24 |
 | "The pattern position, image flipud, pixel size in nm etc. information can be retrieved from the metadata file and would be used together to create the map." | User, 2026-11-24 |
 | "The header may contain the shift value, but likely not completely accurate." | User, 2026-11-25 |
-| No code reads it. `stripes.json` stores its path under `header`, or `null` when the folder given to the run does not hold it. The tests stand in for it with an empty `<header/>`. | Code |
+| The workstation agent wrote `src/actis/header.py`, which exists only on the workstation: `find_header(scan_folder)` returns the path, `parse_header(path)` returns an object whose `pixel_x` and `pixel_y` are the pixel size in µm, and `HeaderError` is raised on failure. | User, 2026-11-27 |
+| `actis.stripes` imports that module when it runs and uses `pixel_x` and `pixel_y`. Without the module, or without a readable header, a run needs `--pixel-nm`. `stripes.json` stores the header's path under `header`. The development repository holds no `header.py` (a pull would collide with the workstation's), and its tests stand in for the module. | Code |
 
 Everything else is unknown: element names, nesting, units, the origin and directions of its coordinates, and whether it describes the scan as a whole, each stripe, each segment or each page.
 
@@ -204,26 +206,26 @@ What the map needs from it, in order of need:
 
 | File | Contents |
 |---|---|
-| `stripes.json` | `format` (`"actis-stripes-1"`), `root`, `header`, `settings`, `reference_shapes`, `reference_pitch_px`, `incomplete`, and `segments`. Each segment entry has `stripe`, `vertical`, `files` (relative to `root`), `status`, and when complete `result`, `pages`, `board_shape`, `page_shape`, `tile_grid`, `seam_columns`, `seam_correlation_p90`, `tested_tiles`, `accepted_tiles`, `methods`, `seconds` and `notes`. |
-| `<stripe>_<vertical>.npz` | One float32 array per method that ran (`raw` by default), shaped (page, tile row, tile column), NaN where the tile was not accepted. `reference` (int8, −1 where not accepted), `page_index`, `seam_correlation` shaped (page, seam), and the single numbers `stripe`, `vertical`, `tile_size`, `overlap_px`, `boards`, `board_columns`. |
+| `stripes.json` | `format` (`"actis-stripes-2"` since 2026-11-27), `root`, `header`, `pixel_source`, `settings` (with `pixel_um`, `tile_um`, `bin_y_um`, `bin_x_um`, `reject_sigma`), `tile_size`, `bin_rows`, `gpu`, `gpu_index`, `gpu_pci_bus`, `reference_shapes`, `reference_pitch_px`, `incomplete`, and `segments`. Each segment entry has `stripe`, `vertical`, `files` (relative to `root`), `status`, and when complete `result`, `pages`, `board_shape`, `page_shape`, `tile_grid`, `tile_x0`, `rows_left`, `bin_tiles`, `bin_grid`, `seam_columns`, `seam_correlation_p90`, `tested_tiles`, `accepted_tiles`, `accepted_by_rows`, `methods`, `seconds` and `notes`. |
+| `<stripe>_<vertical>.npz` | Per method that ran (`raw` by default): `bin_<method>` (bin row, bin column) and `bin_<method>_tiles`, `tile_<method>` and `tile_<method>_used` (tile row, tile column). Also `tile_reference` (int8, −1 where not accepted), `bin_rows` and `bin_columns` (tile ranges of each bin), `page_index`, `seam_correlation` shaped (page, seam), and the single numbers `stripe`, `vertical`, `tile_size`, `tile_x0`, `page_rows`, `pixel_um` (x, y), `reject_sigma`, `overlap_px`, `boards`, `board_columns`. |
 | `<stripe>_<vertical>_edges.npz` | Only with `--edge-strips`: `left` and `right`, shaped (page, row, column), the first and the last 32 columns of every merged page in the pixel type of the TIFFs, plus `page_index`, `stripe`, `vertical`. |
 
 `raw` is the mean brightness of a tile in DN. The other methods give sizes in pixels, except `flux` in DN px².
 
 ### Where a tile lies
 
-With `T` the tile size (128), a tile `[p, r, c]` of a segment covers, on the merged page as stored:
+The merged pages of a segment are stacked into one strip in stored order, and tiles are cut from the strip, so a tile can span two pages. With `T` the tile size (476 px for 10 µm at 21 nm), a tile `[r, c]` of a segment covers:
 
-- rows `r × T` to `(r + 1) × T` of page `page_index[p]`,
-- stripe columns `c × T` to `(c + 1) × T`.
+- strip rows `r × T` to `(r + 1) × T`, where strip row `y` is row `y mod page_rows` of merged page `page_index[y // page_rows]`,
+- stripe columns `tile_x0 + c × T` to `tile_x0 + (c + 1) × T`.
 
-So its centre is at stripe column `(c + 0.5) × T` and, within its segment, at strip row `p × 2,048 + (r + 0.5) × T`. For a stripe of several segments, add the rows of the segments before it.
+A bin `[i, j]` covers tile rows `bin_rows[i]` and tile columns `bin_columns[j]`, each a [first, end) pair. Its centre is the middle of those tiles. For a stripe of several segments, add the rows of the segments before it.
 
-- **Across the stripe.** 42 tiles cover columns 0 to 5,375. The last 32 columns belong to no tile. Stripes advance to the right, so if they share exactly 32 columns, those columns are the first 32 of the next stripe and the tile columns of neighbouring stripes continue each other without a gap.
-- **Turning a stripe upright.** 2,048 rows are exactly 16 tiles of 128. Flipping a strip therefore moves whole tiles: for the values of a stripe stacked over all its pages, `values[::-1, ::-1, :]` is the same strip upside down. This holds only while the tile size divides 2,048.
-- **The shift.** A shift between stripes is not a multiple of the tile size. Place every tile by the coordinate of its centre instead of forcing the stripes onto one grid.
+- **Across the stripe.** The tiles are centred: at 476 px, 11 tiles cover columns 86 to 5,321, and 86 columns at each edge, which include the 32 shared with each neighbouring stripe, belong to no tile. So tile columns of neighbouring stripes do not continue each other on one grid. Place them by coordinate.
+- **Turning a stripe upright.** The strip begins at the first row of the segment. The rows at its end that do not fill a tile (`rows_left`) are not used, so flipping a strip does not map tiles onto the tile grid of the flipped strip. Place each tile and bin by the coordinate of its centre after the flip.
+- **The shift.** A shift between stripes is not a multiple of the tile size. Place every tile and bin by the coordinate of its centre instead of forcing the stripes onto one grid.
 
-Then, for a tile centre at stripe column `x` and upright strip row `y`:
+Then, for a centre at stripe column `x` and upright strip row `y`:
 
 ```
 X = X of the stripe (header) + x × pixel size
@@ -233,7 +235,7 @@ Y = Y of the stripe (header) + shift of the stripe + y × pixel size
 ### What the results do not hold
 
 - **No pixels**, apart from the optional edge strips.
-- **No position on the mask** and nothing from the header.
+- **No position on the mask.** Of the header only the pixel size is used.
 - **Not the offset of each tile's pattern.** The screening finds how far every accepted tile is shifted against the reference tile (`select_tiles` returns it), but the files do not keep it.
 - **Not every tile.** Only tiles that matched the reference have values.
 
@@ -284,9 +286,9 @@ Constraints the user has stated:
 Two pointers:
 
 - **The user's own earlier code.** The user wrote a raw-intensity pipeline before this repository's ("My previous implementation that I did on my own"), which loaded whole images onto the GPU and picked tiles by phase cross-correlation. If it is on the workstation, it may already show how the header was read and how stripes were put together. Ask.
-- **Keep `actis-stripes-1` loadable.** The map is to be built from these files. Add to the format, or change it deliberately with a new format name, but do not break the reading of existing runs.
+- **Read the format name.** The map is to be built from these files. Runs from before 2026-11-27 are `actis-stripes-1`: 128-px tiles cut page by page, values shaped (page, tile row, tile column), no bins, no pixel size. Runs since are `actis-stripes-2`, described above. A reader should check `format` and refuse what it does not know.
 
 Suggestions from the development side, not instructions from the user:
 
 - **Keep real data and real metadata out of git.** `.gitignore` covers `*.tif`, `*.tiff`, `*.png` and `results/`. It does not cover `header.xml`, `.npz`, `.json` or `.csv`. Ask the user before committing a real header, even as a test fixture. A fixture with the real structure and invented values serves the tests as well.
-- **Write back what you find.** The development PC cannot see the data, and code travels between the two machines only through git. When a row of this document is confirmed or turns out wrong, change it here and commit it, so the next session on either machine starts from the facts.
+- **Report back through the user.** The development PC cannot see the data. Code travels one way only: the development side pushes and the workstation pulls, and nothing written on the workstation reaches git. When a row of this document is confirmed or turns out wrong, or a tool is written there, tell the user, who passes it on.

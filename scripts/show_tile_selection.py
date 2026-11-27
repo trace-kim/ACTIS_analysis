@@ -6,6 +6,12 @@ the stripe run, or one file to see that file alone. Pages count from 0, like
 page_index in the stripe results. Hover over a tile for its score, raw mean
 and shift.
 
+The stripe run stacks the pages of a segment and cuts its tiles from that
+strip, so on most pages the first tile row begins below the top. A tile that
+runs on into the page before or after is not shown. The pixel size comes from
+the header of the scan the files lie in, as in the stripe run, unless
+--pixel-nm gives it.
+
 All four boards of segment 1_1, page 120.
     python scripts/show_tile_selection.py D:\\ACTIS\\scan\\RAW\\S1\\1_1_?.tiff --reference holes.tiff --page 120
 
@@ -15,6 +21,7 @@ One file, written to a PNG instead of a window (for a machine without a display)
 
 import argparse
 import glob
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +29,15 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from actis.fit import array_backend
-from actis.stripes import SCREEN_PIXELS, cut_tiles, merge_boards, seam_columns
+from actis.stripes import (
+    SCREEN_PIXELS,
+    TILE_UM,
+    Tiling,
+    cut_tiles,
+    merge_boards,
+    scan_pixel_size,
+    seam_columns,
+)
 from actis.tiff_benchmark import _read_page, _reference
 from actis.tiff_tiles import prepare_reference, score_tiles
 
@@ -44,8 +59,32 @@ def read_page(path, page, tifffile):
             raise ValueError(f"{path.name} has no page {page}") from None
 
 
+def pixel_size(paths, pixel_nm):
+    """The pixel size in µm that the stripe run would use for these files.
+
+    A board stack lies a few folders below its scan, as in scan\\RAW\\S1, so
+    the nearest folders above the first file are asked for a header.
+    """
+    if pixel_nm:
+        return scan_pixel_size(paths[0].parent, pixel_nm)[0]
+    problems = []
+    for folder in paths[0].resolve().parents[:4]:
+        try:
+            return scan_pixel_size(folder)[0]
+        except ValueError as error:
+            problems.append(error)
+    raise ValueError(
+        f"No folder above {paths[0].name} gives a pixel size ({problems[-1]}). "
+        "Give --pixel-nm"
+    )
+
+
 def screen(paths, args, tifffile):
-    """Merge the page of every file, cut it into tiles and score every tile."""
+    """Merge the page of every file, cut it into tiles and score every tile.
+
+    Returns the page, the seams, the references, the tile values and where
+    the tiles lie on the page: (first row, first column, tile side).
+    """
     boards = [read_page(path, args.page, tifffile) for path in paths]
     for path, board in zip(paths, boards):
         if (board.shape, board.dtype) != (boards[0].shape, boards[0].dtype):
@@ -58,15 +97,24 @@ def screen(paths, args, tifffile):
         raise ValueError(f"The boards are no wider than the overlap of {args.overlap}")
     page = merge_boards(boards, args.overlap)
     seams = seam_columns(len(boards), boards[0].shape[1], args.overlap)
+    # The bins do not matter here, only where the tiles lie.
+    tiling = Tiling.from_um(args.tile_um, args.tile_um, None, pixel_size(paths, args.pixel_nm))
+    side = tiling.tile
+    if side < 16:
+        raise ValueError(f"Tiles of {args.tile_um:g} um are {side} px. Use at least 16 px")
+    left = tiling.across(page.shape[1]).first_column
+    # Tile rows begin at multiples of the tile side in the stacked pages.
+    top = -args.page * page.shape[0] % side
+    window = page[top:, left:]
     cp = array_backend("cuda")
-    if args.device >= cp.cuda.runtime.getDeviceCount():
-        raise ValueError(f"CUDA device {args.device} is unavailable")
-    with cp.cuda.Device(args.device):
+    if args.gpu >= cp.cuda.runtime.getDeviceCount():
+        raise ValueError(f"There is no GPU {args.gpu}")
+    with cp.cuda.Device(args.gpu):
         pixels = _reference(args.reference.resolve(), args.reference_page, tifffile)
-        templates = prepare_reference(pixels, args.tile_size, args.shape, cp)
-        tiles, grid = cut_tiles(cp.asarray(page), args.tile_size, cp)
+        templates = prepare_reference(pixels, side, args.shape, cp)
+        tiles, grid = cut_tiles(cp.asarray(window), side, cp)
         # The batch size of the stripe run, so a whole page fits on the GPU.
-        batch = max(1, SCREEN_PIXELS // args.tile_size**2)
+        batch = max(1, SCREEN_PIXELS // side**2)
         parts = [
             score_tiles(tiles[first : first + batch], templates, cp)
             for first in range(0, len(tiles), batch)
@@ -77,10 +125,10 @@ def screen(paths, args, tifffile):
         # What the stripe run stores as raw for an accepted tile.
         raw = tiles.mean(axis=(1, 2), dtype=cp.float64).get().reshape(grid)
     tiles_of = dict(score=score, reference=reference, dx=dx, dy=dy, raw=raw)
-    return page, seams, templates, tiles_of
+    return page, seams, templates, tiles_of, (top, left, side)
 
 
-def draw(page, seams, tiles_of, templates, title, args):
+def draw(page, seams, tiles_of, templates, title, placed, args):
     """The page in grey, each tile outlined or shaded by its verdict, with its score."""
     import matplotlib.pyplot as plt
     from matplotlib import patheffects
@@ -89,7 +137,7 @@ def draw(page, seams, tiles_of, templates, title, args):
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch, Rectangle
 
-    side = args.tile_size
+    top, left, side = placed
     rows, columns = page.shape
     score = tiles_of["score"]
     ny, nx = score.shape
@@ -105,7 +153,7 @@ def draw(page, seams, tiles_of, templates, title, args):
 
     def boxes(chosen):
         return [
-            Rectangle((c * side - 0.5, r * side - 0.5), side, side)
+            Rectangle((left + c * side - 0.5, top + r * side - 0.5), side, side)
             for r, c in zip(*np.nonzero(chosen))
         ]
 
@@ -116,16 +164,18 @@ def draw(page, seams, tiles_of, templates, title, args):
     ax.add_collection(
         PatchCollection(boxes(accepted), facecolor="none", edgecolor=ACCEPTED, lw=1.1)
     )
-    # The columns at the right and the rows at the bottom that no tile holds.
+    # The columns at both edges that no tile holds, and the rows of tiles that
+    # run on into the page before or after.
     left_over = dict(fill=False, hatch="///", edgecolor="0.65", lw=0)
-    if columns > nx * side:
-        ax.add_patch(
-            Rectangle((nx * side - 0.5, -0.5), columns - nx * side, rows, **left_over)
-        )
-    if rows > ny * side:
-        ax.add_patch(
-            Rectangle((-0.5, ny * side - 0.5), nx * side, rows - ny * side, **left_over)
-        )
+    right, bottom = left + nx * side, top + ny * side
+    for x, y, w, h in (
+        (0, 0, left, rows),
+        (right, 0, columns - right, rows),
+        (left, 0, nx * side, top),
+        (left, bottom, nx * side, rows - bottom),
+    ):
+        if w > 0 and h > 0:
+            ax.add_patch(Rectangle((x - 0.5, y - 0.5), w, h, **left_over))
     for seam in seams:
         ax.axvline(seam - 0.5, color=SEAM, lw=0.9, ls=(0, (6, 4)))
 
@@ -134,8 +184,8 @@ def draw(page, seams, tiles_of, templates, title, args):
     outline = [patheffects.withStroke(linewidth=max(1.5, size / 3.5), foreground="black")]
     for (r, c), value in np.ndenumerate(score):
         ax.text(
-            (c + 0.5) * side - 0.5,
-            (r + 0.5) * side - 0.5,
+            left + (c + 0.5) * side - 0.5,
+            top + (r + 0.5) * side - 0.5,
             f"{value:.2f}",
             ha="center",
             va="center",
@@ -147,9 +197,9 @@ def draw(page, seams, tiles_of, templates, title, args):
     def where(x, y):
         column, row = int(np.floor(x + 0.5)), int(np.floor(y + 0.5))
         text = f"x={column} y={row}"
-        r, c = row // side, column // side
-        if row < 0 or column < 0 or r >= ny or c >= nx:
-            return text + "  (in no tile)"
+        r, c = (row - top) // side, (column - left) // side
+        if not (0 <= r < ny and 0 <= c < nx):
+            return text + "  (in no tile of this page)"
         verdict = "accepted" if accepted[r, c] else "rejected"
         text += (
             f"  tile ({r}, {c}): score {score[r, c]:.3f}, {verdict}, "
@@ -170,7 +220,7 @@ def draw(page, seams, tiles_of, templates, title, args):
     handles = [
         Patch(facecolor="none", edgecolor=ACCEPTED, label="accepted"),
         Patch(facecolor=shade, edgecolor=REJECTED, label="rejected"),
-        Patch(fill=False, hatch="///", edgecolor="0.65", label="in no tile"),
+        Patch(fill=False, hatch="///", edgecolor="0.65", label="in no tile of this page"),
     ]
     if seams:
         handles.append(Line2D([], [], color=SEAM, ls=(0, (6, 4)), label="board seam"))
@@ -202,7 +252,15 @@ def main(argv=None):
         help="Zero-based page of a reference TIFF (default: 0)",
     )
     parser.add_argument(
-        "--tile-size", type=int, default=128, help="Even tile side in pixels (default: 128)"
+        "--tile-um",
+        type=float,
+        default=TILE_UM,
+        help=f"Tile side in um, as given to measure_stripes.py (default: {TILE_UM:g})",
+    )
+    parser.add_argument(
+        "--pixel-nm",
+        type=float,
+        help="Pixel size in nm, instead of the one in the scan's header",
     )
     parser.add_argument(
         "--min-corr",
@@ -222,17 +280,28 @@ def main(argv=None):
         default="auto",
         help="Specify only if the reference hole shape is known",
     )
-    parser.add_argument("--device", type=int, default=0, help="CUDA device index")
+    parser.add_argument(
+        "--gpu",
+        "--device",
+        dest="gpu",
+        type=int,
+        default=0,
+        metavar="N",
+        help="GPU to use, numbered as nvidia-smi numbers them (default: 0)",
+    )
     parser.add_argument(
         "--save",
         type=Path,
         help="Write the figure to this PNG instead of opening a window",
     )
     args = parser.parse_args(argv)
-    if args.tile_size < 16 or args.tile_size % 2 or not 0 < args.min_corr <= 1:
-        parser.error("Use an even tile size of at least 16 and a --min-corr in (0, 1]")
-    if min(args.page, args.reference_page, args.overlap, args.device) < 0:
-        parser.error("Pages, overlap and device must be nonnegative")
+    if not args.tile_um > 0 or not 0 < args.min_corr <= 1:
+        parser.error("Use a positive --tile-um and a --min-corr in (0, 1]")
+    if args.pixel_nm is not None and not args.pixel_nm > 0:
+        parser.error("--pixel-nm must be positive")
+    if min(args.page, args.reference_page, args.overlap, args.gpu) < 0:
+        parser.error("Pages, overlap and GPU must be nonnegative")
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # as in measure_stripes.py
     # PowerShell and cmd pass a pattern through unexpanded.
     paths = [Path(p) for arg in args.image for p in (sorted(glob.glob(arg)) or [arg])]
 
@@ -247,7 +316,7 @@ def main(argv=None):
     except ImportError:
         parser.exit(1, 'Install the TIFF/CUDA dependencies with pip install -e ".[gpu]"\n')
     try:
-        page, seams, templates, tiles_of = screen(paths, args, tifffile)
+        page, seams, templates, tiles_of, placed = screen(paths, args, tifffile)
     except (OSError, ValueError, RuntimeError, tifffile.TiffFileError) as error:
         parser.exit(1, f"Tile selection: {error}\n")
 
@@ -259,13 +328,15 @@ def main(argv=None):
             f"Reference: {t.region.shape} holes, pitch {t.region.pitch:.2f} px, "
             f"shifts searched up to {len(t.search) // 2} px"
         )
+    top, left, side = placed
     print(
-        f"{page.shape[1]} x {page.shape[0]} px page: {accepted.sum()} of "
-        f"{accepted.size} tiles accepted, {close.sum()} of them within 0.05 of "
-        f"the {args.min_corr:.2f} threshold"
+        f"{page.shape[1]} x {page.shape[0]} px page, tiles of {side} px from row "
+        f"{top} and column {left}: {accepted.sum()} of {accepted.size} tiles "
+        f"accepted, {close.sum()} of them within 0.05 of the {args.min_corr:.2f} "
+        "threshold"
     )
     title = ", ".join(path.name for path in paths)
-    fig, inches = draw(page, seams, tiles_of, templates, title, args)
+    fig, inches = draw(page, seams, tiles_of, templates, title, placed, args)
     if args.save:
         # About one image pixel per figure pixel, within reason.
         fig.savefig(args.save, dpi=float(np.clip(1 / inches, 100, 400)))

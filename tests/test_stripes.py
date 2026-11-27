@@ -1,5 +1,9 @@
 import json
+import sys
+import types
 from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,18 +11,28 @@ import pytest
 from actis.fit import array_backend
 from actis.stripes import (
     MANIFEST,
+    Tiling,
     _board_pages,
+    bin_tiles,
     find_segments,
     main,
     measure_stripes,
     merge_boards,
+    scan_pixel_size,
     seam_agreement,
     seam_columns,
+    tile_pixels,
 )
 from actis.synthetic import render_repeats
 from actis.tiff_benchmark import METHODS
 
 SIDE = 96
+PIXEL_NM = 21.0
+TILE_UM = SIDE * PIXEL_NM / 1000  # 96 px at 21 nm
+# Not a multiple of the tile, so rows of tiles run on from one page into the next.
+PAGE_ROWS = 150
+# Four boards of 128 columns sharing 32: 416 columns hold 4 tiles, from column 16.
+WIDTH, X0 = 4 * SIDE + 32, 16
 
 
 @pytest.fixture(scope="module")
@@ -27,6 +41,36 @@ def cuda():
         return array_backend("cuda")
     except RuntimeError as exc:
         pytest.skip(str(exc))
+
+
+class HeaderError(Exception):
+    pass
+
+
+@pytest.fixture
+def header(monkeypatch):
+    """Stand in for actis.header, which only the workstation has.
+
+    It finds Header.xml in the folder it is given and reads `size` from it.
+    """
+    module = types.ModuleType("actis.header")
+    module.HeaderError = HeaderError
+    module.size = [PIXEL_NM / 1000] * 2
+
+    def find_header(folder):
+        path = Path(folder) / "Header.xml"
+        if not path.is_file():
+            raise HeaderError(f"no Header.xml in {folder}")
+        return path
+
+    def parse_header(path):
+        if path.read_text() == "broken":
+            raise HeaderError("unreadable")
+        return SimpleNamespace(pixel_x=module.size[0], pixel_y=module.size[1])
+
+    module.find_header, module.parse_header = find_header, parse_header
+    monkeypatch.setitem(sys.modules, "actis.header", module)
+    return module
 
 
 @pytest.fixture(scope="module")
@@ -50,36 +94,59 @@ def split(page, boards=4, overlap=32):
     return [page[..., k * step : k * step + columns] for k in range(boards)]
 
 
-def merged_page(tile, where):
-    """Two rows of four tiles, with the hole tile at the (row, column) places in `where`.
+def merged_strip(tile, where, pages, dim=()):
+    """`pages` merged pages, stacked, with the hole tile at the (tile row, tile
+    column) places in `where`, 0.4 as bright at the places in `dim`.
 
-    Three rows and 32 columns are left over at the edges. Brightness rises
-    from left to right, so a tile's mean tells exactly which columns it holds.
+    Tile columns begin 16 columns in. Brightness rises from left to right, so
+    a tile's mean tells exactly which columns it holds.
     """
-    page = np.full((2 * SIDE + 3, 4 * SIDE + 32), 10.0)
+    strip = np.full((pages * PAGE_ROWS, WIDTH), 10.0)
     for row, column in where:
-        page[row * SIDE :, column * SIDE :][:SIDE, :SIDE] = tile
-    return np.rint(page * np.linspace(0.6, 1.0, page.shape[1])).astype(np.uint8)
+        rows = slice(row * SIDE, (row + 1) * SIDE)
+        columns = slice(X0 + column * SIDE, X0 + (column + 1) * SIDE)
+        strip[rows, columns] = tile * (0.4 if (row, column) in dim else 1.0)
+    return np.rint(strip * np.linspace(0.6, 1.0, WIDTH)).astype(np.uint8)
 
 
-def tile_means(page):
-    return page[: 2 * SIDE, : 4 * SIDE].reshape(2, SIDE, 4, SIDE).mean(axis=(1, 3))
+def tile_means(strip):
+    rows = len(strip) // SIDE
+    tiles = strip[: rows * SIDE, X0 : X0 + 4 * SIDE]
+    return tiles.reshape(rows, SIDE, 4, SIDE).mean(axis=(1, 3))
 
 
-def hole_tiles(layout):
-    """Which (page, tile row, tile column) hold the hole tile, from each page's places."""
-    held = np.zeros((len(layout), 2, 4), dtype=bool)
-    for page, where in enumerate(layout):
-        for row, column in where:
-            held[page, row, column] = True
-    return held
+def held(where, rows):
+    """Which tiles of a grid `rows` tall hold the hole tile."""
+    grid = np.zeros((rows, 4), dtype=bool)
+    for row, column in where:
+        if row < rows:
+            grid[row, column] = True
+    return grid
 
 
-def write_boards(folder, stem, pages, tifffile):
+def pages_of(strip):
+    return strip.reshape(-1, PAGE_ROWS, strip.shape[1])
+
+
+def write_boards(folder, stem, strip, tifffile):
     folder.mkdir(parents=True, exist_ok=True)
-    for number, board in enumerate(split(np.stack(pages)), 1):
+    for number, board in enumerate(split(pages_of(strip)), 1):
         path = folder / f"{stem}_{number}.tiff"
         tifffile.imwrite(path, board, photometric="minisblack")
+
+
+def expected_bins(values, used, size, first=0):
+    """Bin means written out plainly, to check bin_tiles against."""
+    tall, wide = size
+    down, across = -(-len(values) // tall), (values.shape[1] - first) // wide
+    out = np.full((down, across), np.nan)
+    for r in range(down):
+        for c in range(across):
+            rows = slice(r * tall, (r + 1) * tall)
+            columns = slice(first + c * wide, first + (c + 1) * wide)
+            if used[rows, columns].any():
+                out[r, c] = values[rows, columns][used[rows, columns]].mean()
+    return out
 
 
 def test_boards_merge_with_shared_columns_counted_once():
@@ -174,38 +241,141 @@ def test_boards_are_read_together_up_to_the_shortest(
     assert read(files, max_pages=3) == (rows[:3], [])
 
 
-def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeypatch):
+def test_pixel_size_comes_from_the_header(tmp_path, header, monkeypatch):
+    path = tmp_path / "Header.xml"
+    path.write_text("<header/>")
+    assert scan_pixel_size(tmp_path) == ((0.021, 0.021), path)
+    header.size[:] = [0.0211, 0.0209]
+    assert scan_pixel_size(tmp_path) == ((0.0211, 0.0209), path)
+    # A size that is given wins, for both directions.
+    assert scan_pixel_size(tmp_path, pixel_nm=20) == ((0.02, 0.02), path)
+    header.size[:] = [21, 21]  # nm taken for µm
+    with pytest.raises(ValueError, match="outside 0.005 to 0.1 um"):
+        scan_pixel_size(tmp_path)
+    path.write_text("broken")
+    with pytest.raises(ValueError, match="Cannot read the pixel size .*unreadable"):
+        scan_pixel_size(tmp_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="Cannot find the header .*no Header.xml"):
+        scan_pixel_size(empty)
+    assert scan_pixel_size(empty, pixel_nm=21) == ((0.021, 0.021), None)
+    # As on a PC without the workstation's module.
+    monkeypatch.setitem(sys.modules, "actis.header", None)
+    with pytest.raises(ValueError, match="needs actis.header"):
+        scan_pixel_size(tmp_path)
+    assert scan_pixel_size(tmp_path, pixel_nm=21) == ((0.021, 0.021), None)
+
+
+def test_tiles_and_bins_are_centred_across_the_stripe():
+    pixel = (0.021, 0.021)
+    assert tile_pixels(10, pixel) == 476 and tile_pixels(10, (0.0215,) * 2) == 466
+    tiling = Tiling.from_um(10, 100, None, pixel)
+    assert (tiling.tile, tiling.bin_rows, tiling.bin_columns) == (476, 10, None)
+    # 5,408 merged columns hold 11 tiles and leave 172, 86 at each edge.
+    assert tiling.across(5408) == (86, 11, 0, 1, 11)
+    assert Tiling.from_um(10, 100, 110, pixel).across(5408) == (86, 11, 0, 1, 11)
+    # Two bins of 5 tiles leave one tile, at the right. Three of 3 leave one at each edge.
+    assert Tiling.from_um(10, 100, 50, pixel).across(5408) == (86, 11, 0, 2, 5)
+    assert Tiling.from_um(10, 100, 30, pixel).across(5408) == (86, 11, 1, 3, 3)
+    # At 20 nm a pixel the stripe is 108 µm: too narrow for bins of 110 µm,
+    # and bins of the whole stripe take the 10 tiles that fit.
+    with pytest.raises(ValueError, match="do not fit across the stripe"):
+        Tiling.from_um(10, 100, 110, (0.02, 0.02)).across(5408)
+    assert Tiling.from_um(10, 100, None, (0.02, 0.02)).across(5408) == (
+        204,
+        10,
+        0,
+        1,
+        10,
+    )
+    with pytest.raises(ValueError, match="wider than the stripe"):
+        Tiling(600, pixel, 1).across(500)
+
+
+def test_bins_average_their_tiles_without_the_far_ones():
+    nan = np.nan
+    values = np.array(
+        [
+            [100, 10, 10, 10, 1, 2, 3],
+            [100, 10, 10, 30, 4, 5, nan],
+            [100, nan, nan, nan, nan, nan, nan],
+            [100, nan, nan, nan, nan, 7, nan],
+            [100, 2, 4, nan, nan, nan, nan],
+        ]
+    )
+    # Bins of 2 x 3 tiles from tile column 1: column 0 is in none, and the
+    # last bin row holds one tile row.
+    means, counts, used = bin_tiles(values, (2, 3), 1, reject_sigma=1.5)
+    # 30 lies 2.04 standard deviations above its bin's mean of 13.3. A lone tile stays.
+    np.testing.assert_allclose(means, [[10, 3], [nan, 7], [3, nan]])
+    np.testing.assert_array_equal(counts, [[5, 5], [0, 1], [2, 0]])
+    expected = np.isfinite(values)
+    expected[:, 0] = expected[1, 3] = False
+    np.testing.assert_array_equal(used, expected)
+    assert means.dtype == np.float32
+    for sigma in (None, 2.1):
+        means, counts, used = bin_tiles(values, (2, 3), 1, reject_sigma=sigma)
+        assert means[0, 0] == pytest.approx(80 / 6) and counts[0, 0] == 6 and used[1, 3]
+    # No tile of n can lie more than (n - 1) / sqrt(n) standard deviations
+    # from their mean, which is 1.5 for four tiles.
+    one_far = np.array([[1.0, 1.0], [1.0, 9.0]])
+    assert bin_tiles(one_far, (2, 2), reject_sigma=1.5)[1][0, 0] == 4
+    assert bin_tiles(one_far, (2, 2), reject_sigma=1.49)[1][0, 0] == 3
+
+
+def test_every_stripe_is_measured_in_tiles_and_bins(
+    cuda, holes, header, tmp_path, monkeypatch
+):
     tifffile = pytest.importorskip("tifffile")
     tile = holes // 256
     root, out = tmp_path / "scan", tmp_path / "out"
     root.mkdir()
-    (root / "header.xml").write_text("<header/>")
+    (root / "Header.xml").write_text("<header/>")
     reference = tmp_path / "reference.tiff"
     tifffile.imwrite(reference, holes, photometric="minisblack")
-    # Tile columns 1 to 3 each lie across a seam between two boards.
-    places = [[(0, 0), (0, 1), (1, 3)], [(0, 2), (1, 1)], []], [[(1, 0)], [(0, 3)]]
-    first = [merged_page(tile, where) for where in places[0]]
-    second = [merged_page(tile, where) for where in places[1]] + first[:1]
+    # Tile rows 1 and 3 run on from one page into the next, tile columns 1 to
+    # 3 each lie across a seam between two boards, and one tile is dim.
+    where = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (1, 3)]
+    where += [(2, 1), (2, 3), (3, 0), (3, 2)]
+    dim = {(1, 3)}
+    first = merged_strip(tile, where, 3, dim)
+    later = [(0, 3), (1, 0), (2, 2)]
+    second = merged_strip(tile, later, 3)
     write_boards(root / "RAW" / "S1", "1_1", first, tifffile)
     write_boards(root / "RAW" / "S1", "1_2", second, tifffile)
-    short = split(np.stack(second[:2]))[2]
+    short = split(pages_of(second)[:2])[2]
     tifffile.imwrite(
         root / "RAW" / "S1" / "1_2_3.tiff", short, photometric="minisblack"
     )
     write_boards(root / "RAW" / "S2", "2_1", first, tifffile)
     (root / "RAW" / "S2" / "2_1_4.tiff").unlink()
     write_boards(root / "RAW" / "S3", "3_1", first, tifffile)
-    narrow = split(np.stack(first))[1][..., :120]
+    narrow = split(pages_of(first))[1][..., :120]
     tifffile.imwrite(
         root / "RAW" / "S3" / "3_1_2.tiff", narrow, photometric="minisblack"
     )
 
     lines = []
-    kwargs = {"reference": reference, "tile_size": SIDE, "shape": "square"}
+    # Bins two tiles long and the whole stripe wide.
+    kwargs = {"reference": reference, "tile_um": TILE_UM, "shape": "square"}
+    kwargs["bin_y_um"] = 2 * TILE_UM
     manifest = measure_stripes(root, out, progress=lines.append, **kwargs)
     assert manifest == json.loads((out / MANIFEST).read_text(encoding="utf-8"))
-    assert manifest["header"] == str(root / "header.xml")
+    assert manifest["format"] == "actis-stripes-2"
+    assert manifest["header"] == str(root / "Header.xml")
+    assert manifest["pixel_source"] == "header"
+    assert manifest["settings"]["pixel_um"] == [0.021, 0.021]
     assert manifest["settings"]["methods"] == ["raw"]
+    assert (manifest["tile_size"], manifest["bin_rows"]) == (SIDE, 2)
+    assert manifest["gpu_index"] == 0 and manifest["gpu_pci_bus"]
+    assert any(line.startswith("GPU 0: ") and "PCI bus" in line for line in lines)
+    assert any(
+        line.startswith("Pixels of 21 x 21 nm. Tiles of 96 px")
+        and "Bins of 2 tiles" in line
+        and "by 4 tiles" in line
+        for line in lines
+    )
     assert manifest["incomplete"] == [
         {"stripe": 2, "vertical": 1, "boards_found": [1, 2, 3]}
     ]
@@ -217,41 +387,79 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
         (1, 2, "complete"),
         (3, 1, "failed"),
     ]
-    assert "3_1_2.tiff is 120 x 195 px" in three["error"] and "result" not in three
+    assert "3_1_2.tiff is 120 x 150 px" in three["error"] and "result" not in three
     assert not (out / "3_1.npz").exists()
     assert one["files"] == [f"RAW/S1/1_1_{b}.tiff" for b in range(1, 5)]
     assert (one["pages"], one["board_shape"], one["page_shape"]) == (
         3,
-        [195, 128],
-        [195, 416],
+        [150, 128],
+        [150, 416],
     )
-    assert (one["tile_grid"], one["seam_columns"]) == ([2, 4], [112, 208, 304])
-    assert (one["tested_tiles"], one["accepted_tiles"]) == (24, 5)
+    # 450 rows hold 4 rows of tiles and leave 66. 416 columns hold 4 tiles and
+    # leave 16 at each edge.
+    assert (one["tile_grid"], one["tile_x0"], one["rows_left"]) == ([4, 4], 16, 66)
+    assert (one["bin_tiles"], one["bin_grid"]) == ([2, 4], [2, 1])
+    assert one["seam_columns"] == [112, 208, 304]
+    assert (one["tested_tiles"], one["accepted_tiles"]) == (16, 11)
+    # Tile rows 0 and 2 lie inside a page, rows 1 and 3 across two.
+    assert one["accepted_by_rows"] == {"within_pages": [5, 8], "across_pages": [6, 8]}
     assert one["notes"] == [] and min(one["seam_correlation_p90"]) > 0.999
     assert one["seconds"]["total"] >= one["seconds"]["read_wait"] > 0
-    assert two["pages"] == 2 and two["accepted_tiles"] == 2
+    # Board 3 of 1_2 ends after 2 pages: 300 rows, 3 rows of tiles, and a last
+    # bin one tile row long.
+    assert (two["pages"], two["tile_grid"], two["rows_left"]) == (2, [3, 4], 12)
+    assert two["bin_grid"] == [2, 1] and two["accepted_tiles"] == 3
     assert two["notes"][0].startswith("1_2_3.tiff ended after 2 pages")
-    assert any(line.startswith("1_1: 3 pages of 416 x 195 px") for line in lines)
+    assert any(
+        line.startswith(
+            "1_1: 3 pages of 416 x 150 px, 11 of 16 tiles accepted (62% within "
+            "pages and 75% across pages), 2 x 1 bins, raw "
+        )
+        for line in lines
+    )
     assert any(line.startswith("3_1: failed.") for line in lines)
 
-    for entry, pages, layout in zip((one, two), (first, second[:2]), places):
+    for entry, strip, places, faint in (
+        (one, first, where, dim),
+        (two, second[: 2 * PAGE_ROWS], later, ()),
+    ):
         data = np.load(out / entry["result"])
-        expected = np.stack([tile_means(page) for page in pages])
-        accepted = hole_tiles(layout)
-        assert data["raw"].dtype == np.float32 and data["raw"].shape == accepted.shape
-        np.testing.assert_array_equal(np.isfinite(data["raw"]), accepted)
-        np.testing.assert_array_equal(data["reference"] >= 0, accepted)
-        # A merge that is off by one column would change these means.
-        np.testing.assert_allclose(data["raw"][accepted], expected[accepted], rtol=1e-6)
-        np.testing.assert_array_equal(data["page_index"], np.arange(len(pages)))
-        assert data["seam_correlation"].shape == (len(pages), 3)
+        rows = entry["tile_grid"][0]
+        accepted, expected = held(places, rows), tile_means(strip)
+        raw = data["tile_raw"]
+        assert raw.dtype == np.float32 and raw.shape == (rows, 4)
+        np.testing.assert_array_equal(np.isfinite(raw), accepted)
+        np.testing.assert_array_equal(data["tile_reference"] >= 0, accepted)
+        # Off by one column or row, at a seam or between pages, these would change.
+        np.testing.assert_allclose(raw[accepted], expected[accepted], rtol=1e-6)
+        used = accepted & ~held(faint, rows)
+        np.testing.assert_array_equal(data["tile_raw_used"], used)
+        np.testing.assert_allclose(
+            data["bin_raw"], expected_bins(expected, used, (2, 4)), rtol=1e-6
+        )
+        np.testing.assert_array_equal(
+            data["bin_raw_tiles"], [[used[r : r + 2].sum()] for r in range(0, rows, 2)]
+        )
+        np.testing.assert_array_equal(
+            data["bin_rows"], [[r, min(r + 2, rows)] for r in range(0, rows, 2)]
+        )
+        np.testing.assert_array_equal(data["bin_columns"], [[0, 4]])
+        np.testing.assert_array_equal(data["page_index"], np.arange(entry["pages"]))
+        assert data["seam_correlation"].shape == (entry["pages"], 3)
         assert np.nanmin(data["seam_correlation"]) > 0.999
         assert (int(data["stripe"]), int(data["vertical"])) == (1, entry["vertical"])
-        assert (int(data["tile_size"]), int(data["overlap_px"])) == (SIDE, 32)
-        assert (int(data["boards"]), int(data["board_columns"])) == (4, 128)
-        assert "blur_sigma_px" not in data.files
-        mean = entry["methods"]["raw"]["mean"]
-        assert mean == pytest.approx(expected[accepted].mean(), rel=1e-6)
+        assert (int(data["tile_size"]), int(data["tile_x0"])) == (SIDE, X0)
+        assert (int(data["page_rows"]), float(data["reject_sigma"])) == (PAGE_ROWS, 1.5)
+        np.testing.assert_array_equal(data["pixel_um"], [0.021, 0.021])
+        assert (int(data["overlap_px"]), int(data["boards"])) == (32, 4)
+        assert int(data["board_columns"]) == 128
+        assert not any(name.startswith("blur") for name in data.files)
+        row = entry["methods"]["raw"]
+        assert row["mean"] == pytest.approx(expected[accepted].mean(), rel=1e-6)
+        assert row["used_tiles"] == used.sum()
+        assert row["bins"] == np.isfinite(data["bin_raw"]).sum()
+    # The dim tile is left out of its bin, and the six others are averaged.
+    assert np.load(out / "1_1.npz")["bin_raw_tiles"].tolist() == [[6], [4]]
 
     # A second run keeps what is complete and tries the failed segment again.
     measured = []
@@ -264,16 +472,20 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
     monkeypatch.setattr("actis.stripes._measure_segment", recorded)
     again = measure_stripes(root, out, **kwargs)
     assert measured == ["3_1"] and again == manifest
-    # A folder written before edge strips existed continues as one without them.
-    old = json.loads((out / MANIFEST).read_text(encoding="utf-8"))
-    del old["settings"]["edge_columns"]
-    (out / MANIFEST).write_text(json.dumps(old), encoding="utf-8")
-    assert measure_stripes(root, out, **kwargs) == manifest
-    assert measured == ["3_1", "3_1"]
-    with pytest.raises(ValueError, match="other settings"):
-        measure_stripes(root, out, **{**kwargs, "min_corr": 0.7})
-    with pytest.raises(ValueError, match="other settings"):
-        measure_stripes(root, out, edge_columns=32, **kwargs)
+    for changed in (
+        {"min_corr": 0.7},
+        {"reject_sigma": None},
+        {"bin_y_um": 3 * TILE_UM},
+        {"pixel_nm": 20},
+        {"edge_columns": 32},
+    ):
+        with pytest.raises(ValueError, match="other settings"):
+            measure_stripes(root, out, **{**kwargs, **changed})
+    (tmp_path / "old").mkdir()
+    earlier = {**manifest, "format": "actis-stripes-1"}
+    (tmp_path / "old" / MANIFEST).write_text(json.dumps(earlier), encoding="utf-8")
+    with pytest.raises(ValueError, match="format actis-stripes-1"):
+        measure_stripes(root, tmp_path / "old", **kwargs)
     (tmp_path / "taken").mkdir()
     (tmp_path / "taken" / "file.txt").touch()
     with pytest.raises(ValueError, match="new or empty folder"):
@@ -281,25 +493,55 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
     with pytest.raises(ValueError, match="No segment"):
         measure_stripes(root, tmp_path / "none", stripes=[7], **kwargs)
 
-    # Every method goes through the same pages, and a trial stops early.
+    # Bins two tiles wide, with every accepted tile averaged.
+    halves = {**kwargs, "stripes": [1], "bin_x_um": 2 * TILE_UM, "reject_sigma": None}
+    assert measure_stripes(root, tmp_path / "x2", **halves)["segments"][0][
+        "bin_grid"
+    ] == [2, 2]
+    data = np.load(tmp_path / "x2" / "1_1.npz")
+    accepted = held(where, 4)
+    np.testing.assert_array_equal(data["tile_raw_used"], accepted)
+    np.testing.assert_array_equal(data["bin_columns"], [[0, 2], [2, 4]])
+    np.testing.assert_allclose(
+        data["bin_raw"],
+        expected_bins(tile_means(first), accepted, (2, 2)),
+        rtol=1e-6,
+    )
+    assert np.isnan(data["reject_sigma"])
+    # Three tiles wide leave one tile over, at the right. Five do not fit.
+    measure_stripes(root, tmp_path / "x3", **{**halves, "bin_x_um": 3 * TILE_UM})
+    assert np.load(tmp_path / "x3" / "1_1.npz")["bin_columns"].tolist() == [[0, 3]]
+    with pytest.raises(ValueError, match="do not fit across the stripe"):
+        measure_stripes(root, tmp_path / "x5", **{**kwargs, "bin_x_um": 5 * TILE_UM})
+    with pytest.raises(ValueError, match="at least one tile"):
+        measure_stripes(root, tmp_path / "small", **{**kwargs, "bin_y_um": TILE_UM / 2})
+    with pytest.raises(ValueError, match="There is no GPU"):
+        gpus = cuda.cuda.runtime.getDeviceCount()
+        measure_stripes(root, tmp_path / "gpu", device=gpus, **kwargs)
+
+    # Every method goes through the same tiles, and a trial stops early.
     every = measure_stripes(
         root, tmp_path / "every", methods=METHODS, stripes=[1], max_pages=1, **kwargs
     )
     assert [s["pages"] for s in every["segments"]] == [1, 1]
     data = np.load(tmp_path / "every" / "1_1.npz")
-    accepted = hole_tiles(places[0][:1])
+    accepted = held(where, 1)  # 150 rows hold one row of tiles
     for name in METHODS:
-        np.testing.assert_array_equal(np.isfinite(data[name]), accepted, err_msg=name)
+        np.testing.assert_array_equal(
+            np.isfinite(data[f"tile_{name}"]), accepted, err_msg=name
+        )
+        assert data[f"bin_{name}"].shape == (1, 1)
     assert data["blur_sigma_px"].shape == (1, 1, 2)
+    assert data["blur_tile_row"].tolist() == [0]
 
     # On request the outer columns of every merged page are kept as stored.
     strips = {**kwargs, "stripes": [1], "edge_columns": 32}
     kept = measure_stripes(root, tmp_path / "edges", **strips)
     assert kept["settings"]["edge_columns"] == 32
     assert "edges" not in one and "save" in one["seconds"]
-    for entry, pages in zip(kept["segments"], (first, second[:2])):
+    for entry, strip in zip(kept["segments"], (first, second[: 2 * PAGE_ROWS])):
         assert entry["edges"] == f"1_{entry['vertical']}_edges.npz"
-        pages = np.stack(pages)
+        pages = pages_of(strip)
         with np.load(tmp_path / "edges" / entry["edges"]) as edges:
             assert edges["left"].dtype == np.uint8
             np.testing.assert_array_equal(edges["left"], pages[:, :, :32])
@@ -311,9 +553,10 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
             )
         # Keeping the strips does not change the values.
         with np.load(tmp_path / "edges" / entry["result"]) as with_strips:
-            np.testing.assert_array_equal(
-                with_strips["raw"], np.load(out / entry["result"])["raw"]
-            )
+            for name in ("tile_raw", "bin_raw"):
+                np.testing.assert_array_equal(
+                    with_strips[name], np.load(out / entry["result"])[name]
+                )
     # A segment whose strips are gone is measured again.
     (tmp_path / "edges" / "1_2_edges.npz").unlink()
     del measured[:]
@@ -326,22 +569,31 @@ def test_every_stripe_is_measured_on_merged_pages(cuda, holes, tmp_path, monkeyp
     with pytest.raises(ValueError, match="nonnegative"):
         measure_stripes(root, tmp_path / "negative", **{**strips, "edge_columns": -1})
 
-    arguments = [str(root), "--reference", str(reference), "--tile-size", str(SIDE)]
-    arguments += ["--shape", "square", "--output"]
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    arguments = [str(root), "--reference", str(reference), "--tile-um", str(TILE_UM)]
+    arguments += ["--bin-y-um", str(2 * TILE_UM), "--shape", "square", "--gpu", "0"]
+    arguments += ["--output"]
     assert main([*arguments, str(tmp_path / "cli"), "--stripe", "1"]) == 0
     saved = json.loads((tmp_path / "cli" / MANIFEST).read_text(encoding="utf-8"))
     assert [s["result"] for s in saved["segments"]] == ["1_1.npz", "1_2.npz"]
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "cli" / "1_1.npz")["bin_raw"],
+        np.load(out / "1_1.npz")["bin_raw"],
+    )
     assert main([*arguments, str(tmp_path / "cli")]) == 1  # 3_1 cannot be merged
-    trial = [
-        *arguments,
-        str(tmp_path / "cli-edges"),
-        "--stripe",
-        "1",
-        "--max-pages",
-        "1",
-    ]
+    # Without a header the pixel size must be given.
+    (root / "Header.xml").unlink()
+    with pytest.raises(SystemExit):
+        main([*arguments, str(tmp_path / "cli-none")])
+    trial = [*arguments, str(tmp_path / "cli-given"), "--stripe", "1"]
+    trial += ["--max-pages", "1", "--pixel-nm", "21", "--no-reject"]
     assert main([*trial, "--edge-strips"]) == 0
-    edges = np.load(tmp_path / "cli-edges" / "1_1_edges.npz")
-    assert edges["right"].shape == (1, 195, 32)
+    given = json.loads((tmp_path / "cli-given" / MANIFEST).read_text(encoding="utf-8"))
+    assert (given["header"], given["pixel_source"]) == (None, "--pixel-nm")
+    assert given["settings"]["reject_sigma"] is None
+    edges = np.load(tmp_path / "cli-given" / "1_1_edges.npz")
+    assert edges["right"].shape == (1, 150, 32)
     with pytest.raises(SystemExit):  # the folder holds strips of 32 columns, not 16
         main([*trial, "--edge-strips", "16"])
+    with pytest.raises(SystemExit):  # a threshold, or no rejection, not both
+        main([*trial, "--reject-sigma", "2"])

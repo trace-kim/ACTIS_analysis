@@ -138,7 +138,7 @@ footer ul { padding-left: 1.2rem; font-family: var(--mono); font-size: 0.86rem; 
 <header>
   <p class="eyebrow">ACTIS stripe run · measure_stripes.py</p>
   <h1>How tiles are screened</h1>
-  <p class="lede col">The stripe run cuts every merged page into 128-pixel tiles and measures only the tiles whose hole pattern matches the reference. This page follows one tile through that test and shows what the test cannot see.</p>
+  <p class="lede col">The stripe run cuts the merged pages into tiles and measures only the tiles whose hole pattern matches the reference. This page follows one tile through that test and shows what the test cannot see. The run's tiles are 10 µm by default, 476 px at 21 nm per pixel. The example tile here is 128 px. Its numbers are fractions of a tile and scale with its size.</p>
 
   <div class="answer col" aria-labelledby="why">
     <h2 id="why">Why tiles at a pattern edge can come out bright</h2>
@@ -220,7 +220,7 @@ footer ul { padding-left: 1.2rem; font-family: var(--mono); font-size: 0.86rem; 
     <li><div class="step">
       <h3>Make the template</h3>
       <p class="where">prepare_reference · src/actis/tiff_tiles.py:76</p>
-      <p>The reference image is searched for hole lattices. One 128 × 128 tile is cut from the middle of each lattice that is large enough. Every tile of every page is compared with that clean tile.</p>
+      <p>The reference image is searched for hole lattices. One square the size of a tile (128 × 128 in this example) is cut from the middle of each lattice that is large enough. Every tile of every page is compared with that clean tile.</p>
       <details><summary>More detail</summary>
         <p>A lattice must be at least one tile wide and tall, with at least five pitches across the tile. Several lattices give several templates. Each page tile is scored against all of them and keeps the best.</p>
         <p>The template's mean is removed, a Hann window is applied and its spectrum is computed once. The shift search radius is the longest lattice vector rounded up, at most 32 px. For a 6.6 px pitch that is 7 px.</p>
@@ -228,9 +228,9 @@ footer ul { padding-left: 1.2rem; font-family: var(--mono); font-size: 0.86rem; 
     </div></li>
     <li><div class="step">
       <h3>Merge the boards and cut tiles</h3>
-      <p class="where">merge_boards, cut_tiles · src/actis/stripes.py:114, 152</p>
-      <p>The four board pages are joined left to right with the 32 shared columns counted once: 4 × 1,376 − 3 × 32 = 5,408 columns. Tiles are cut from the top-left corner, 42 across and 16 down, 672 per page.</p>
-      <p>The grid does not follow the pattern, so a pattern edge can fall anywhere inside a tile. The last 32 columns belong to no tile.</p>
+      <p class="where">merge_boards, cut_tiles, _measure_rows · src/actis/stripes.py:311, 349, 416</p>
+      <p>The four board pages are joined left to right with the 32 shared columns counted once: 4 × 1,376 − 3 × 32 = 5,408 columns. The merged pages of a segment are stacked into one strip, and tiles are cut from it. At 476 px, 11 tiles fit across, centred, so 86 columns at each edge belong to no tile. Down the strip, tiles run on from one page into the next.</p>
+      <p>The grid does not follow the pattern, so a pattern edge can fall anywhere inside a tile.</p>
     </div></li>
     <li><div class="step">
       <h3>Align the tile with the template</h3>
@@ -375,7 +375,7 @@ footer ul { padding-left: 1.2rem; font-family: var(--mono); font-size: 0.86rem; 
 <footer>
   <p>Describes the code on branch report-redesign as of 26 November 2026. The synthetic page mentioned above was made for testing; no real ACTIS page was used.</p>
   <ul>
-    <li>src/actis/stripes.py · merge_boards, cut_tiles, _measure_merged_page</li>
+    <li>src/actis/stripes.py · merge_boards, cut_tiles, _measure_rows</li>
     <li>src/actis/tiff_tiles.py · prepare_reference, _match, _quadrant_scores, score_tiles, select_tiles</li>
     <li>src/actis/tiff_benchmark.py · _raw_means</li>
     <li>scripts/show_tile_selection.py</li>
